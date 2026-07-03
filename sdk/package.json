@@ -1,0 +1,39 @@
+{
+  "name": "@tfl5/sdk",
+  "version": "0.1.0",
+  "description": "Official JS/TS client for the tfl5 platform — wraps the fixed REST contract (spine apps→groups/roles/resources/docs, hooks, operators, field-level encryption, shares, files).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:browser": "esbuild src/index.ts --bundle --format=esm --target=es2021 --minify --outfile=./dist/browser/sdk.mjs && esbuild src/index.ts --bundle --format=iife --global-name=__tfl5sdk --target=es2021 --minify --footer:js=\"if(typeof window!=='undefined'){window.TFL5=__tfl5sdk.TFL5;window.tfl5sdk=__tfl5sdk;}\" --outfile=./dist/browser/sdk.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "keywords": [
+    "tfl5",
+    "sdk",
+    "low-code",
+    "platform"
+  ],
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "typescript": "^5.4.0"
+  }
+}
