@@ -20,6 +20,12 @@ export interface GoogleAuthCapable {
   auth: {
     google(credential: string, opts?: { password?: string }): Promise<LoginResult>;
   };
+  /**
+   * Scope the client to a specific app. Present on a full {@link TFL5}
+   * instance; the helper checks for it at runtime so callers that pass a
+   * narrower object are still accepted.
+   */
+  useApp?(appTid: string): unknown;
 }
 
 export interface MountGoogleButtonOptions {
@@ -56,6 +62,15 @@ export interface MountGoogleButtonOptions {
    * @see https://developers.google.com/identity/gsi/web/reference/js-reference#GsiButtonConfiguration
    */
   buttonConfig?: Record<string, unknown>;
+  /**
+   * Scope the button to a specific app (community-platform model). When set:
+   * (a) the helper fetches THAT app's `google_client_id` from
+   *     `GET /platform/info?app_tid=<appId>` so each app can have its own
+   *     OAuth client; and (b) `tfl5.useApp(appId)` is called (if available)
+   *     so the subsequent `/auth/google` exchange carries `app_tid` and the
+   *     server verifies the credential against the app's own OAuth client.
+   */
+  appId?: string;
 }
 
 /** Handle returned by {@link mountGoogleButton}. */
@@ -125,9 +140,18 @@ export async function mountGoogleButton(
   const el = resolveTarget(options.target);
   const host = (options.host ?? window.location.origin).replace(/\/$/, "");
 
+  // Scope the client to the target app so auth.google carries app_tid.
+  if (options.appId && typeof tfl5.useApp === "function") {
+    tfl5.useApp(options.appId);
+  }
+
   let clientId = options.clientId;
   if (!clientId) {
-    const info = await fetch(`${host}/platform/info`)
+    // When appId is set, fetch the APP's own google_client_id via ?app_tid=.
+    const infoUrl = options.appId
+      ? `${host}/platform/info?app_tid=${encodeURIComponent(options.appId)}`
+      : `${host}/platform/info`;
+    const info = await fetch(infoUrl)
       .then((r) => r.json() as Promise<{ google_client_id?: string }>)
       .catch(() => ({}) as { google_client_id?: string });
     clientId = info.google_client_id;
