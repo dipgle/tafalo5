@@ -443,6 +443,93 @@ SDK gửi `Authorization: Bearer <token>` mọi request.
 Token được mint qua endpoint mới (TBD): `POST /admin/token` (chỉ
 `platform.managers`).
 
+### 7.3 Các phương thức đăng nhập khác
+
+Ngoài `login(user, pass)`, `tfl5.auth` bọc mọi phương thức đăng nhập thay thế
+của platform. Tất cả **hội tụ về cùng một phiên** (cookie `_token` ở browser,
+hoặc `token` bearer ở Node — SDK tự capture như `login`).
+
+```ts
+// Magic email link (chống dò tài khoản: luôn trả về dạng thành công).
+await tfl5.auth.magicLink("alice@acme.com");
+// → server gửi email; user bấm link → /auth/magic set cookie + redirect.
+
+// Phone OTP (Zalo ZNS). start → verify.
+await tfl5.auth.phoneStart("+84901234567");
+const s = await tfl5.auth.phoneVerify("+84901234567", "123456");
+
+// QR: desktop hiển thị QR, mobile (đã đăng nhập) quét để duyệt.
+const { qr_id } = await tfl5.auth.qrStart();
+const session = await tfl5.auth.qrPoll(qr_id!);   // poll đến khi mobile duyệt
+```
+
+#### 7.3.1 Google Sign-In (browser)
+
+Google Sign-In **bắt buộc** dùng thư viện GIS của Google
+(`accounts.google.com/gsi/client`) để render nút + chạy consent trong browser
+— SDK chỉ đổi token ở bước cuối. Vì thế nút Google phải render **client-side**;
+SDK core (headless) không tự render. Hai cách:
+
+**Cách A — helper opt-in `@tfl5/sdk/ui` (khuyến nghị).** Một hàm
+framework-agnostic lo hết: đọc `google_client_id`, nạp GIS, render nút, đổi
+token, và xử lý luôn nhánh link-account. Bundle riêng (~2 KB) nên **không** ảnh
+hưởng SDK core / Node.
+
+```ts
+import { TFL5 } from "@tfl5/sdk";
+import { mountGoogleButton } from "@tfl5/sdk/ui";
+
+const tfl5 = new TFL5();                    // cookie mode, same-origin
+
+await mountGoogleButton(tfl5, {
+  target: "#google-btn",                    // element hoặc CSS selector
+  // clientId tự lấy từ GET /platform/info (google_client_id) nếu bỏ trống.
+  onSignIn: (session) => { location.href = "/app"; },
+  // Chỉ cần khi email trùng một tài khoản CŨ chưa verify → cần password để link:
+  onRequiresPassword: async (usernameHint) =>
+    prompt(`Đã có tài khoản "${usernameHint}". Nhập mật khẩu để liên kết:`),
+  onError: (err) => console.error(err),
+});
+```
+
+Nếu trang được platform host, bundle browser sẵn sàng qua script tag:
+
+```html
+<!-- Platform serving the SDK exposes these at /sdk.js and /sdk-ui.js -->
+<script src="/sdk.js"></script>        <!-- window.TFL5 -->
+<script src="/sdk-ui.js"></script>     <!-- window.tfl5ui -->
+<div id="google-btn"></div>
+<script>
+  const tfl5 = new TFL5();
+  tfl5ui.mountGoogleButton(tfl5, { target: "#google-btn",
+    onSignIn: () => location.href = "/app" });
+</script>
+```
+
+> **Note:** `/sdk-ui.js` (IIFE) and `/sdk-ui.mjs` (ESM) are the built browser
+> bundles from `@tfl5/sdk/ui`. A platform hosting the SDK typically serves them
+> at these paths; for standalone apps install the npm package and bundle normally.
+
+**Cách B — tự render, gọi thẳng `tfl5.auth.google()`.** Nếu bạn tự nạp GIS:
+
+```ts
+// Trong callback GIS: resp.credential là JWT do Google cấp.
+try {
+  await tfl5.auth.google(resp.credential);          // ⚠ field là `credential`
+  location.href = "/app";
+} catch (e) {
+  // Email trùng tài khoản CŨ chưa verify → server đòi password để link.
+  if (e instanceof BadRequestError && e.body?.requires_password) {
+    const pw = await promptForPassword(e.body.username_hint);
+    await tfl5.auth.google(resp.credential, { password: pw });
+  } else throw e;
+}
+```
+
+**Điều kiện:** operator phải set env `TFL5_GOOGLE_CLIENT_ID`. Chưa set thì
+`/auth/google` trả 400 "Google login not configured" và helper ẩn nút
+(hoặc ném lỗi config nếu không auto-fetch được `client_id`).
+
 ## 8. Anonymous mode + share token
 
 User chưa login:

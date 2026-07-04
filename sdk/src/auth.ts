@@ -116,9 +116,37 @@ export class AuthClient {
 
   // ---- Alternative login methods (all converge on a session) ----------
 
-  /** Google Identity Services `id_token` exchange. */
-  google(idToken: string): Promise<LoginResult> {
-    return this.capture(this.http.post<LoginResult>("/auth/google", { id_token: idToken }));
+  /**
+   * Google Identity Services sign-in. Pass the JWT string GIS hands your
+   * callback — `response.credential` (the field is literally named
+   * `credential`; it is *not* an OAuth `id_token` query param). On a fresh
+   * email or an already-verified account this establishes the session and
+   * resolves the {@link LoginResult}.
+   *
+   * LINK REFUSAL: if an *unverified* local account already owns this email,
+   * the server won't merge identities blindly — it throws a
+   * {@link BadRequestError} whose `body.requires_password === true` (and
+   * `body.username_hint` names the account). Catch it, collect that
+   * account's password, and call again with `{ password }` to prove
+   * ownership + link + sign in:
+   *
+   * ```ts
+   * try {
+   *   await tfl5.auth.google(credential);
+   * } catch (e) {
+   *   if (e instanceof BadRequestError && e.body?.requires_password) {
+   *     const pw = await promptForPassword(e.body.username_hint);
+   *     await tfl5.auth.google(credential, { password: pw });
+   *   } else throw e;
+   * }
+   * ```
+   *
+   * Browsers can skip all of this and use `mountGoogleButton` from
+   * `@tfl5/sdk/ui`, which renders the Google button and drives this flow
+   * (including the link prompt) for you.
+   */
+  google(credential: string, opts: { password?: string } = {}): Promise<LoginResult> {
+    return this.capture(this.http.post<LoginResult>("/auth/google", { credential, ...opts }));
   }
 
   /** Send a magic email link (anti-enumeration: always success-shaped). */
