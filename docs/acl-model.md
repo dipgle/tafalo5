@@ -12,6 +12,24 @@
 
 ## 1. TL;DR
 
+**Authorization on tfl5 is FOUR layers that AND together.** Every doc
+read/write must pass ALL applicable layers — any single layer can deny:
+
+```
+L1  App-level ACL       — 5 levels on the `apps` row (§2–§4)
+        ↓  AND
+L2  Resource-type ACL   — arrays on the `resources` row (§6)
+        ↓  AND
+L3  Per-row / per-doc ACL — arrays on the doc/file row (§5)
+        ↓  AND
+L4  Row-level scope      — field-based fencing (§7, opt-in)
+```
+
+A caller sees/edits a doc only if L1 **and** L2 **and** L3 **and** L4 all
+say yes. Emptiness is permissive: an empty L2/L3 array inherits the layer
+above; L4 is off unless the app opts in. `noaccess` and the scope filter
+never *grant* — they only subtract.
+
 - 5 permission levels: `Owner > Manager > Designer > Editor > Reader`
 - Each row that has ACL has 4-7 arrays of **tokens**: `managers`,
   `designers`, `editors`, `readers`, `deletable`, `noaccess`
@@ -22,6 +40,9 @@
   anything (lockout protection).
 - Per-doc and per-file ACL stack ON TOP of app-level ACL. Empty
   per-row ACL = inherit app-level.
+- The resource-type ACL (L2) and row-level scope (L4) are the two layers
+  that let you fence *categories* of data and *individual rows by field*
+  without exploding role tokens.
 
 ---
 
@@ -163,7 +184,166 @@ This is the row-scoping mechanism for fine-grained delegation.
 
 ---
 
-## 6. Roles — the indirection that makes scaling work
+## 6. Resource-level ACL — gating a KIND of data (L2)
+
+The per-row ACL in §5 answers *"who can touch THIS record."* The
+resource-level ACL answers the coarser question *"who can touch THIS
+KIND of record at all"* — it gates every doc op on a resource **type**
+before the request ever reaches an individual row.
+
+The `resources` table carries the same ACL-array shape as `apps` and
+docs:
+
+```
+resources.author
+resources.editors      ← enforced by the doc gate
+resources.readers      ← enforced by the doc gate
+resources.deletable    ← enforced by the doc gate
+resources.noaccess     ← enforced by the doc gate (hard veto)
+resources.managers     ← stored + returned, NOT used by the doc gate*
+resources.designers    ← stored + returned, NOT used by the doc gate*
+resources.authors      ← stored + returned, NOT used by the doc gate*
+```
+
+\* **Accuracy note.** The doc-op gate
+(`crate::auth::resource_acl_allows`) reads and enforces only
+`author`, `editors`, `readers`, `deletable`, `noaccess`. The
+`managers` / `designers` / `authors` arrays are persisted on the row
+and echoed back by `/app/resource/get`, but at Manager/Designer level
+the gate returns deny — so they do not currently grant doc access on
+their own. Rely on `editors` / `readers` / `deletable` (plus the
+owner/manager bypass below) to fence a resource. Don't design around
+`resources.managers` as a doc gate; it isn't wired as one today.
+
+### How it's enforced
+
+On every doc op the handler calls, in order:
+
+```
+require_app_perm(app, Reader|Editor)     ← L1
+  → resource_acl_allows(app, resource, level)  ← L2
+    → scope_filter::resolve(...)               ← L4
+```
+
+The L2 call sits between the app-level check and the row scope filter.
+It is wired on all five doc paths:
+
+| Doc op | L2 level asked |
+|---|---|
+| `/app/doc/list` | Reader |
+| `/app/doc/get` | Reader |
+| `/app/doc/create` | Editor |
+| `/app/doc/update` | Editor |
+| `/app/doc/del` | Editor (+ `deletable`) |
+
+Decision inside `resource_acl_allows`:
+
+```
+1. `_cluster` synthetic user → PASS (cross-tenant orchestration bypass).
+2. If caller == resource.author OR caller is app owner/manager → PASS.
+3. If resource.noaccess matches caller.perms → DENY.
+4. If resource has NO explicit editors/readers/deletable → PASS
+   (empty = permissive; inherit the app-level + per-row decision).
+5. Else AND-gate the caller into the level's array:
+   - Reader: editors OR readers OR deletable
+   - Editor: editors
+```
+
+**Empty = inherit, not deny** — same rule as per-row (§5). A resource
+with all positive arrays empty is fully governed by L1 + L3 + L4. This
+is the pre-REQ-TFL5-015 backward-compatible default: existing resources
+keep behaving exactly as before until you opt in by populating an array.
+
+**Deny is quiet on read.** When L2 denies a `list`/`get`, the endpoint
+returns the same empty-success envelope as a zero-row page — no
+existence leak. On write it returns `AccessDenied`.
+
+### Setting + reading the resource ACL
+
+- **Read:** `POST /app/resource/get { app_tid, tid }` returns the arrays
+  in `data.{editors,readers,deletable,noaccess,managers,designers,authors,author}`.
+  The ACL arrays are only populated in the response for an
+  owner/manager caller (control-plane gate); a mere Reader sees `[]`.
+- **Set:** the arrays are written through `/app/resource/create` and
+  `/app/resource/update` (fields `readers`, `editors`, `noaccess`,
+  `deletable`; omitted = preserve via COALESCE, `[]` = clear). Both
+  endpoints are Manager-gated. Role tids are bracket-wrapped
+  (`[r-…]`) on the way in. There is **no** separate
+  `/app/resource/acl-set` endpoint — use create/update.
+
+### Resource-ACL vs per-row ACL — when to use which
+
+| | Resource-level (L2) | Per-row (L3) |
+|---|---|---|
+| Scope | a whole resource **type** | one doc/file **record** |
+| Question | "who can touch this KIND of data" | "who can touch THIS record" |
+| Typical use | lock a `salary` resource to HR; open a `notice` resource to all | grant Bob edit on one specific doc |
+| Storage | `resources` row | `docs` / `files` row |
+
+Use L2 to draw the broad boundary (only HR reads any `salary` doc),
+then L3 to carve exceptions within what L2 already allows. They AND
+together — L2 can only *narrow*, never widen, what L3 also permits.
+
+---
+
+## 7. Row-level scope — field fencing (L4)
+
+Scope is the fourth and innermost layer. Instead of putting a role
+token on **every row** (the §11 approach), you declare — once, in the
+app config — *which column* carries the tenancy value and *which values*
+each user is allowed to see. The server then AND-s the predicate
+`row's column ∈ caller's allowed set` directly into the query.
+
+You configure it purely with **data** — two keys in the app's
+`apps.acls.scope` JSON blob, no new columns and no new tfl5 code:
+
+- **`field_map`** — per resource, which column maps to which scope tier
+  (e.g. `"deal": { "S": "company_id", "O": "owner_id" }`).
+- **`bindings`** — per user, which scope code + values they hold
+  (e.g. `"u-alice": [{ "scope": "S", "params": { "S": "acme" } }]`).
+
+The engine is **domain-neutral**: the scope codes are just letters
+(`W`/`S`/`C` = a 3-level widest→narrowest hierarchy, `M` = multi at the
+narrow tier, `O` = own-records, `G` = global, `N` = none). A CRM reads
+`S` as "company"; a school reads `S` as "school". Multi-role users get
+their bindings UNION'd (OR).
+
+**Read vs write.** On `/app/doc/list` the predicate is spliced into the
+SQL (`AND (row's scope column ∈ allowed set)`). On
+`/app/doc/{get,create,update,del}` it's evaluated in-memory against the
+row's indexed data. A user with no matching binding lists **zero rows**
+(the fragment becomes `FALSE`) — a silent, existence-safe empty page.
+
+**Activation (all three must be true to enforce):**
+
+1. Env flag `TFL5_ENFORCE_SCOPE=true` — global circuit breaker; unset =
+   scope is bypassed entirely (ships dark by default).
+2. Per-app opt-in — `apps.acls.scope.field_map` is non-empty.
+3. The requested resource has an entry in `field_map`; if it doesn't,
+   the request is default-denied (`scope_not_configured`, 400).
+
+So for an app that hasn't opted in, L4 is a no-op and only L1–L3 apply.
+
+### Scope vs role-tokens (§11) — both valid
+
+| | Role-token per row (§11) | Scope (L4) |
+|---|---|---|
+| Grant lives on | each doc's ACL array | one `bindings` map in app config |
+| "User sees rows where field X = their value" | one role + one token per distinct value, on every row | one `field_map` entry + one binding per user |
+| Membership change | edit role members | edit one binding |
+| Best when | small, discrete grants; ad-hoc sharing | many rows partitioned by a stable field (tenant / owner / org unit) |
+
+Scope scales better precisely when the number of distinct values is
+large: you avoid minting a role and stamping a token onto every row.
+Role tokens remain the right tool for small, explicit, per-doc grants.
+
+> This section only **introduces** scope. The full model — every scope
+> code, the generic-vs-legacy keys, and the worked CRM + school examples
+> — lives in **[scope.md](scope.md)**. Don't reimplement the spec here.
+
+---
+
+## 8. Roles — the indirection that makes scaling work
 
 A role is a named, mutable list of `user_tid`s, scoped per-app.
 
@@ -204,7 +384,7 @@ row.
 
 ---
 
-## 7. The lock-out guard — protecting Owner
+## 9. The lock-out guard — protecting Owner
 
 Two protections built into tfl5 endpoints:
 
@@ -226,7 +406,7 @@ Two protections built into tfl5 endpoints:
 
 ---
 
-## 8. ACL patching endpoints
+## 10. ACL patching endpoints
 
 ### App-level
 ```
@@ -281,9 +461,15 @@ Share = orthogonal channel; doesn't mutate the doc's own ACL.
 Revocable instantly via `/app/share/revoke`. Anonymous link claim:
 `POST /app/share/claim { token, app_tid? }`.
 
+> The `fields` whitelist above is *access* control, not *confidentiality*
+> — it narrows what a share exposes, but the tfl5 server can still read
+> the underlying data. For the confidentiality / trust model (tfl5 is
+> **custodial** — the server can read stored data; it is **not**
+> zero-knowledge), see **[security-model.md](security-model.md)**.
+
 ---
 
-## 9. Role-based ACL conventions for a school management app
+## 11. Role-based ACL conventions for a school management app
 
 This section shows how to map a typical set of school roles (principal,
 teacher, parent, health staff, administrator) cleanly onto tfl5's ACL
@@ -366,7 +552,7 @@ health officer today."
 
 ---
 
-## 10. Common mistakes — read before designing
+## 12. Common mistakes — read before designing
 
 1. **Don't use username in ACL arrays.** Always use `user_tid`.
    Username is for login; tid is for authorization.
@@ -401,7 +587,7 @@ health officer today."
 
 ---
 
-## 11. Audit + traceability
+## 13. Audit + traceability
 
 Every mutation that matters writes one row to `audit_log`. Operators
 query via `/admin/audit/list` filtered by actor / target / action /

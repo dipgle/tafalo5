@@ -8,17 +8,25 @@ tfl5 without modifying the Rust core.
 ### If you're new (read in order)
 1. **[app-builder-guide.md](app-builder-guide.md)** — concepts,
    building blocks, app lifecycle, walkthrough. Start here.
-2. **[acl-model.md](acl-model.md)** — authorization model. Read in
-   full before designing any data model. The 6-array ACL is THE
-   most-common source of foot-guns; don't skip.
-3. **[api-reference.md](api-reference.md)** — endpoint-by-endpoint
+2. **[acl-model.md](acl-model.md)** — authorization model (the 4 layers:
+   app → resource → per-row → scope). Read in full before designing any
+   data model. The ACL arrays are THE most-common source of foot-guns; don't skip.
+3. **[scope.md](scope.md)** — row-level scope (field-based fencing). Read
+   if users should see only *their* rows (own records, per-company, per-class)
+   without minting a role token per row.
+4. **[security-model.md](security-model.md)** — the confidentiality & trust
+   model. **Read before you promise your end-users anything about privacy** —
+   tfl5 is custodial (encrypted at rest, but the operator can read it), NOT
+   zero-knowledge.
+5. **[api-reference.md](api-reference.md)** — endpoint-by-endpoint
    reference. Lookup as you build.
-4. **[recipes.md](recipes.md)** — 12 practical "how do I X?" patterns
+6. **[recipes.md](recipes.md)** — practical "how do I X?" patterns
    (audit, bulk move, share with expiry, encrypted field, …).
    Search this when you hit a task.
 
 ### If you're an AI agent picking up this folder
-Read app-builder-guide.md → acl-model.md → api-reference.md. Pull
+Read app-builder-guide.md → acl-model.md → scope.md → security-model.md →
+api-reference.md. Pull
 api-reference.md sections on demand by endpoint. These files are the
 complete contract — nothing outside this folder is required to start
 building.
@@ -45,6 +53,9 @@ building.
 | Schema-defined data (resources + docs) with field-level encryption | `/app/resource/*`, `/app/doc/*` | api-reference §Resources + §Docs |
 | File upload (static FE + binary attachments) with per-file ACL | `/app/file/*` | api-reference §Files |
 | Roles + per-row ACL with role tokens `[r_xxx]` | `/app/role/*` | acl-model + api-reference §Roles |
+| Resource-type ACL (gate a whole KIND of data) | `/app/resource/update` | acl-model §Resource-level ACL |
+| Row-level scope — users see only *their* rows by a data field (own/company/class), env-gated | `/app/scope/*`, `apps.acls.scope` | scope.md |
+| Custodial field-level encryption (at-rest; NOT zero-knowledge) + F3 per-grantee sealed attachments | `/app/doc/*` levels, `/app/f3/*` | security-model.md |
 | Read-only sharing with field whitelist + anonymous tokens | `/app/share/*` | api-reference §Sharing |
 | Test/release stages + atomic promote | `/app/test/*`, `/app/release` | api-reference §Stages |
 | Declarative hooks (`require_fields`, `set_fields`, `webhook`) | `resources.hooks` JSONB | app-builder-guide §5.2 |
@@ -95,4 +106,6 @@ One non-blocking quirk across the API surface — design around it:
 | Add a role / change role members | Use `/app/role/*` — see acl-model §6. |
 | Need server-side validation | Use a `require_fields` declarative hook — see app-builder-guide §5.2. |
 | Need to fire a notification | Use a `webhook` hook, or `/app/email/send` for email. ZNS/SMS via `/op/<id>/send` once those operators are fully wired. |
-| Need to store sensitive PII | Mark the resource field `level: 1` or `2` — see app-builder-guide §5.1. |
+| Need to store sensitive PII | Mark the resource field `level: 1` or `2` — see app-builder-guide §5.1. **Then read [security-model.md](security-model.md)** so you describe it correctly (custodial, not zero-knowledge). |
+| Need users to see only *their own* rows | Use [scope](scope.md) (fence by a data field) — don't mint a role token per row. |
+| Need "only the vendor can't read it" (zero-knowledge) | tfl5 does NOT provide it — do client-side E2E yourself; see [security-model.md](security-model.md) §3. |

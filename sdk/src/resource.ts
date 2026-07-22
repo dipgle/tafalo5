@@ -123,11 +123,25 @@ export class ResourceClient<T extends Record<string, unknown> = Record<string, u
     return this.http.post<ResourceDef>("/app/resource/get", { tid });
   }
 
-  /** Update this resource's definition (name/fields/hooks). To CREATE a
-   *  new resource use `tfl5.createResource(...)` instead. */
-  async putSchema(def: { name?: string; fields?: FieldDecl[]; hooks?: Hook[] }): Promise<ResourceDef> {
+  /** Update this resource's definition (name/fields/hooks) and/or its
+   *  per-RESOURCE-TYPE ACL arrays. To CREATE a new resource use
+   *  `tfl5.createResource(...)` instead.
+   *
+   *  Resource-ACL (`readers/editors/deletable/noaccess`) gates every
+   *  `/app/doc/*` op on this resource TYPE — a coarser layer than per-doc ACL
+   *  (see acl-model.md). Omit an array to preserve it; pass `[]` to clear.
+   *  (`managers`/`designers`/`authors` are NOT enforced as a doc gate — only the
+   *  four arrays here are; see acl-model.md "Resource-level ACL".) */
+  async putSchema(
+    def: { name?: string; fields?: FieldDecl[]; hooks?: Hook[] } & ResourceAcl,
+  ): Promise<ResourceDef> {
     const tid = await this.resolveTid();
     return this.http.post<ResourceDef>("/app/resource/update", { tid, ...def });
+  }
+
+  /** Convenience: set only this resource's ACL arrays (leaves schema/hooks). */
+  async setResourceAcl(acl: ResourceAcl): Promise<ResourceDef> {
+    return this.putSchema(acl);
   }
 
   /** Declarative-hook accessor (require_fields / set_fields / webhook). */
@@ -137,6 +151,15 @@ export class ResourceClient<T extends Record<string, unknown> = Record<string, u
 }
 
 export interface DocAcl {
+  editors?: string[];
+  readers?: string[];
+  deletable?: string[];
+  noaccess?: string[];
+}
+
+/** Per-resource-type ACL arrays enforced on `/app/doc/*` (the four the server
+ *  actually gates on — see acl-model.md "Resource-level ACL"). */
+export interface ResourceAcl {
   editors?: string[];
   readers?: string[];
   deletable?: string[];

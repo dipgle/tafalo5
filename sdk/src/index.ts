@@ -9,7 +9,9 @@
 //    ├─ .groups               ← global groups (/admin/group/*)
 //    ├─ .resource(ma)         ← spine `resources` + `docs` (CRUD/list/upsert)
 //    │     ├─ .hooks          ← declarative hooks (require_fields/set_fields/webhook)
+//    │     ├─ .setResourceAcl ← per-resource-type ACL gate (acl-model.md)
 //    │     └─ .getSchema()    ← fields incl. field-level encryption tiers
+//    ├─ .scope                ← row-level scope config (/app/scope/*, see scope.md)
 //    ├─ .operator(opId)       ← dispatch /op/<id>/<action> (catalog + WASM)
 //    ├─ .integrations         ← per-app operator enable/config
 //    ├─ .wasm                 ← tenant WASM operator lifecycle
@@ -29,6 +31,7 @@ import { HttpCore, type Tfl5Config } from "./http.js";
 import { IntegrationsClient, OperatorClient, WasmClient } from "./operator.js";
 import { ResourceClient } from "./resource.js";
 import { GroupsClient, RolesClient } from "./roles.js";
+import { ScopeClient } from "./scope.js";
 import { SharesClient } from "./shares.js";
 import { SourcesClient } from "./sources.js";
 import type { FieldDecl, Hook } from "./types.js";
@@ -45,6 +48,8 @@ export class TFL5 {
   readonly files: FilesClient;
   readonly shares: SharesClient;
   readonly sources: SourcesClient;
+  /** Row-level scope config (`/app/scope/*`). See docs/scope.md. */
+  readonly scope: ScopeClient;
 
   constructor(config: Tfl5Config = {}) {
     this.http = new HttpCore(config);
@@ -57,6 +62,7 @@ export class TFL5 {
     this.files = new FilesClient(this.http);
     this.shares = new SharesClient(this.http);
     this.sources = new SourcesClient(this.http);
+    this.scope = new ScopeClient(this.http);
   }
 
   /** Scope subsequent calls to an app — `app_tid` is auto-injected. */
@@ -110,7 +116,9 @@ export default TFL5;
 export { HttpCore } from "./http.js";
 export type { Tfl5Config, AuthMode } from "./http.js";
 export { ResourceClient, HooksAccessor } from "./resource.js";
-export type { ResourceDef, DocAcl } from "./resource.js";
+export type { ResourceDef, DocAcl, ResourceAcl } from "./resource.js";
+export { ScopeClient } from "./scope.js";
+export type { ScopeCode, ScopeBinding, ScopeFieldMap, ScopeConfig } from "./scope.js";
 export { OperatorClient, IntegrationsClient, WasmClient } from "./operator.js";
 export { AppsClient } from "./apps.js";
 export type { AppConfig, AppAcl } from "./apps.js";

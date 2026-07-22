@@ -15,7 +15,7 @@
 3. [Bulk-move 200 students from grade 6A to grade 7A at end of school year](#3-bulk-move-200-students-from-grade-6a-to-grade-7a-at-end-of-school-year)
 4. [Grant a user read access to all attendance docs for one student](#4-grant-a-user-read-access-to-all-attendance-docs-for-one-student)
 5. [Generate a one-time shareable link to a single doc](#5-generate-a-one-time-shareable-link-to-a-single-doc)
-6. [Encrypt a field the client never sees in plaintext at rest](#6-encrypt-a-field-the-client-never-sees-in-plaintext-at-rest)
+6. [Encrypt a sensitive field at rest (custodial)](#6-encrypt-a-sensitive-field-at-rest-custodial)
 7. [Validate input server-side without writing Rust](#7-validate-input-server-side-without-writing-rust)
 8. [Push a notification when a record is created with a specific status](#8-push-a-notification-when-a-record-is-created-with-a-specific-status)
 9. [Show only this teacher's class on a list-students page](#9-show-only-this-teachers-class-on-a-list-students-page)
@@ -251,10 +251,18 @@ recipient never sees fields outside the list.
 
 ---
 
-## 6. Encrypt a field the client never sees in plaintext at rest
+## 6. Encrypt a sensitive field at rest (custodial)
 
-**Task:** "Store the student's national ID encrypted at rest. Only
-authorised callers get plaintext back."
+**Task:** "Store the student's national ID encrypted at rest, safe if the
+database is stolen. Authorised callers get plaintext back."
+
+> ⚠ **Custodial, NOT zero-knowledge.** This encrypts against DB theft and
+> outsiders — **the platform operator can still decrypt it** (they hold the
+> keys; an authorised read decrypts server-side and returns plaintext). Do
+> **not** tell your users this is "end-to-end" or that "the vendor can't read
+> it." For true zero-knowledge you must encrypt in your own client and store
+> opaque bytes. Read [security-model.md](security-model.md) before promising
+> privacy.
 
 **Pattern:** declare the field at `level: 1` or `level: 2` in the
 resource schema. The platform encrypts on `/app/doc/create` and
@@ -295,19 +303,27 @@ POST /app/doc/get
 { "app_tid": "a-example", "tid": "d_xxx" }
 ```
 
-**Why this works:** each app has a per-app KEK in `app_keys`,
-wrapped by the cell's master key. Field-level encryption uses AEAD
-with `AAD = <doc_tid>|<field_name>` so swapping ciphertexts between
-fields/docs detects as tamper. Keys never leave the server.
+**Why this works:** each app has its own data key (DEK) in `app_keys`,
+envelope-wrapped by the cell's master key (KEK). Field-level encryption uses
+AEAD with `AAD = <doc_tid>|<field_name>` so swapping ciphertexts between
+fields/docs detects as tamper. The keys are **held by the platform** (the
+master key lives on the cell) — that's what makes this *custodial*: strong
+against DB theft, readable by the operator.
 
 **Gotchas:**
 - **Encrypted fields aren't searchable.** `/app/doc/list { where: { national_id: ... } }`
   fails with `cannot_filter_encrypted_field`. If you need lookup
   by value, keep it `level: 0`.
+- **Level 1 and level 2 are NOT an access tier** — both encrypt identically,
+  and any caller who passes the doc's ACL + [scope](scope.md) gets the
+  decrypted value. To hide fields from *authorised-but-not-need-to-know*
+  roles, use the scope **PII level** (masking), not the encryption level.
 - Don't reflexively mark everything `level: 2` — encrypted fields
   have a decrypt-on-read cost.
-- `level: 3` (per-grantee sealed-box) is **not yet supported** at
-  the resource level. For level-3 file attachments use `/app/f3/*`.
+- `level: 3` (per-grantee sealed-box) is **not supported** at the resource-field
+  level. For per-grantee sealed content use F3 attachments (`/app/f3/*`), which
+  seal a file key to each grantee's X25519 public key (still custodial — see
+  [security-model.md](security-model.md)).
 
 **See also:** [app-builder-guide.md §5.1 fields](app-builder-guide.md#51-fields-jsonb-array),
 [api-reference.md POST /app/resource/create](api-reference.md#post-appresourcecreate).

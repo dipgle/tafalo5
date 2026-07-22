@@ -596,9 +596,32 @@ editors, designers, readers, authors, noaccess, deletable`).
 **Body:** all fields optional except `app_tid` + `tid`. COALESCE-skip
 semantics — omitted = preserve.
 ```json
-{ "app_tid", "tid", "name?", "description?", "fields?", "status?",
-  "sharing?", "hooks?" }
+{
+  "app_tid", "tid",
+  "name?", "description?", "fields?", "status?", "sharing?", "hooks?",
+  "before_create_code?", "after_create_code?",
+  "before_update_code?", "after_update_code?",
+  "readers?":   ["..."],
+  "editors?":   ["..."],
+  "noaccess?":  ["..."],
+  "deletable?": ["..."],
+  "audit_writes?": true
+}
 ```
+
+**Per-resource ACL (REQ-TFL5-015):** `readers / editors / noaccess /
+deletable` set the resource's own ACL arrays (the same seven arrays
+`/app/resource/get` returns). `/app/resource/update` is the endpoint
+that WRITES them — there is no separate resource-ACL route. Omitted =
+preserve (COALESCE-skip); an empty array clears the bucket. Role tids
+are bracket-wrapped (`[r-…]`) before persistence. These arrays gate
+every `/app/doc/*` op on that resource: doc list/get is denied (empty
+success, no existence leak) unless the caller is Reader on the
+resource; doc create/update/delete additionally require the resource's
+`editors` / `deletable`. `managers / designers / authors` are read
+back by `/app/resource/get` but are set at create time / via app-level
+gates — `/app/resource/update` only accepts the four arrays above.
+See [acl-model.md](acl-model.md) for the layered model.
 
 ### POST /app/resource/del
 
@@ -814,6 +837,85 @@ owner/manager, doc author, or row.deletable member).
 
 **Body:** `{app_tid, tid, editors?, readers?, deletable?, noaccess?}`.
 COALESCE-skip semantics.
+
+### Row-level scope (REQ-TFL5-006)
+
+On top of the per-doc/per-resource ACL arrays, `/app/doc/*` supports a
+tenant-configured **row-level scope filter**: "the caller only sees
+rows whose column X ∈ their allowed set". It is domain-neutral (a code
+`S` can mean "company", "school", or anything) and configured purely
+with data — no new schema, no new code. The config lives in the app's
+`apps.acls.scope` JSONB blob as two keys:
+
+- **`field_map`** — per `resource_ma`, maps scope codes (`G/W/S/C/M/O/N`)
+  to the doc column they filter on (plus `own_param` for own-records).
+- **`bindings`** — per `user_tid`, a list of
+  `{ scope, params, role_code, pii_level? }` grants. Multi-role users
+  get their bindings UNION'd (OR).
+
+**Enforcement is gated by three layers, all must be true (default OFF):**
+
+1. Env flag `TFL5_ENFORCE_SCOPE=true` — global circuit breaker; unset =
+   bypass entirely (ships dark).
+2. Per-app opt-in — `apps.acls.scope.field_map` non-empty.
+3. Requested resource has an entry in `field_map` — otherwise
+   default-deny (`scope_not_configured`, 400).
+
+When active on `/app/doc/list`, the scope predicate is AND'd into the
+SQL alongside any client `where` filter; a user with no matching
+bindings gets zero rows. The response carries a
+`meta.scope_filter_applied` object (and `meta.pii_aggregate_dropped`
+when PII-masking drops rows). The synthetic `_cluster` user bypasses
+scope. See [acl-model.md](acl-model.md) for how scope layers with the
+ACL arrays.
+
+### POST /app/scope/get
+
+**Auth:** Designer on `app_tid` (scope config is operator-tier).
+
+**Body:** `{app_tid}`.
+
+**Response:**
+```json
+{
+  "result": true,
+  "app_tid": "a_xxx",
+  "field_map":   { ... },   // apps.acls.scope.field_map verbatim
+  "my_bindings": [ ... ],   // ONLY the caller's own bindings
+  "timestamp": 0
+}
+```
+Designer callers see the full `field_map` (operator config, no PII) but
+only their OWN `bindings` entry, mirroring `/user.scope_bindings`.
+Unset scope returns `{field_map: {}, my_bindings: []}`.
+
+### POST /app/scope/set
+
+**Auth:** Designer on `app_tid`.
+
+**Body:** three optional patch modes, applied in order (`field_map`,
+then `bindings` replace, then `bindings_patch`):
+```json
+{
+  "app_tid":         "a_xxx",                 required
+  "field_map?":      { "<resource_ma>": { ... } },  // object=replace, null=clear
+  "bindings?":       { "<user_tid>": [ {scope,params,role_code,pii_level?} ] },
+                                                     // object=replace ALL, null=clear
+  "bindings_patch?": { "<user_tid>": [ ... ] }       // per-user: array=set, null=delete
+}
+```
+
+**Validation:** `field_map` must be object or null
+(`scope_field_map_invalid`); `bindings` must be object or null
+(`scope_bindings_invalid`); `bindings_patch` must be an object whose
+values are each an array or null
+(`scope_bindings_patch_invalid` / `…_value`). `bindings_patch` lets an
+idempotent sync update one user at a time without shipping the whole
+map.
+
+**Response:** `{result: true, data: {app_tid, bindings_count,
+field_map_size}, timestamp}` — the post-write counts, so an idempotent
+sync can sanity-check without a `/app/scope/get` round-trip.
 
 ---
 
