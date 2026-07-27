@@ -1,652 +1,408 @@
-# JS SDK — `@tfl5/sdk`
+# JS/TS SDK — `@tfl5/sdk`
 
-> 🚧 **ROADMAP — SDK package chưa build.** File này là **design spec** cho JS SDK
-> sẽ ship khi tới phase. Nếu bạn là dev đang cần xây ứng dụng trên tfl5 HÔM NAY,
-> đọc **[api-reference.md](api-reference.md)** — REST API đầy đủ, đủ để build app
-> không cần SDK package. Quay lại file này khi spec cần tinh chỉnh hoặc khi SDK
-> bắt đầu được implement.
->
-> Trạng thái hiện tại:
-> - ❌ `@tfl5/sdk` npm package chưa publish
-> - ❌ `/sdk.js` UMD bundle endpoint chưa wire
-> - ❌ `@tfl5/cli` codegen chưa build
-> - ✅ Tất cả REST endpoint SDK sẽ wrap đã có (xem [api-reference.md](api-reference.md))
->
-> **Khi nào ship**: ~3-4 batch sau khi resource UI + DocBus realtime ship
-> (priority cao hơn vì gỡ block FE dev productivity ngay).
+> **Status: 0.1.0 — implemented, not yet published to npm.** Core transport,
+> auth, and the full client surface documented below are real, typecheck
+> clean, and end-to-end smoked against a live dev server (see
+> `sdk/README.md` for the smoke-test notes). This file is the API
+> reference for what ships today, plus a look at what's landing next.
+> Every endpoint here also has a plain-REST description in
+> [api-reference.md](api-reference.md) if you'd rather call it directly
+> without the SDK.
 
 ---
 
-Thư viện client JS cho tenant SPA và Node ứng dụng nói chuyện với tfl5 platform.
-Bọc toàn bộ API surface (the platform REST API)
-thành object-oriented + Promise-based + TypeScript-aware.
+## 1. Distribution
 
-## 1. Phân phối
+| Form | Use case | What you get |
+|---|---|---|
+| `GET /sdk.js` | Drop-in `<script>` tag, zero build step | IIFE bundle, registers `window.TFL5` |
+| `GET /sdk.mjs` | Native ESM `<script type="module">` | `import { TFL5 } from "/sdk.mjs"` |
+| `GET /sdk-ui.js` / `GET /sdk-ui.mjs` | The opt-in Google Sign-In button helper | registers `window.tfl5ui`, or `import { mountGoogleButton }` |
+| `npm install @tfl5/sdk` | Node/CLI or a bundler pipeline (Vite/webpack/Next.js) | ESM + `.d.ts` — **not published yet**; build from `sdk/` in this repo meanwhile |
 
-| Hình thức            | Use case                                      | Output             |
-|----------------------|-----------------------------------------------|---------------------|
-| `GET /sdk.js`        | Quick-start cho SPA tenant — 1 dòng script    | UMD bundle, đăng ký `window.TFL5` |
-| `npm @tfl5/sdk`      | Build pipeline (Vite/Webpack/Next.js)         | ESM + CJS                          |
-| `npm @tfl5/cli`      | Codegen TS types từ resource schema           | CLI binary                         |
+Every tfl5 server serves its own SDK bundle: `/sdk.js`, `/sdk.mjs`,
+`/sdk-ui.js`, `/sdk-ui.mjs` are baked into the server binary from the
+committed `sdk/` source, so the bundle a server serves always matches the
+version it was built from — there's no drift between "the SDK docs" and
+"what `<script src="/sdk.js">` actually gives you." There is no separate
+`@tfl5/cli` codegen tool today.
 
-Server tự host bundle qua `GET /sdk.js` (extension `.js` → trong whitelist
-static, nhưng route đặc biệt cao hơn — render từ binary embed thay vì đọc
-`assetp/`). Caching aggressive (1 năm, immutable nếu có hash trong URL).
-
-## 2. Browser usage
+## 2. Browser usage (no build step)
 
 ```html
-<!-- Auto-detect host từ URL hiện tại -->
 <script src="/sdk.js"></script>
 <script>
-  const tfl5 = new TFL5();
-  await tfl5.login(username, password);
+(async () => {
+  const tfl5 = new TFL5();                 // host = window.location.origin
+  await tfl5.auth.login(username, password);
+  tfl5.useApp("a-xxxx");
+})();
 </script>
 ```
 
-Hoặc ESM:
+or ESM:
 
 ```html
 <script type="module">
-  import { TFL5 } from "/sdk.js";
+  import { TFL5 } from "/sdk.mjs";
   const tfl5 = new TFL5();
 </script>
 ```
 
-Auto-detect:
-- `host` = `window.location.origin`
-- `appId` = inferred from server (cookie set by `setConfig` middleware, hoặc
-  endpoint `GET /?resource_id=__meta` trả về app config).
+`host` defaults to `window.location.origin` in the browser. There is no
+auto-detected `appId` — call `tfl5.useApp(appTid)` once you know it (or
+pass `app_tid` per-call; an explicit body value always wins over the
+scoped app).
 
-## 3. Node usage
+## 3. Node / server-side usage
 
-```js
+```ts
 import { TFL5 } from "@tfl5/sdk";
 
 const tfl5 = new TFL5({
-  host:   "https://acme.com",
-  appId:  "a_xxx",                    // explicit, không có window
-  token:  process.env.TFL5_TOKEN,     // server-side token
+  host: "https://acme.example.com",
+  appId: "a_xxx", // no `window` in Node, so set it explicitly
 });
 
-await tfl5.user();
+await tfl5.auth.login("dev_demo", process.env.DEMO_PASSWORD!); // captures the bearer token
+const me = await tfl5.auth.me();
 ```
 
-Node mode dùng `Authorization: Bearer <token>` header thay vì cookie. Token mint
-qua endpoint admin của platform.
-
-## 4. API surface — module breakdown
-
-### 4.1 Top-level
+Node mode defaults to `auth: "bearer"` (no `window` present) and sends
+`Authorization: Bearer <token>`. You can also mint/pass a token directly:
 
 ```ts
-class TFL5 {
-  constructor(options?: TFL5Options);
-
-  // Auth
-  login(username: string, password: string): Promise<User>;
-  logout(): Promise<void>;
-  register(input: RegisterInput): Promise<User>;
-  resetPassword(username: string, newPassword: string): Promise<void>;
-
-  // Context
-  user(): Promise<User | null>;        // null nếu chưa login
-  app(): Promise<AppConfig>;           // current app
-  license(): Promise<LicenseInfo>;     // combo user + app license
-
-  // Sub-modules
-  resource<T extends string>(idOrMa: T): ResourceClient<T>;
-  shares: SharesClient;
-  files: FilesClient;
-  groups: GroupsClient;
-  roles: RolesClient;
-  apps: AppsClient;
-  errors: typeof Errors;               // class references để dùng với instanceof
-}
+const tfl5 = new TFL5({ host: "...", appId: "a_xxx", token: myServiceToken });
 ```
 
-### 4.2 ResourceClient — `tfl5.resource("post")`
+## 4. Architecture → SDK map
+
+The platform spine is immutable: **`apps` → (`groups`, `roles`,
+`resources`, `docs`)**. The SDK mirrors that shape one-to-one, plus the
+surrounding primitives:
+
+| Platform primitive | Endpoints | SDK surface |
+|---|---|---|
+| `apps` (spine root) + 7-array ACL + members | `/app/update` `/app/get` `/app/list` `/app/acl-set` `/app/member/*` | `tfl5.apps` |
+| `roles` (per-app) | `/app/role/*` `/app/roles/list` | `tfl5.roles` |
+| `groups` (global) | `/admin/group/*` | `tfl5.groups` |
+| `resources` + `docs` | `/app/resource/*` `/app/doc/*` | `tfl5.resource(ma)` |
+| declarative hooks | `resources.hooks` | `tfl5.resource(ma).hooks` |
+| field-level encryption (level 0/1/2) | transparent — server splits `data_indexed`/`data_secret` | — you always read/write plain field values |
+| row-level scope | `/app/scope/*` | `tfl5.scope` |
+| operators (catalog + WASM) | `/op/<id>/<action>` | `tfl5.operator(id).invoke()` |
+| operator admin/config | `/app/integrations/*` | `tfl5.integrations` |
+| tenant WASM lifecycle | `/app/wasm/*` | `tfl5.wasm` |
+| app-wide files + folders | `/app/file/*` `/app/folder/*` | `tfl5.files` |
+| per-doc shares + link claim | `/app/share/*` | `tfl5.shares` |
+| signed inbound data channels | `/app/source/*` | `tfl5.sources` |
+| auth (cookie + bearer) + PDPD rights | `/login` `/logout` `/reg` `/user` `/auth/*` `/user/data/*` | `tfl5.auth` |
+
+Anything not yet covered by a typed client: `tfl5.raw(path, body)` — a
+raw POST that still unwraps the `{result, data}` envelope and throws the
+same typed errors.
+
+### 4.1 Landing next (endpoint groups without a typed client yet)
+
+These endpoint groups are real and callable today via `tfl5.raw(...)` or
+plain `fetch`; typed SDK modules for them are being built out. Treat the
+names below as the REST surface they wrap, not as a preview of exact SDK
+method signatures — those may still shift before each module ships:
+
+| Area | Endpoints | What it's for |
+|---|---|---|
+| Site publishing | `/app/site/*` | The content-addressed draft → snapshot → publish/rollback engine behind the visual no-code builder and the in-browser code editor. See [app-builder-guide.md §2.1/§4](app-builder-guide.md#21-serving-precedence--read-this-before-you-upload-anything). |
+| Versioned code deploy | `/app/bundle/*` | Upload + activate a versioned FE build, with rollback. |
+| Per-doc encrypted attachments | `/app/f3/*` | Files bound to one doc's ACL and encryption key (distinct from the app-wide `tfl5.files`). |
+| Durable compute | `/durable/*`, `/ws/durable/subscribe` | The opt-in, **default-OFF** stateful/durable-execution operator — see [app-builder-guide.md §7](app-builder-guide.md#7-what-tfl5-does-not-give-you). |
+| Per-app email | `/app/email/*` | Send via the platform's mail service, list sends/inbox, DKIM + DNS record setup. |
+| Billing | `/billing/*` | The public pricing catalog, checkout, and provider webhooks. |
+| Account | `/user/*` (profile, 2FA, email management) | Broader account management alongside the PDPD rights already in `tfl5.auth` today. |
+| Realtime chat | `/ws/chat`, `/app/chat/history` | The first-party, Reader-gated, room-scoped WebSocket chat primitive. |
+
+## 5. Docs & resources — `tfl5.resource(ma)`
 
 ```ts
-interface ResourceClient<T extends string> {
-  list(opts?: ListOptions): Promise<ListResult<DocOf<T>>>;
-  get(docId: string): Promise<DocOf<T>>;
-  add(data: DataOf<T>): Promise<DocOf<T>>;
-  edit(docId: string, data: Partial<DataOf<T>>): Promise<DocOf<T>>;
-  delete(docId: string): Promise<void>;
+const task = tfl5.resource<{ title: string; status: string }>("task");
 
-  // Sharing convenience
-  share(docId: string, opts: ShareOptions): Promise<Share>;
-
-  // Bulk
-  reset(filter: FilterRules): Promise<void>;        // app.managers only
-
-  // Hook-triggered ops
-  call(fnc: string, params: any): Promise<any>;     // POST /data/sfnc/<resource>/<fnc>
-}
-
-type ListOptions = {
-  filter?:  FilterRules;
-  skip?:    number;
-  limit?:   number;       // default 30, max 100
-  deleted?: boolean;
-};
-
-type ListResult<T> = {
-  rows:      T[];
-  total:     number;
-  skip:      number;
-  limit:     number;
-  timestamp: number;
-};
+const created = await task.create({ title: "Write SDK docs", status: "todo" });
+const open = await task.list({ where: { status: "todo" }, limit: 50 });
+await task.update(created.tid, { ...created.data, status: "done" }); // full replace
+await task.patch(created.tid, { status: "done" });                  // get → merge → update
+await task.upsert({ match_on: { title: "Write SDK docs" }, data: created.data });
+await task.setAcl(created.tid, { readers: ["[r_team]"] });
+await task.del(created.tid);
 ```
 
-### 4.3 SharesClient — `tfl5.shares`
+`update()` **replaces** `data` wholesale — any field you don't send is
+dropped server-side. `patch()` is a convenience read-modify-write (not
+atomic — a concurrent writer can race it); for an ACL-only change use
+`setAcl()` instead of touching `data`.
+
+Schema + hooks live on the same client (resolved by `ma`, cached):
 
 ```ts
-interface SharesClient {
-  list(filters: ShareListFilters): Promise<Share[]>;
-  get(shareId: string): Promise<Share>;
-  revoke(shareId: string): Promise<void>;
+const schema = await task.getSchema();               // fields, hooks, ...
+await task.putSchema({ hooks: [...] });               // replace hooks (or fields/ACL)
+await task.hooks.set([{ id: "require_status", on: ["before_create"],
+  type: "require_fields", params: { fields: ["status"] } }]);
 
-  // Token claim (anonymous flow)
-  claim(token: string): Promise<void>;              // explicit
-  claimFromUrl(): Promise<boolean>;                 // tự đọc ?_share= từ URL hiện tại
-                                                    //   trả true nếu tìm + claim thành công
-}
+// Create a NEW resource on the currently-scoped app:
+await tfl5.createResource({ ma: "task", name: "Task", fields: [...] });
 ```
 
-`claimFromUrl` thường được gọi 1 lần ngay sau `new TFL5()` để hấp thụ share URL
-anonymous khi user mở public link.
+Field-level encryption (level 0/1/2) is transparent end to end,
+including through `set_fields` hooks — the SDK only ever sees plaintext
+field values; see [app-builder-guide.md §5.1](app-builder-guide.md#51-fields-jsonb-array)
+for what each level means.
 
-### 4.4 FilesClient — `tfl5.files`
+## 6. Auth — `tfl5.auth`
 
 ```ts
-interface FilesClient {
-  upload(path: string, file: File | Blob): Promise<FileEntry>;
-  replace(path: string, file: File | Blob): Promise<FileEntry>;
-  list(path: string): Promise<FileEntry[]>;
-  delete(path: string): Promise<void>;            // soft-delete, recoverable
-  rename(path: string, newName: string): Promise<FileEntry>;
-
-  // Trash bin (Batch 24). `delete()` now stamps deleted_at and moves the
-  // file under _trash/ on disk; recovery via restore(); permanent removal
-  // via purge(). Auto-purge after TFL5_TRASH_TTL_DAYS (default 30).
-  trashList(opts?: { stage?: "test" | "release" }): Promise<TrashEntry[]>;
-  restore(fileTid: string): Promise<FileEntry>;   // un-delete (Editor+)
-  purge(fileTid: string): Promise<void>;          // irreversible (Manager+)
-
-  // Resolve URL
-  url(path: string): string;                        // build từ host + path
-  signedUrl(path: string, expiresInSec: number): Promise<string>;  // if available
-
-  // Quota check trước upload (optional)
-  canUpload(sizeBytes: number): Promise<boolean>;
-}
-
-interface TrashEntry {
-  tid: string;
-  path: string;
-  stage: "test" | "release";
-  is_dir: boolean;
-  size: number | null;
-  mime: string | null;
-  deleted_at: number;     // epoch ms
-  deleted_by: string | null;  // username
-  author: string;
-}
+await tfl5.auth.login(username, password);   // captures the bearer token in Node mode
+await tfl5.auth.register({ username, password, re_password, email });
+const me = await tfl5.auth.me();             // throws UnauthorizedError if not signed in
+await tfl5.auth.logout();
 ```
 
-Underlying REST surface (Batch 24):
-
-| Method | Path                    | Auth        | Body                                       |
-| ------ | ----------------------- | ----------- | ------------------------------------------ |
-| POST   | `/app/file/trash-list`  | Editor+     | `{ app_tid, stage? }`                      |
-| POST   | `/app/file/restore`     | Editor+     | `{ app_tid, file_tid }` — fails if active row already at same path |
-| POST   | `/app/file/purge`       | Manager     | `{ app_tid, file_tid }` — debits storage   |
-
-### 4.5 GroupsClient — `tfl5.groups` (global)
+Alternative sign-in methods all converge on the same session:
 
 ```ts
-interface GroupsClient {
-  create(input: { name: string; description?: string }): Promise<Group>;
-  list(): Promise<Group[]>;                         // groups user thấy được
-  get(groupId: string): Promise<Group>;
-  update(groupId: string, input: Partial<Group>): Promise<Group>;
-  delete(groupId: string): Promise<void>;
-  addMember(groupId: string, userTid: string): Promise<void>;
-  removeMember(groupId: string, userTid: string): Promise<void>;
-}
+await tfl5.auth.magicLink(email);                       // sends the email; always success-shaped
+await tfl5.auth.phoneStart(phone);                       // Zalo ZNS OTP
+const session = await tfl5.auth.phoneVerify(phone, otp);
+const { qr_id } = await tfl5.auth.qrStart();              // desktop shows a QR
+const session2 = await tfl5.auth.qrPoll(qr_id!);          // ...mobile approves it
 ```
 
-### 4.6 RolesClient — `tfl5.roles` (per-app)
+Google Sign-In needs Google's own script to render the button and run
+consent, so it's a separate opt-in bundle rather than part of headless
+`tfl5.auth`:
 
 ```ts
-interface RolesClient {
-  create(input: { name: string; description?: string }): Promise<Role>;
-  list(): Promise<Role[]>;
-  get(roleId: string): Promise<Role>;
-  update(roleId: string, input: Partial<Role>): Promise<Role>;
-  delete(roleId: string): Promise<void>;
-  addMember(roleId: string, target: Token): Promise<void>;        // target: user_uuid | G_uuid
-  removeMember(roleId: string, target: Token): Promise<void>;
-}
-```
-
-### 4.7 AppsClient — `tfl5.apps`
-
-```ts
-interface AppsClient {
-  create(input: CreateAppInput): Promise<App>;       // platform.designers required
-  list(): Promise<App[]>;                            // apps user có quyền access
-  get(appId: string): Promise<App>;
-  update(appId: string, input: Partial<App>): Promise<App>;
-  delete(appId: string): Promise<void>;
-  bindDomain(appId: string, domain: string): Promise<DomainBinding>;
-  unbindDomain(domainId: string): Promise<void>;
-  listDomains(appId: string): Promise<DomainBinding[]>;
-}
-```
-
-### 4.8 AuthClient — `tfl5.auth` (PDPD data-subject rights)
-
-Quyền của chủ thể dữ liệu theo **NĐ 13/2023** (Nghị định Bảo vệ dữ liệu cá
-nhân). Tất cả đều **self-scoped** — chỉ tác động tài khoản đang đăng nhập,
-không có biến thể admin-override.
-
-```ts
-interface AuthClient {
-  // … login / logout / register / me / các phương thức đăng nhập khác …
-
-  /** Quyền truy cập / mang theo dữ liệu: xuất account + metadata email +
-   *  danh sách app đang tham gia của chính mình. */
-  exportData(): Promise<DataExport>;
-
-  /** Quyền được xóa: đặt lịch xóa tài khoản của chính mình. Đăng xuất mọi
-   *  thiết bị ngay; xóa cứng chạy nền sau grace window (mặc định 24h) — trong
-   *  cửa sổ đó gọi cancelErase() để rút lại. Xác nhận bằng `password` (tài
-   *  khoản có mật khẩu) hoặc `code` TOTP/backup (tài khoản passwordless có 2FA). */
-  eraseAccount(confirm?: { password?: string; code?: string }): Promise<EraseResult>;
-
-  /** Rút lại yêu cầu xóa đang treo (chỉ trong grace window, sau khi login lại). */
-  cancelErase(): Promise<EraseResult>;
-}
-```
-
-```ts
-// Xuất dữ liệu của tôi. Trả về đã unwrap: { account, emails,
-// app_memberships, regulation, ... } — KHÔNG có wrapper { result, data }.
-const dump = await tfl5.auth.exportData();
-saveAs(new Blob([JSON.stringify(dump, null, 2)]), "my-tfl5-data.json");
-
-// Đặt lịch xóa tài khoản. Thành công → đăng xuất mọi nơi + trả về lịch xóa.
-// Từ chối → NÉM Tfl5Error, bắt theo err.code.
-try {
-  const r = await tfl5.auth.eraseAccount({ password });
-  alert(`Sẽ xóa vào ${new Date(r.erase_after!).toLocaleString()}. `
-      + `Đăng nhập lại trước thời điểm đó và gọi cancelErase() để hủy.`);
-  // Phiên hiện tại đã bị vô hiệu — coi như đã đăng xuất.
-} catch (err) {
-  // import { Tfl5Error } from "@tfl5/sdk"
-  if (err instanceof Tfl5Error && err.code === "owns_apps") {
-    console.warn("Phải chuyển quyền sở hữu / xóa các app này trước:",
-                 err.body.app_tids);
-  } else throw err;   // password_required / totp_required / lỗi khác
-}
-
-// Rút lại trong grace window (sau khi login lại). Ném code:'no_pending_erasure'
-// nếu không có yêu cầu nào đang treo.
-await tfl5.auth.cancelErase();
-```
-
-**Lưu ý:**
-- `exportData()` KHÔNG trả địa chỉ email dạng plaintext — lấy qua `POST
-  /user/email/list`. Tài liệu/tệp bên trong mỗi app xuất bằng API riêng của
-  app đó (`/app/doc/*`, `/app/file/*`).
-- `eraseAccount()` **ném** khi bị từ chối — nhánh theo `err.code`:
-  `'owns_apps'` (kèm `err.body.app_tids`), `'password_required'`,
-  `'totp_required'`. Thành công thì phiên bị vô hiệu ở mọi thiết bị.
-- `cancelErase()` ném `code:'no_pending_erasure'` nếu không có gì để hủy.
-- Bằng chứng đã-xóa được lưu bền (miễn khỏi purge log 90 ngày) và chỉ chứa
-  định danh giả danh — không lộ PII.
-
-## 5. License + quota awareness
-
-```ts
-const license = await tfl5.license();
-// {
-//   user: {
-//     tid:               "pro",
-//     name:              "Pro",
-//     max_apps:          50,
-//     max_total_storage: 50_000_000_000,    // 50 GB
-//     features:          ["custom_domain", "anonymous_share"]
-//   },
-//   app: {
-//     tid:                "standard",
-//     name:               "Standard",
-//     max_storage_per_app: 10_000_000_000,
-//     features:           ["custom_domain"]
-//   },
-//   used: {
-//     apps:     7,
-//     storage:  1_200_000_000
-//   },
-//   remaining: {
-//     apps:     43,
-//     storage:  8_800_000_000
-//   }
-// }
-```
-
-SDK methods tự pre-check quota khi upload/create:
-
-```ts
-// canUpload trả false nếu vượt quota
-const ok = await tfl5.files.canUpload(file.size);
-if (!ok) { /* show upgrade UI */ }
-
-// hoặc gọi trực tiếp, throw nếu quota exceeded:
-try {
-  await tfl5.files.upload(path, file);
-} catch (e) {
-  if (e instanceof tfl5.errors.QuotaError) {
-    /* e.detail = { license, used, requested, available } */
-  }
-}
-```
-
-## 6. TypeScript codegen
-
-```bash
-npx @tfl5/cli types --host https://acme.com --app a_xxx --out src/tfl5-types.ts
-```
-
-Server đọc `<app>_resources` schema → generate TS interfaces:
-
-```typescript
-// Auto-generated. Đừng edit tay.
-export interface PostDoc {
-  tid: string;
-  resource_tid: "r_post";
-  author: string;
-  data: {
-    title:  string;          // required (resource.fields[].validator: "required")
-    body?:  string;
-    tags?:  string[];
-    /** @description Số lượt xem */
-    views?: number;
-  };
-  // ACL fields ẩn khỏi types (designer dùng), client thấy null/undefined
-  created_at: number;
-  updated_at: number;
-}
-
-export interface CommentDoc { ... }
-
-export type ResourceMap = {
-  post:    PostDoc;
-  comment: CommentDoc;
-};
-
-declare module "@tfl5/sdk" {
-  interface ResourceMapDef extends ResourceMap {}
-}
-```
-
-Sử dụng type-safe:
-
-```ts
-import "./tfl5-types";
-
-const posts = tfl5.resource("post");
-// list type: Promise<ListResult<PostDoc>>
-const { rows } = await posts.list();
-rows[0].data.title;          // string, autocomplete OK
-rows[0].data.unknown;        // ts error
-
-await posts.add({
-  title: "Hello",            // required, ts ép
-});
-
-await posts.add({
-  body: "no title",          // ts error: missing required 'title'
-});
-```
-
-## 7. Auth modes
-
-### 7.1 Browser (cookie-based)
-
-SDK gửi mọi request với `credentials: 'include'`. `_token` cookie auto-attach
-nếu cookie domain khớp (vd `.example.com`).
-
-Login flow:
-```ts
-const user = await tfl5.login("alice", "hunter2");
-// Server set _token cookie, SDK lưu user vào memory
-// Subsequent calls tự authenticated
-```
-
-### 7.2 Node / server-side (token-based)
-
-```ts
-const tfl5 = new TFL5({
-  host:  "https://acme.com",
-  token: "<jwt-like-token>",      // mint từ admin / service account
-  appId: "a_xxx",
-});
-```
-
-SDK gửi `Authorization: Bearer <token>` mọi request.
-
-Token được mint qua endpoint mới (TBD): `POST /admin/token` (chỉ
-`platform.managers`).
-
-### 7.3 Các phương thức đăng nhập khác
-
-Ngoài `login(user, pass)`, `tfl5.auth` bọc mọi phương thức đăng nhập thay thế
-của platform. Tất cả **hội tụ về cùng một phiên** (cookie `_token` ở browser,
-hoặc `token` bearer ở Node — SDK tự capture như `login`).
-
-```ts
-// Magic email link (chống dò tài khoản: luôn trả về dạng thành công).
-await tfl5.auth.magicLink("alice@acme.com");
-// → server gửi email; user bấm link → /auth/magic set cookie + redirect.
-
-// Phone OTP (Zalo ZNS). start → verify.
-await tfl5.auth.phoneStart("+84901234567");
-const s = await tfl5.auth.phoneVerify("+84901234567", "123456");
-
-// QR: desktop hiển thị QR, mobile (đã đăng nhập) quét để duyệt.
-const { qr_id } = await tfl5.auth.qrStart();
-const session = await tfl5.auth.qrPoll(qr_id!);   // poll đến khi mobile duyệt
-```
-
-#### 7.3.1 Google Sign-In (browser)
-
-Google Sign-In **bắt buộc** dùng thư viện GIS của Google
-(`accounts.google.com/gsi/client`) để render nút + chạy consent trong browser
-— SDK chỉ đổi token ở bước cuối. Vì thế nút Google phải render **client-side**;
-SDK core (headless) không tự render. Hai cách:
-
-**Cách A — helper opt-in `@tfl5/sdk/ui` (khuyến nghị).** Một hàm
-framework-agnostic lo hết: đọc `google_client_id`, nạp GIS, render nút, đổi
-token, và xử lý luôn nhánh link-account. Bundle riêng (~2 KB) nên **không** ảnh
-hưởng SDK core / Node.
-
-```ts
-import { TFL5 } from "@tfl5/sdk";
-import { mountGoogleButton } from "@tfl5/sdk/ui";
-
-const tfl5 = new TFL5();                    // cookie mode, same-origin
+import { mountGoogleButton } from "@tfl5/sdk/ui"; // or /sdk-ui.mjs when served
 
 await mountGoogleButton(tfl5, {
-  target: "#google-btn",                    // element hoặc CSS selector
-  // clientId tự lấy từ GET /platform/info (google_client_id) nếu bỏ trống.
+  target: "#google-btn",
   onSignIn: (session) => { location.href = "/app"; },
-  // Chỉ cần khi email trùng một tài khoản CŨ chưa verify → cần password để link:
-  onRequiresPassword: async (usernameHint) =>
-    prompt(`Đã có tài khoản "${usernameHint}". Nhập mật khẩu để liên kết:`),
-  onError: (err) => console.error(err),
+  // Only invoked if the email matches an existing UNVERIFIED account,
+  // which needs its password to prove ownership before linking:
+  onRequiresPassword: (usernameHint) => promptForPassword(usernameHint),
 });
 ```
 
-Nếu trang được platform host, bundle browser sẵn sàng qua script tag:
+`mountGoogleButton` auto-fetches `google_client_id` from `GET
+/platform/info` unless you pass `clientId`, and throws if the operator
+hasn't set `TFL5_GOOGLE_CLIENT_ID`. Calling `tfl5.auth.google(credential)`
+directly is the lower-level equivalent if you render the button yourself.
 
-```html
-<!-- Platform serving the SDK exposes these at /sdk.js and /sdk-ui.js -->
-<script src="/sdk.js"></script>        <!-- window.TFL5 -->
-<script src="/sdk-ui.js"></script>     <!-- window.tfl5ui -->
-<div id="google-btn"></div>
-<script>
-  const tfl5 = new TFL5();
-  tfl5ui.mountGoogleButton(tfl5, { target: "#google-btn",
-    onSignIn: () => location.href = "/app" });
-</script>
-```
+Telegram and VNeID sign-in are real platform endpoints
+(`/auth/telegram/*`, `/auth/vneid/*`) that `tfl5.auth` doesn't wrap yet —
+reach them with `tfl5.raw(path, body)` in the meantime.
 
-> **Note:** `/sdk-ui.js` (IIFE) and `/sdk-ui.mjs` (ESM) are the built browser
-> bundles from `@tfl5/sdk/ui`. A platform hosting the SDK typically serves them
-> at these paths; for standalone apps install the npm package and bundle normally.
+### 6.1 PDPD data-subject rights (NĐ 13/2023)
 
-**Cách B — tự render, gọi thẳng `tfl5.auth.google()`.** Nếu bạn tự nạp GIS:
+Self-scoped only — there is no admin-override form; these act on the
+caller's own account.
 
 ```ts
-// Trong callback GIS: resp.credential là JWT do Google cấp.
+const dump = await tfl5.auth.exportData();     // profile + email metadata + app memberships
+// document/file content inside each app is exported via that app's own
+// /app/doc/* and /app/file/* APIs, not by exportData().
+
 try {
-  await tfl5.auth.google(resp.credential);          // ⚠ field là `credential`
-  location.href = "/app";
+  const r = await tfl5.auth.eraseAccount({ password });
+  // Success: signed out everywhere; hard-erase runs after a grace window
+  // (default 24h) unless you call cancelErase() before it elapses.
 } catch (e) {
-  // Email trùng tài khoản CŨ chưa verify → server đòi password để link.
-  if (e instanceof BadRequestError && e.body?.requires_password) {
-    const pw = await promptForPassword(e.body.username_hint);
-    await tfl5.auth.google(resp.credential, { password: pw });
-  } else throw e;
+  if (e instanceof Tfl5Error && e.code === "owns_apps") {
+    console.warn("Transfer or delete these apps first:", e.body.app_tids);
+  } else throw e; // password_required / totp_required / other
+}
+
+await tfl5.auth.cancelErase(); // throws code:"no_pending_erasure" if nothing's pending
+```
+
+## 7. Operators — `tfl5.operator(id)`, `tfl5.integrations`, `tfl5.wasm`
+
+```ts
+// Catalog operator (e.g. VietQR):
+const qr = await tfl5.operator("vietqr").invoke("generate", { amount: 50000 });
+
+// Per-app operator config (credentials, on/off):
+await tfl5.integrations.enable("zalo-zns");
+await tfl5.integrations.setConfig("zalo-zns", { oa_id, access_token, templates: {...} });
+
+// Your own server-side code, sandboxed:
+await tfl5.wasm.upload({ op_id: "price-engine", version: "1.0.0", bytecode: wasmBytes });
+await tfl5.wasm.activate("price-engine", "1.0.0");
+const quote = await tfl5.operator("price-engine").invoke("quote", { items });
+```
+
+WASM is tfl5's one sandboxed server-side code lane (no JS/Lua `eval`): a
+module runs fuel/memory/time-bounded and reaches data through host calls
+that execute **as the calling user** — it can never exceed the caller's
+ACL. Full limits and the guest ABI: api-reference.md §Operators →
+"WASM operators".
+
+Catalog operators that call out to a real external service (email, Zalo
+ZNS, Viettel SMS, VietQR, VNeID, payment) only work once the app has
+configured its own credentials via `tfl5.integrations.setConfig(...)` —
+see [app-builder-guide.md §7](app-builder-guide.md#7-what-tfl5-does-not-give-you)
+for exactly what each one needs.
+
+## 8. Files — `tfl5.files`
+
+```ts
+await tfl5.files.upload({ path: "/avatars", file: someBlob, filename: "a.png" });
+const list = await tfl5.files.list("/avatars");
+const { signed_url } = await tfl5.files.signUrl("/avatars/a.png", { expires_in_sec: 300 });
+await tfl5.files.rename(fileId, "new-name.png");
+await tfl5.files.del(fileId);      // soft-delete → trash
+await tfl5.files.restore(fileId);  // undo, while still in trash
+await tfl5.files.createFolder("/avatars/thumbs");
+```
+
+Uploads are multipart only — never base64-in-JSON. `signUrl` mints a
+short-lived link (default 5 min, server-capped at 1 hour); mint it
+on-demand at view time rather than persisting it. This client wraps the
+app-wide `/app/file/*` tier described in
+[app-builder-guide.md §3](app-builder-guide.md#3-building-blocks--when-to-use-what) —
+for your app's *published site* specifically (with draft/publish/rollback
+semantics), see the site engine in §4.1 above.
+
+## 9. Shares — `tfl5.shares`
+
+```ts
+const share = await tfl5.shares.create({
+  doc_tid: "d_xxx",
+  target: "anonymous",              // or a user_tid / "[r_role]" / "G_group"
+  fields: ["full_name", "diagnosis_code"],
+  expires_at: Date.now() + 86_400_000,
+});
+// share.token is only returned for target:"anonymous" — that's the link token
+
+const claimed = await tfl5.shares.claim(token); // exchange a token for the projected doc
+await tfl5.shares.revoke(share.tid);
+```
+
+## 10. Roles + groups — `tfl5.roles`, `tfl5.groups`
+
+```ts
+const role = await tfl5.roles.create({ name: "homeroom_7a", members: [userTid] });
+await tfl5.roles.edit(role.tid, { members: [...role.members!, otherUserTid] }); // members REPLACES
+await tfl5.roles.del(role.tid);
+
+const group = await tfl5.groups.create({ name: "district-1-schools" }); // global, admin-scoped
+```
+
+## 11. Scope — `tfl5.scope`
+
+Row-level scope is the 4th authorization layer: it fences rows by a data
+field (own / class / company / …), on top of the ACL arrays. It's
+designer-configured and env + per-app opt-in — see
+[scope.md](scope.md) for the full model.
+
+```ts
+const cfg = await tfl5.scope.get();          // field_map + the CALLER's own bindings only
+await tfl5.scope.setFieldMap({ student: { O: "created_by_user_tid" } });
+await tfl5.scope.patchBindings({ [userTid]: [{ scope: "O" }] }); // null clears a user's bindings
+```
+
+## 12. Signed sources — `tfl5.sources`
+
+Register an inbound data channel for an external system to push into
+one of your resources — tfl5 auto-mints the service principal, you never
+supply a user id.
+
+```ts
+const src = await tfl5.sources.register({ name: "stripe-events", target_resource_ma: "order" });
+console.log(src.ingest_url, src.secret); // secret is shown ONCE — store it now
+const all = await tfl5.sources.list();    // secret omitted here
+const rotated = await tfl5.sources.rotate(src.tid); // new secret, old one dead immediately
+await tfl5.sources.revoke(src.tid);
+```
+
+The external system signs its push with HMAC-SHA256 over
+`"<unix_ts_secs>.<raw_body>"` in `X-Tfl5-Timestamp` +
+`X-Tfl5-Signature`; full push-side protocol in api-reference.md
+§Signed sources.
+
+## 13. Errors
+
+Every rejection is a `Tfl5Error` subclass keyed on the server's stable
+`code` — never on the (possibly localized) `msg`:
+
+```ts
+export class Tfl5Error extends Error {
+  readonly code: string;      // e.g. "access_denied"
+  readonly status: number;    // HTTP status (0 if the request never completed)
+  readonly body: ErrorEnvelope;
 }
 ```
 
-**Điều kiện:** operator phải set env `TFL5_GOOGLE_CLIENT_ID`. Chưa set thì
-`/auth/google` trả 400 "Google login not configured" và helper ẩn nút
-(hoặc ném lỗi config nếu không auto-fetch được `client_id`).
-
-## 8. Anonymous mode + share token
-
-User chưa login:
+| Class | Meaning |
+|---|---|
+| `UnauthorizedError` | 401 — session missing/expired |
+| `AccessDeniedError` | 200 — authenticated, but lacks ACL on the target |
+| `NotFoundError` | resource/doc/row not found |
+| `BadRequestError` | 400 — malformed request / validation failure |
+| `RateLimitError` | 429 — has an optional `.retryAfter` (seconds) |
+| `InternalError` | 5xx — server-side failure |
 
 ```ts
-const tfl5 = new TFL5();           // không login
+import { NotFoundError, AccessDeniedError, RateLimitError } from "@tfl5/sdk";
 
-// Doc với readers=[] → đọc OK
-const publicDoc = await tfl5.resource("post").get("d_xxx");
-
-// Doc cần auth → throw AuthError
 try {
-  await tfl5.resource("post").get("d_private");
+  await tfl5.resource("task").get("nope");
 } catch (e) {
-  if (e instanceof tfl5.errors.AuthError) { /* show login */ }
-}
-
-// Hấp thụ share token từ URL ?_share=xxx
-await tfl5.shares.claimFromUrl();
-// Sau đó các call tiếp theo có thể access doc qua share
-```
-
-`claimFromUrl()` set internal flag để mọi request kế tiếp tự add header
-`X-Share-Token`. Khi user logout / refresh, share lifetime kết thúc theo
-`expires_at` server-side.
-
-## 9. Error classes
-
-```ts
-class TFL5Error extends Error {
-  constructor(message: string, public code: string, public detail?: any) {}
-}
-
-class AuthError extends TFL5Error { ... }              // chưa login / token expired
-class PermissionError extends TFL5Error { ... }        // access denied
-class QuotaError extends TFL5Error { detail: QuotaDetail }
-class ValidationError extends TFL5Error { errors: FieldError[] }
-class NotFoundError extends TFL5Error { ... }
-class NetworkError extends TFL5Error { ... }
-class LicenseError extends TFL5Error { ... }           // feature not in tier
-```
-
-Pattern:
-
-```ts
-try {
-  await tfl5.resource("post").add({ body: "no title" });
-} catch (e) {
-  if (e instanceof tfl5.errors.ValidationError) {
-    e.errors.forEach(err => { /* { field, message } */ });
-  } else if (e instanceof tfl5.errors.QuotaError) {
-    /* show upgrade UI */
-  } else if (e instanceof tfl5.errors.PermissionError) {
-    /* show 403 */
-  } else {
-    throw e;
-  }
+  if (e instanceof NotFoundError) { /* ... */ }
+  else if (e instanceof AccessDeniedError) { /* ... */ }
+  else if (e instanceof RateLimitError) { await sleep((e.retryAfter ?? 1) * 1000); }
+  else throw e;
 }
 ```
 
-## 10. Cache strategy — open
+Some legacy error shapes ship on HTTP 200 with a `code` (e.g.
+`not_found`, `access_denied`) rather than the matching HTTP status — the
+SDK normalizes this: any response that isn't `{result: true}` throws,
+regardless of the HTTP status code, so you never have to special-case
+200-with-an-error yourself.
 
-v1 SDK **không có built-in cache**. Mỗi call = 1 HTTP request.
-
-Dev tự quản:
+## 14. Config reference
 
 ```ts
-// Tự cài cache layer
-import { TFL5 } from "@tfl5/sdk";
-import { LRUCache } from "lru-cache";
-
-class CachedTFL5 extends TFL5 {
-  private cache = new LRUCache({ max: 500, ttl: 30_000 });
-  // ... override resource() để wrap
+interface Tfl5Config {
+  host?: string;              // defaults to window.location.origin in a browser
+  appId?: string;             // default app_tid auto-injected into request bodies
+  auth?: "cookie" | "bearer"; // defaults to "cookie" in a browser, "bearer" in Node
+  token?: string;             // bearer token; also settable via setToken()
+  fetch?: typeof fetch;       // custom fetch — tests, non-standard runtimes
 }
 ```
 
-Hoặc dùng `react-query` / `swr` ở UI layer.
+- **cookie** mode sends `credentials: "include"`; the server's `_token`
+  cookie round-trips automatically.
+- **bearer** mode sends `Authorization: Bearer <token>`; in Node (no
+  cookie jar available to the platform) the SDK keeps an in-memory
+  cookie jar internally so a `/login` cookie still persists across calls
+  if you're in cookie mode outside a browser.
+- `tfl5.useApp(appTid)` — scope subsequent calls; a per-call `app_tid` in
+  the request body always overrides it.
+- `tfl5.setToken(token)` — set/replace the bearer token manually (e.g.
+  one minted out-of-band by a service).
 
-v1.5 có thể thêm built-in (`tfl5.cache.enabled = true` + invalidation rules).
+## 15. Build & publish
 
-## 11. Real-time — open
+See [sdk/README.md](../sdk/README.md) for the exact build/typecheck/publish
+commands and the end-to-end smoke test that verifies this contract
+against a real dev server. In short: `npm run build` emits the npm
+package (`dist/`), `npm run build:browser` emits the bundles served at
+`/sdk.js` / `/sdk.mjs` / `/sdk-ui.js` / `/sdk-ui.mjs`.
 
-v1 SDK **không có real-time**. Muốn cập nhật → polling tay:
+## 16. Versioning
 
-```ts
-const sub = setInterval(async () => {
-  const { rows } = await posts.list({ filter: { ... } });
-  /* update UI */
-}, 10_000);
-
-clearInterval(sub);   // cleanup
-```
-
-v1.5 có thể thêm `tfl5.resource("post").subscribe(filter, cb)` với SSE backend.
-
-## 12. Bundle budget
-
-| Bundle           | Mục đích                        | Target gzip |
-|------------------|---------------------------------|-------------|
-| `core`           | Auth + Resource CRUD + Files    | < 15 KB     |
-| `+sharing`       | + Shares + claim token          | < 22 KB     |
-| `+types`         | + TS runtime helpers            | < 25 KB     |
-| `+cache`         | (v1.5) + LRU cache + invalidate | < 35 KB     |
-| `+realtime`      | (v1.5) + SSE client             | < 45 KB     |
-
-Tree-shakable — chỉ import phần dùng.
-
-## 13. Versioning
-
-- Semver. Major bump = breaking change.
-- Server và SDK độc lập versioning, nhưng SDK x.y.z compatible với server x.y.{any}.
-- SDK đầu mỗi request gửi header `X-TFL5-SDK-Version: <ver>` cho server log.
-
-## 14. Mở rộng tương lai
-
-- **v1.5:** built-in cache, SSE real-time, optimistic updates.
-- **v2:** offline mode (IndexedDB cache + sync queue).
-- **v2.5:** TypeScript decorators cho resource classes (`@Resource("post") class Post {}`).
-- **v3:** GraphQL adapter trên cùng API surface.
+- Semver once published; a major bump is a breaking change.
+- The server and the SDK version independently — a server always serves
+  the exact browser bundle it was built with (§1), so version skew only
+  matters for the npm package against a REST contract that moved.

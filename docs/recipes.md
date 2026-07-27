@@ -22,6 +22,7 @@
 10. [Soft-delete then permanently delete an app](#10-soft-delete-then-permanently-delete-an-app)
 11. [Add an editor to a single doc without making them an editor of the whole app](#11-add-an-editor-to-a-single-doc-without-making-them-an-editor-of-the-whole-app)
 12. [Test changes on the test stage before promoting to release](#12-test-changes-on-the-test-stage-before-promoting-to-release)
+13. [Why isn't my uploaded file showing up? (serving precedence)](#13-why-isnt-my-uploaded-file-showing-up-serving-precedence)
 
 ---
 
@@ -425,11 +426,16 @@ immediately; the webhook fires post-commit.
 
 **What's wired vs. pending:**
 - `webhook` hook type: **shipped + production-ready**.
-- `zalo-zns` + `viettel-sms` operators: **scaffolded** — handlers
-  exist but HTTP send is a stub. Production wiring + credential
-  onboarding is **pending ops setup**. Verify before going live.
-- Until ZNS is live, fall back to `/app/email/send` (mailler is
-  production-ready) for the same alert.
+- `zalo-zns` + `viettel-sms` operators: the `send` action makes a real
+  HTTP call — this is not a stub. What's still on you is **your own
+  credentials**: a Zalo Official Account id + access token (ZNS), or a
+  Viettel CP code + registered brand name + service key (SMS), set via
+  `/app/integrations/config-set`. An unconfigured operator fails the
+  send (returns an error, doesn't fake success) — verify credentials
+  are actually configured before relying on delivery in production.
+- `/app/email/send` (mailler) is production-ready and needs no
+  per-tenant credential setup beyond a verified sending domain — the
+  simplest fallback for the same alert if you haven't wired ZNS yet.
 
 **Roadmap (not shipped):** an inline operator-hook type that calls
 `/op/<id>/<action>` directly from the hook phase, removing the
@@ -635,6 +641,83 @@ timestamped backup.
   Use `/app/test/wipe` for a clean slate.
 - Test subdomain works only when `TFL5_TEST_SUBDOMAIN_BASE` is
   configured at deploy time (`/platform/info` reports the base).
+- **This whole flow is shadowed if the app has a live site snapshot**
+  (i.e. it's ever been published through the no-code builder or code
+  editor). A pinned release only serves once there's no
+  `live_snapshot` above it — see recipe [#13](#13-why-isnt-my-uploaded-file-showing-up-serving-precedence)
+  if your promoted release doesn't seem to take effect.
 
 **See also:** [api-reference.md POST /app/release](api-reference.md#post-apprelease),
-[app-builder-guide.md §4 step 3](app-builder-guide.md#step-3--upload-static-fe).
+[app-builder-guide.md §4 step 3](app-builder-guide.md#step-3--author-your-static-fe).
+
+---
+
+## 13. Why isn't my uploaded file showing up? (serving precedence)
+
+**Task:** "I uploaded a new `index.html` (or promoted a release, or
+activated a bundle) and the live site still shows the old page. What's
+going on?"
+
+**Pattern:** tfl5 resolves every public request through **one
+precedence chain, first match wins** — see
+[app-builder-guide.md §2.1](app-builder-guide.md#21-serving-precedence--read-this-before-you-upload-anything)
+for the full explanation. In order, highest wins:
+
+```
+1. live snapshot   — /app/site/publish (no-code builder / code editor)
+2. active bundle   — /app/bundle/activate
+3. pinned release  — /app/release
+4. legacy public/  — /app/file/upload or /app/file/save
+```
+
+Diagnose which tier is actually serving, from the top down:
+
+```json
+// Does this app have a live site snapshot?
+POST /app/site/history
+{ "app_tid": "a-example" }
+// non-empty snapshots[] + a recent one ⇒ tier 1 is very likely live
+
+// Does this app have an active bundle?
+POST /app/bundle/list
+{ "app_tid": "a-example" }
+// → data includes "current_bundle_version" — non-null ⇒ tier 2 is live
+
+// Does this app have a pinned release?
+POST /app/release/status
+{ "app_tid": "a-example" }
+```
+
+**Why this works:** each tier is separate storage — writing to a lower
+tier never fails and never touches a higher one, so there's no error to
+notice. The fix is to make your change in whichever tier is actually
+serving:
+
+- **Live snapshot is serving** → author through `/app/site/put` +
+  `/app/site/publish` (or the no-code builder / code editor UI), or
+  `/app/site/rollback` off the snapshot entirely if you want to fall
+  through to the tiers below.
+- **Bundle is serving** → ship a new bundle version and
+  `/app/bundle/activate` it, or `/app/bundle/rollback` /
+  `/app/bundle/unpublish` to stop using bundles for this app.
+- **Release is serving** → edit `_test/public/`, `/app/release` again,
+  or `/app/release/rollback` to un-pin it.
+- **Nothing above is set** → your `/app/file/upload` /
+  `/app/file/save` write to `public/` is already the live tier; a stale
+  view is almost always a browser/CDN cache, not a shadow — try a hard
+  refresh before suspecting the platform.
+
+**Gotchas:**
+- Uploading to a shadowed tier isn't rejected or warned about — the
+  write succeeds, it's just invisible. There's no "you have 3 tiers
+  active" banner; use the diagnosis calls above.
+- A brand-new app with no site/bundle/release activity ever configured
+  is always on tier 4 (legacy `public/`) — this recipe mostly matters
+  for apps that have used the visual builder, the code editor, or a
+  versioned deploy pipeline at some point in their history.
+- Rolling back a snapshot/bundle/release doesn't delete the lower
+  tiers' files — it just changes which tier answers requests.
+
+**See also:** [app-builder-guide.md §2.1 Serving precedence](app-builder-guide.md#21-serving-precedence--read-this-before-you-upload-anything),
+[app-builder-guide.md §4 step 3](app-builder-guide.md#step-3--author-your-static-fe),
+recipe [#12](#12-test-changes-on-the-test-stage-before-promoting-to-release).

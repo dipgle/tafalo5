@@ -19,16 +19,39 @@ declarative hooks, and sandboxed operators.
 | [`docs/api-reference.md`](docs/api-reference.md) | Full REST endpoint reference. |
 | [`docs/acl-model.md`](docs/acl-model.md) | Authorization: ACL arrays, roles, groups, sharing. |
 | [`docs/recipes.md`](docs/recipes.md) | Task-oriented how-tos. |
-| [`docs/sdk.md`](docs/sdk.md) | SDK design spec + full TypeScript surface. |
+| [`docs/sdk.md`](docs/sdk.md) | Full SDK reference — every client module, the auth/error model, and what's landing next. |
 
 ## Quick start
 
+Every tafalo5 server serves the SDK directly — no build step, no npm install:
+
+```html
+<script src="/sdk.js"></script>
+<script>
+(async () => {
+  const tfl5 = new TFL5();                 // host defaults to window.location.origin
+  await tfl5.auth.login("username", "password");
+  tfl5.useApp("a-xxxx");
+
+  const task = tfl5.resource("task");
+  await task.create({ title: "Hello", status: "todo" });
+  const open = await task.list({ where: { status: "todo" } });
+})();
+</script>
+```
+
+See [sdk/README.md](sdk/README.md#no-build--script-usage--served-by-the-platform)
+for the ESM (`/sdk.mjs`) form and more detail.
+
+`@tfl5/sdk` isn't published to npm yet (see [sdk/README.md](sdk/README.md) for
+current status) — for a Node/CLI build pipeline, build it from source today:
+
 ```bash
-npm install @tfl5/sdk
+cd sdk && npm install && npm run build
 ```
 
 ```ts
-import { TFL5 } from "@tfl5/sdk";
+import { TFL5 } from "@tfl5/sdk"; // resolved to sdk/dist once built, or a local path
 
 const tfl5 = new TFL5({ host: "https://your-app.example.com" });
 await tfl5.auth.login("username", "password");
@@ -38,10 +61,6 @@ const task = tfl5.resource<{ title: string; status: string }>("task");
 await task.create({ title: "Hello", status: "todo" });
 const open = await task.list({ where: { status: "todo" } });
 ```
-
-In the browser, every tafalo5 server also serves the bundle directly — drop
-in `<script src="/sdk.js"></script>` and use `window.TFL5` with no build step.
-See [sdk/README.md](sdk/README.md#no-build--script-usage--served-by-the-platform).
 
 ## Prerequisites
 

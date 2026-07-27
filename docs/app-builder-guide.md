@@ -22,7 +22,8 @@ You build an app by:
 
 1. Registering a user account on tfl5 (one-time per dev).
 2. Creating an app row (`POST /app/update` without `tid`).
-3. Uploading your static FE (HTML/JS) via the file API.
+3. Authoring your static FE (HTML/JS) — with the in-browser code
+   editor, the visual no-code page builder, or a direct file upload.
 4. Binding a public domain.
 5. Defining your data schema as *resources*.
 6. Letting your FE call tfl5 APIs from the browser — `fetch` with
@@ -31,11 +32,15 @@ You build an app by:
 You do **not** write Rust. You do **not** fork tfl5. You do **not**
 define custom routes. All tenant logic is either:
 
-- **Static FE code** (your HTML/JS, runs in the user's browser), or
+- **Static FE code** (your HTML/JS, runs in the user's browser) —
+  written by hand and uploaded, dragged together in the visual
+  no-code builder, or edited in-browser with the code editor; all
+  three publish through the same versioned site engine (§4 step 3), or
 - **Resource schema + declarative hooks** (validation + side-effects
   the platform executes for you), or
 - **Operators** (officially supported integrations like email, ZNS,
-  SMS, VietQR, VNeID — pre-built; you configure, you don't code), or
+  SMS, VietQR, VNeID, payment — pre-built; you configure credentials,
+  you don't code), or
 - **External services** you run elsewhere, calling tfl5 APIs from
   your server using a service token.
 
@@ -51,8 +56,9 @@ conversation — see [out of scope](#7-what-tfl5-does-not-give-you).
 │  PUBLIC INTERNET                                            │
 │  ┌────────────────────────────────────────────────────────┐ │
 │  │  https://<your-domain>/                                │ │
-│  │    └─ tfl5 serves your static files from data/<cell>/  │ │
-│  │       <your-app-tid>/public/                            │ │
+│  │    └─ tfl5 serves your static files — a published site │ │
+│  │       snapshot if you have one, else data/<cell>/      │ │
+│  │       <your-app-tid>/public/ (see §2.1)                 │ │
 │  │                                                          │ │
 │  │  https://<your-domain>/app/doc/list  (JSON API)        │ │
 │  │  https://<your-domain>/app/file/upload                 │ │
@@ -84,6 +90,42 @@ Static files in `public/`. Test-stage files in `_test/public/`.
 Everything else (users, data rows, file metadata) is in shared PG
 filtered by your `app_tid`.
 
+### 2.1 Serving precedence — read this before you upload anything
+
+A public request for `https://<your-domain>/<path>` is resolved through
+**one precedence chain, first match wins**:
+
+```
+1. live snapshot   (site engine — /app/site/publish set a live version)
+2. active bundle   (/app/bundle/activate set a versioned code deploy)
+3. pinned release  (/app/release promoted a snapshot of public/)
+4. legacy public/  (whatever's on disk right now — the mutable default)
+```
+
+Each tier is independent storage. **A file that exists in a lower tier
+is silently SHADOWED by whichever higher tier is active** — this is the
+single most common "why isn't my change showing up" question. Concretely:
+
+- You `POST /app/file/upload` a new `index.html` straight into
+  `public/` (tier 4), refresh your domain, and still see the old page.
+  That's because the app was, at some point, published through the
+  no-code builder or the code editor (`/app/site/publish`, tier 1) —
+  the live snapshot answers every request until you either publish a
+  new snapshot with your change or explicitly stop using the site
+  engine for this app.
+- Same story one level down: an activated bundle (tier 2, from
+  `/app/bundle/activate`) shadows a pinned release or `public/` even
+  though there's no site snapshot.
+
+**The fix is always the same:** figure out which tier is actually
+serving (ask "did this app ever go through the visual builder / code
+editor?", or check with whoever owns the deploy pipeline), and make
+your change in *that* tier — or explicitly roll it back
+(`/app/site/rollback`, `/app/bundle/rollback`, `/app/release/rollback`)
+to fall through to the tier you intended to edit. Uploading to a lower
+tier is never wrong, it's just invisible until the tiers above it are
+out of the way. See recipe [Why isn't my upload showing up?](recipes.md#13-why-isnt-my-uploaded-file-showing-up-serving-precedence).
+
 ---
 
 ## 3. Building blocks — when to use what
@@ -109,6 +151,8 @@ Other primitives you'll meet less often:
 | **shares** | Time-limited read-only handles to a single doc | When a user needs to send a one-off link to someone without granting full access. |
 | **domains** | Custom hostnames bound to the app | Multiple domains per app supported; subdomain delegation built-in. |
 | **operators** | Configured integrations (one per `op_id` per app) | Connecting to external services like email send, Zalo, VNeID. |
+| **site** | Content-addressed draft + published-snapshot store for your app's site content (`/app/site/*`) | Publishing/updating your live site with full file history and one-click rollback — what the visual builder and the code editor both write through. |
+| **f3 attachments** | Encrypted files bound to one doc's ACL and encryption key (`/app/f3/*`) | A per-record attachment (e.g. a signed PDF on a `health_event` row) that should inherit that row's readers/editors — distinct from `files`, which is app-wide, not doc-scoped. |
 
 ---
 
@@ -146,9 +190,47 @@ You become the app's `author` (immutable owner) and Manager. Your
 license tier defaults to `demo` (1 app, 5MB content cap, 10MB total
 quota). Upgrade via `/app/upgrade-license`.
 
-### Step 3 — upload static FE
+### Step 3 — author your static FE
 
-Two upload modes:
+Read [§2.1 Serving precedence](#21-serving-precedence--read-this-before-you-upload-anything)
+first — it explains why the path you pick here matters.
+
+**Recommended: the site engine (`/app/site/*`)** — a content-addressed
+draft-then-publish store. This is what the in-browser code editor and
+the visual no-code page builder both drive; you can use either UI, or
+call the endpoints yourself:
+
+```
+POST /app/site/put              (JSON) — write one draft entry
+{ "app_tid": "a-example", "path": "/index.html",
+  "kind": "file",                       ← or "page" for a no-code component tree
+  "content_text": "<html>...</html>" }  ← or content_base64 for binary
+
+POST /app/site/publish           ← snapshot the current draft, flip it live
+{ "app_tid": "a-example", "note": "launch copy" }
+→ { result: true, live_snapshot: "<snapshot id>" }
+
+POST /app/site/rollback          ← point Live back at an older snapshot
+{ "app_tid": "a-example", "snapshot_id": "<older id>" }
+
+POST /app/site/history           ← every past snapshot, for rollback/audit
+POST /app/site/file-history      ← every past version of ONE file/path
+```
+
+Publish is atomic (a new immutable snapshot + a pointer flip, never a
+partial write), and every file's history is addressable — a strictly
+stronger guarantee than the legacy path below. `kind: "page"` entries
+are JSON component trees rendered server-side by the no-code renderer
+(headings, containers, text/image/button, and data-bound
+table/list/**chart** nodes wired to your resources); `kind: "file"`
+entries are served as-is (HTML you wrote yourself, CSS, JS, images).
+Charts on a published page render with **Apache ECharts**, served by
+the platform itself at `/_tfl5/vendor/*` — nothing to add to your page,
+no CDN, no separate install.
+
+**Legacy: direct file upload + release/test staging.** Still fully
+supported, and simpler if you're shipping a small static site with no
+need for draft/publish semantics:
 
 ```
 POST /app/file/upload          (multipart/form-data)
@@ -163,11 +245,18 @@ POST /app/file/save            (JSON, base64)
 ```
 
 Both write to `data/<cell>/<app_tid>/public/<path>` (release stage) or
-`_test/public/<path>` if `stage: "test"` is set.
+`_test/public/<path>` if `stage: "test"` is set. Optionally promote a
+pinned, rollback-able snapshot of `public/` with `POST /app/release`
+(see [recipes.md #12](recipes.md#12-test-changes-on-the-test-stage-before-promoting-to-release)).
+Remember: this whole tier is **shadowed** the moment the app has a live
+site snapshot (§2.1) — if you're seeing stale content after uploading
+here, that's almost always why.
 
-Allowlist (release + upload): `html htm css js mjs map json png jpg
-jpeg gif webp avif svg ico woff woff2 ttf otf txt xml`. Hard caps:
-**10MB per file**, **license-tier dependent total quota**.
+Allowlist (both paths): `html htm css js mjs map json png jpg jpeg gif
+webp avif svg ico woff woff2 ttf otf txt xml md` (plus `csv xlsx docx`
+and a small set of binary types for downloadable assets: `sqlite db bin
+wasm zip tar gz`). Hard caps: **10MB per file**, **license-tier
+dependent total quota**.
 
 ### Step 4 — bind a domain
 
@@ -198,7 +287,7 @@ For dev, `localhost:<port>` and `<tid>.test.<base>` (if
 ### Step 5 — define resources
 
 A *resource* is your schema for a class of rows. Create one per logical
-table. See [resource schema](#5-defining-resources-the-schema-shape).
+table. See [resource schema](#5-defining-resources--the-schema-shape).
 
 ```
 POST /app/resource/create
@@ -429,17 +518,46 @@ Be honest with yourself about these before you design:
 - **Cron jobs you can configure from inside tfl5** — no per-app
   scheduler. Run cron in your own infra; call tfl5 APIs from there
   with a service token.
-- **Real-time WebSocket primitives** (chat, presence) — proxy layer
-  exists but no first-party handler. Use external service for now.
-- **Phone OTP delivery, ZNS push, SMS** — operators are scaffolded
-  (zalo-zns, viettel-sms in Batch 84), but the actual HTTP send +
-  template configuration is not yet wired through. Once tfl5 team
-  finishes wiring + you obtain the relevant credentials,
-  it's `/app/integrations/enable` + `/app/integrations/config-set`.
+- **Real-time WebSocket chat** — **SHIPPED.** `GET /ws/chat` is a
+  first-party, Reader-gated WebSocket per app (room-scoped, messages
+  persisted, scrollback via `POST /app/chat/history`, row-level scope
+  supported). Not something you need an external service for anymore.
+  A generic pub/sub *other than chat* (arbitrary presence/broadcast
+  channels) still isn't a first-party primitive — build that on top of
+  `/app/doc/*` + your own polling/webhook, or ask the tfl5 team.
+- **Durable, stateful server-side compute** — exists (a WASM-based
+  durable-execution primitive: exactly-once message delivery,
+  crash-safe replay, reactive projections streamed over
+  `/ws/durable/subscribe`) but ships **default-OFF**. The operator
+  running your tfl5 instance has to explicitly enable it
+  (`TFL5_DURABLE_ENABLED`); until they do, every `/durable/*` endpoint
+  behaves as if the feature doesn't exist. Confirm it's turned on
+  before designing around it — most apps don't need this and should
+  reach for a plain `resource` + hooks instead.
+- **Phone OTP delivery, ZNS push, SMS** — the dispatch is wired for
+  real: `/auth/phone/*` and the `zalo-zns` / `viettel-sms` operators
+  make an actual HTTP call to Zalo/Viettel on `send`, not a stub. What's
+  still on you is the credentials: Zalo needs an Official Account id +
+  access token, Viettel needs a CP code + registered brand name +
+  service key, both set via `/app/integrations/enable` +
+  `/app/integrations/config-set`. **Config-ready, not config-free** —
+  same pattern as payment below: an unconfigured operator fails the
+  send (logged, not silent) rather than working out of the box.
+- **Payment checkout** — `GET /billing/catalog` is public and live (one
+  price per plan, no feature matrix, no sign-in required) and doubles as
+  your pricing-page data source. Actually charging a card runs through
+  a provider (`POST /billing/webhook/:provider` settles it), and a
+  provider only exists once its webhook secret is configured in the
+  server's environment — an unconfigured/unknown provider name is
+  indistinguishable from a 404. Confirm with whoever runs your instance
+  which provider(s) are actually live before building a checkout flow
+  around one.
 - **Tenant-defined endpoints** — you cannot register a new URL path.
   All tenant logic flows through:
   - `/app/doc/*` for data
-  - `/app/file/*` for binary
+  - `/app/site/*` for your published site content (§4 step 3)
+  - `/app/file/*` for app-wide binary storage, `/app/f3/*` for
+    per-doc encrypted attachments
   - `/op/<op_id>/<action>` for integrations
   - your own external service for things outside the above
 

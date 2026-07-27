@@ -8,6 +8,12 @@
 > Scope is **opt-in and domain-neutral** — the engine knows nothing about
 > schools or companies; it just enforces *"row's column X ∈ the caller's allowed
 > set"*, configured entirely with per-app **data** (no backend change, no schema).
+>
+> ⭐ **Scope is one of only two layers that fence doc READS.** Per-doc ACL
+> arrays are not evaluated on `/app/doc/list` or `/app/doc/get`
+> ([acl-model.md §5](acl-model.md)), so if your requirement is "user A must not
+> *see* user B's rows", scope (or a resource-level ACL) is how you get it — not
+> `docs.readers`.
 
 ---
 
@@ -152,13 +158,21 @@ On every `/app/doc/*` call for a fenced resource:
    simply don't come back (no existence leak).
 4. On **writes** it's checked in-memory against the row: create needs the new row
    in-scope; update needs **both** the current row **and** the post-merge row
-   in-scope (so you can't scope-move a row out from under yourself).
+   in-scope (so you can't scope-move a row out from under yourself). `upsert` and
+   `create-batch` apply the same double check; `del` and `acl-set` check the
+   current row only.
+
+The predicate is evaluated against the row's **level-0 (unencrypted) fields**.
+A scope column must therefore be declared `level: 0` — an encrypted field cannot
+fence anything, because the server would have to decrypt every row to filter.
 
 Edge cases (all fail-safe):
-- User has **no** bindings → sees **zero** rows (deny-by-default).
-- A binding maps to a column missing from `field_map` → that binding is dropped to
-  `Never` (no crash, no accidental open).
+- User has **no** bindings → sees **zero** rows (deny-by-default), not an error.
+- A binding maps to a column missing from `field_map` → that binding degrades to
+  `Never` and a warning is logged (no crash, no accidental open).
 - A **`G`** binding matches every row (use sparingly — that's "see everything").
+- On update, the post-merge check only runs when the request actually carries a
+  `data` body. An ACL-only update skips it — harmless, since nothing can move.
 
 ---
 
@@ -166,58 +180,119 @@ Edge cases (all fail-safe):
 
 Three conditions, **all** required, before scope enforces anything:
 
-1. **Env flag** `TFL5_ENFORCE_SCOPE=true` on the cell (global circuit-breaker; unset
-   ⇒ scope is bypassed entirely, so you can ship config first, enforce later).
-2. **Per-app opt-in** — `apps.acls.scope.field_map` is non-empty. Apps that never
-   set it are unaffected even when the flag is on.
+1. **Env flag** `TFL5_ENFORCE_SCOPE` on the cell, set to `1`, `true`, `TRUE`, or
+   `yes` (global circuit-breaker; unset ⇒ scope is bypassed entirely, so you can
+   ship config first and enforce later). It is read from the process environment
+   on every request, so flipping it needs no restart of your app.
+2. **Per-app opt-in** — `apps.acls.scope.field_map` is present *and* non-empty. An
+   empty object counts as not opted in. Apps that never set it are unaffected even
+   when the flag is on.
 3. **Resource in `field_map`** — a resource with no entry is **default-deny** for a
-   scoped app (rather than silently open).
+   scoped app (rather than silently open): `scope_not_configured`, HTTP 400.
 
-The `/app/doc/list` response carries `meta.scope_filter_applied` so you can confirm
-enforcement is live for a given call.
+There is a fourth bypass you can't trigger from a tenant app: the `_cluster`
+platform service principal skips scope entirely.
+
+**Confirming it's live.** The `/app/doc/list` response carries
+`meta.scope_filter_applied`. Note the shape of that signal:
+
+- When scope is **not** enforced (flag off, app not opted in, `_cluster`), there is
+  **no `meta` key at all** — so "`scope_filter_applied` is absent" means *not
+  enforced*, which is exactly the case you must not mistake for a pass.
+- When enforced, its value is an object such as
+  `{"enforced": true, "bindings_count": 2, "roles": [...]}`, or
+  `{"enforced": true, "reason": "no_bindings", "bindings_count": 0}` for a user
+  with nothing bound.
+
+⚠ **Scope config changes are not cache-invalidated.** Unlike the ACL endpoints,
+`/app/scope/set` does not flush the app-config cache, so a change can take up to
+the cache TTL to take effect. Don't write a test that sets a binding and asserts
+the fence in the very next request.
 
 ---
 
 ## 7. Endpoints
 
 **`POST /app/scope/get`** — Designer-level. `{ app_tid }` →
-`{ field_map, my_bindings }` (returns only the **caller's own** bindings, never
-other users').
 
-**`POST /app/scope/set`** — Designer-level. Three patch modes:
+```jsonc
+{ "result": true, "app_tid": "a_xxx",
+  "field_map":   { ... },   // verbatim; operator config, no PII
+  "my_bindings": [ ... ],   // ONLY the caller's own bindings
+  "timestamp":   1700000000000 }
+```
+
+Both fields sit at the **top level**, not under `data`. Unset scope returns
+`{}` / `[]` — the same shape as a fresh app, so a sync script can treat "no
+scope yet" like "no diff". Even a Designer cannot read *another* user's bindings
+through this endpoint.
+
+**`POST /app/scope/set`** — Designer-level. Three patch modes, applied in this
+order (`field_map`, then `bindings`, then `bindings_patch`):
 ```jsonc
 { "app_tid": "a_xxx",
-  "field_map": { ... },              // replace the whole field_map (omit = keep)
+  "field_map": { ... },              // replace the whole field_map (omit = keep,
+                                     //   null = clear to {})
   "bindings":  { ... },              // replace ALL bindings
   "bindings_patch": {                // OR: per-user patch (merge/clear one user)
      "u-alice": [ ... ],             //   set alice's bindings
      "u-bob":   null                 //   clear bob's bindings
   } }
-→ { app_tid, bindings_count, field_map_size }
+→ { "result": true,
+    "data": { "app_tid", "bindings_count", "field_map_size" },
+    "timestamp": ... }
 ```
-Validation errors: `scope_field_map_invalid`, `scope_bindings_invalid`,
-`scope_bindings_patch_invalid`.
+Validation errors (all HTTP 400): `scope_field_map_invalid`,
+`scope_bindings_invalid`, `scope_bindings_patch_invalid`, and
+`scope_bindings_patch_invalid_value` when a patch entry is neither an array nor
+`null`.
 
 ---
 
 ## 8. Scope carries a PII level too
 
-A binding may declare a **PII level** that masks sensitive fields on read even for
-an in-scope row (e.g. an aggregate role that may count students but not see names).
-When multiple bindings match a row, the caller gets the **least-strict** level.
-See [security-model.md](security-model.md) for the field-level encryption + masking
-model this rides on.
+A binding may declare a **`pii_level`** that narrows what an in-scope row shows —
+e.g. an aggregate role that may count students but not see their names. Three
+values, and anything unrecognised falls back to `F`:
+
+| Value | Meaning |
+|---|---|
+| `"F"` / `"Full"` | the row comes back unchanged (default) |
+| `"M"` / `"Masked"` | fields listed in that resource's `pii_fields` are masked |
+| `"A"` / `"Aggregate"` | the row is dropped from `list`; `get` refuses it |
+
+When multiple bindings match a row, the caller gets the **least-strict** level
+(`F` beats `M` beats `A`).
+
+Two behaviours to design around:
+
+- On `/app/doc/list`, `A`-level rows are **silently dropped** and the count
+  appears as `meta.pii_aggregate_dropped`. An aggregate caller therefore sees a
+  short page, not an error.
+- On `/app/doc/get`, an `A`-level caller gets HTTP 400 `pii_aggregate_only` —
+  **unless** they send an `X-Audit-Reason` header, which escalates the read to
+  Full and records it with `drill_down=true` and the reason text. This is a
+  deliberate break-glass path; assume an `A` role can reach Full data by stating
+  a reason, and that both the escalation and the refusal are logged.
+
+See [security-model.md §5](security-model.md) for the masking rules and the
+`pii_fields` declaration this rides on.
 
 ---
 
 ## 9. Gotchas
 
 1. **Scope is `AND`-ed with ACL, not instead of it.** A caller still needs
-   app-level Reader + resource-ACL + per-row ACL. Scope only *subtracts* rows.
-2. **`field_map` columns must be columns the row actually has** (they live in
-   `data_indexed` / the row's fenced field). A typo → that binding becomes `Never`.
-3. **No bindings = no rows.** Don't forget to bind a user, or they see nothing.
+   app-level Reader and the resource ACL (and, on writes, the per-row ACL).
+   Scope only *subtracts* rows.
+2. **`field_map` columns must be columns the row actually has**, and must be
+   **level 0** (unencrypted). A typo → that binding becomes `Never`.
+3. **No bindings = no rows.** Don't forget to bind a user, or they see nothing —
+   and it will look like an empty dataset, not a permission error.
 4. **`G` is "see everything"** — reserve it for admin/service roles.
-5. **It's opt-in and env-gated** — verify `meta.scope_filter_applied` is `true`
-   before trusting the fence in a security-sensitive flow; on a cell with
-   `TFL5_ENFORCE_SCOPE` unset, scope does nothing.
+5. **It's opt-in and env-gated** — check that `meta.scope_filter_applied` is
+   *present* before trusting the fence in a security-sensitive flow. A missing
+   `meta` key means scope did nothing.
+6. **Changes may lag the config cache** — `/app/scope/set` doesn't invalidate it.
+7. **A binding's `pii_level` can still expose Full data** via the
+   `X-Audit-Reason` break-glass on `/app/doc/get` (§8). It is logged, not blocked.
