@@ -101,6 +101,88 @@ export class HttpCore {
     return this.unwrap<T>(res);
   }
 
+  /**
+   * POST and return the WHOLE envelope, not just `data`.
+   *
+   * Several handlers put meaningful fields as siblings of `data` rather than
+   * inside it — `/billing/invoice/issue` returns `receipt_email` and
+   * `e_invoice` that way, and the durable send path returns `instance_tid` /
+   * `deduplicated`. {@link post} would drop them on the floor. Errors are
+   * still thrown exactly as {@link post} throws them.
+   */
+  async postFull<T = unknown>(path: string, body: object = {}): Promise<T> {
+    const b = body as Record<string, unknown>;
+    const payload: Record<string, unknown> =
+      this.appId && b["app_tid"] === undefined ? { app_tid: this.appId, ...b } : b;
+    const res = await this.fetchImpl(this.url(path), {
+      method: "POST",
+      headers: this.headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload),
+      credentials: this.auth === "cookie" ? "include" : "same-origin",
+    });
+    this.captureCookies(res);
+    return this.unwrap<T>(res, { envelope: true });
+  }
+
+  /**
+   * POST and return raw bytes.
+   *
+   * A few endpoints answer with a binary body and a `Content-Disposition`
+   * header instead of JSON — `/app/f3/download` and `/billing/invoice/pdf`.
+   * {@link post} calls `res.json()` unconditionally, which on those routes
+   * throws, gets swallowed, and resolves `undefined`: the file vanishes with
+   * no error. Use this instead.
+   *
+   * An error response is still JSON, so failures throw the usual typed error.
+   */
+  async postRaw(
+    path: string,
+    body: object = {}
+  ): Promise<{ bytes: ArrayBuffer; filename?: string; mimeType?: string }> {
+    const b = body as Record<string, unknown>;
+    const payload: Record<string, unknown> =
+      this.appId && b["app_tid"] === undefined ? { app_tid: this.appId, ...b } : b;
+    const res = await this.fetchImpl(this.url(path), {
+      method: "POST",
+      headers: this.headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload),
+      credentials: this.auth === "cookie" ? "include" : "same-origin",
+    });
+    this.captureCookies(res);
+
+    const type = res.headers.get("content-type") ?? "";
+    if (!res.ok || type.includes("application/json")) {
+      // Either a real error, or a handler that answered JSON because it
+      // refused. Let the normal envelope logic raise the typed error; if it
+      // somehow succeeds there were no bytes to return.
+      await this.unwrap<unknown>(res);
+      throw makeError(res.status, { msg: "expected binary body, got JSON" });
+    }
+
+    const disposition = res.headers.get("content-disposition") ?? "";
+    // filename*=UTF-8''... wins over the plain form when both are present.
+    const star = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
+    const plain = /filename="?([^";]+)"?/i.exec(disposition);
+    const filename = star ? decodeURIComponent(star[1]!) : plain?.[1];
+
+    return { bytes: await res.arrayBuffer(), filename, mimeType: type || undefined };
+  }
+
+  /**
+   * GET a path. Most of the API is POST-only, but a few genuinely public
+   * reads are GET — `/billing/catalog` is one, and it 405s on POST.
+   */
+  async get<T = unknown>(path: string, query: Record<string, string> = {}): Promise<T> {
+    const qs = new URLSearchParams(query).toString();
+    const res = await this.fetchImpl(this.url(path) + (qs ? `?${qs}` : ""), {
+      method: "GET",
+      headers: this.headers(),
+      credentials: this.auth === "cookie" ? "include" : "same-origin",
+    });
+    this.captureCookies(res);
+    return this.unwrap<T>(res);
+  }
+
   private url(path: string): string {
     return `${this.host}${path.startsWith("/") ? path : `/${path}`}`;
   }
@@ -133,7 +215,7 @@ export class HttpCore {
     }
   }
 
-  private async unwrap<T>(res: Response): Promise<T> {
+  private async unwrap<T>(res: Response, opts: { envelope?: boolean } = {}): Promise<T> {
     const retryAfter = Number(res.headers.get("retry-after")) || undefined;
     let body: unknown;
     try {
@@ -151,14 +233,25 @@ export class HttpCore {
       isSignout?: boolean;
     };
 
-    // Success: HTTP 2xx + `result:true`. Return the unwrapped payload.
+    // An expired session is reported by most `/user/*` handlers as HTTP 200
+    // `{isSignout:true, result:true}` — a SUCCESS envelope. This check has to
+    // come before the success branch below: with it after, the success branch
+    // returned first and the guard never ran, so a signed-out caller silently
+    // received an empty object instead of an error.
+    if (env.isSignout === true) {
+      throw makeError(401, { ...env, code: env.code ?? "isSignout" }, retryAfter);
+    }
+    // Success: HTTP 2xx + `result:true`. Return the unwrapped payload — or the
+    // whole envelope when the caller asked for it (postFull).
     if (res.ok && env.result === true) {
+      if (opts.envelope) return body as T;
       return (env.data !== undefined ? env.data : (body as T)) as T;
     }
     // Some legacy error shapes ship HTTP 200 (not_found, access_denied)
     // with a `code` and no `result:true`. Treat any non-success envelope
     // as an error so callers never confuse rejection with data.
-    if (!res.ok || env.code !== undefined || env.isSignout === true || env.result === false) {
+    // (`isSignout` is handled above and is provably not `true` here.)
+    if (!res.ok || env.code !== undefined || env.result === false) {
       throw makeError(res.status, env, retryAfter);
     }
     // 2xx without the standard envelope (e.g. raw object) — pass through.

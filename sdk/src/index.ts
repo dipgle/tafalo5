@@ -17,15 +17,31 @@
 //    ├─ .wasm                 ← tenant WASM operator lifecycle
 //    ├─ .files                ← /app/file/* (+ /app/folder/*), multipart upload
 //    ├─ .shares               ← per-doc grants + anonymous link claim
-//    └─ .sources              ← signed inbound data channels (/app/source/*)
+//    ├─ .sources              ← signed inbound data channels (/app/source/*)
+//    ├─ .site                 ← content-addressed site engine (/app/site/*):
+//    │                          author → publish a snapshot → roll back
+//    ├─ .bundles / .domains   ← legacy bundle tier + custom domains + delegation
+//    ├─ .f3                   ← encrypted file vault attached to records
+//    ├─ .email                ← per-app outbound mail + DKIM + inbox
+//    ├─ .chat                 ← per-app chat history + live socket
+//    ├─ .billing              ← public catalog, subscription, credits, invoices
+//    ├─ .account              ← the signed-in user's own profile / emails / 2FA
+//    └─ .durable              ← stateful actors (OFF unless the operator enables it)
 //
 // Field-level encryption (level 0/1/2) is transparent: the server splits
 // `data_indexed` (searchable plaintext) from `data_secret` (AEAD) on every
 // write path — including `set_fields` hooks — so the SDK only ever handles
 // plain field values.
 
+import { AccountClient } from "./account.js";
 import { AppsClient } from "./apps.js";
 import { AuthClient } from "./auth.js";
+import { BillingClient } from "./billing.js";
+import { ChatClient } from "./chat.js";
+import { BundleClient, DomainClient } from "./deploy.js";
+import { DurableClient } from "./durable.js";
+import { EmailClient } from "./email.js";
+import { F3Client } from "./f3.js";
 import { FilesClient } from "./files.js";
 import { HttpCore, type Tfl5Config } from "./http.js";
 import { IntegrationsClient, OperatorClient, WasmClient } from "./operator.js";
@@ -33,6 +49,7 @@ import { ResourceClient } from "./resource.js";
 import { GroupsClient, RolesClient } from "./roles.js";
 import { ScopeClient } from "./scope.js";
 import { SharesClient } from "./shares.js";
+import { SiteClient } from "./site.js";
 import { SourcesClient } from "./sources.js";
 import type { FieldDecl, Hook } from "./types.js";
 
@@ -50,6 +67,25 @@ export class TFL5 {
   readonly sources: SourcesClient;
   /** Row-level scope config (`/app/scope/*`). See docs/scope.md. */
   readonly scope: ScopeClient;
+  /** Content-addressed site engine (`/app/site/*`) — the current publish path. */
+  readonly site: SiteClient;
+  /** Legacy bundle tier (`/app/bundle/*`). `site` supersedes it. */
+  readonly bundles: BundleClient;
+  /** Custom domains + subdomain delegation (`/app/domain/*`). */
+  readonly domains: DomainClient;
+  /** Encrypted per-record file vault (`/app/f3/*`). */
+  readonly f3: F3Client;
+  /** Per-app outbound mail, DKIM and inbox (`/app/email/*`). */
+  readonly email: EmailClient;
+  /** Per-app chat history + live socket. */
+  readonly chat: ChatClient;
+  /** Catalog, subscription, credits and invoices. */
+  readonly billing: BillingClient;
+  /** The signed-in user's own account (`/user/*`, `/user/2fa/*`). */
+  readonly account: AccountClient;
+  /** Durable stateful actors. Ships DISABLED — the operator must set
+   *  `TFL5_DURABLE_ENABLED` before any of these calls will work. */
+  readonly durable: DurableClient;
 
   constructor(config: Tfl5Config = {}) {
     this.http = new HttpCore(config);
@@ -63,6 +99,15 @@ export class TFL5 {
     this.shares = new SharesClient(this.http);
     this.sources = new SourcesClient(this.http);
     this.scope = new ScopeClient(this.http);
+    this.site = new SiteClient(this.http);
+    this.bundles = new BundleClient(this.http);
+    this.domains = new DomainClient(this.http);
+    this.f3 = new F3Client(this.http);
+    this.email = new EmailClient(this.http);
+    this.chat = new ChatClient(this.http);
+    this.billing = new BillingClient(this.http);
+    this.account = new AccountClient(this.http);
+    this.durable = new DurableClient(this.http);
   }
 
   /** Scope subsequent calls to an app — `app_tid` is auto-injected. */
@@ -132,5 +177,13 @@ export { SourcesClient } from "./sources.js";
 export type { RegisterSourceInput, SourceRecord } from "./sources.js";
 export { AuthClient } from "./auth.js";
 export type { LoginResult, DataExport, EraseResult } from "./auth.js";
+export { SiteClient } from "./site.js";
+export { BundleClient, DomainClient } from "./deploy.js";
+export { F3Client, F3Level } from "./f3.js";
+export { DurableClient, DurableSubscription } from "./durable.js";
+export { EmailClient } from "./email.js";
+export { ChatClient, ChatSocket } from "./chat.js";
+export { BillingClient } from "./billing.js";
+export { AccountClient } from "./account.js";
 export * from "./errors.js";
 export * from "./types.js";
