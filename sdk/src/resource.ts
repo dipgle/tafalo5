@@ -7,6 +7,22 @@
 // decrypted back on `get`. The SDK never sees ciphertext — you read/write
 // the plain field; the server enforces the column split (and, post-fix,
 // even `set_fields` hooks honor it).
+//
+// ⚠ NO GRACEFUL DEGRADATION on decrypt failure, and the blast radius is the
+// WHOLE response, not the one bad cell. Server-side, `decrypt_secret_blob`
+// (doc_fields.rs:181-223) turns any decrypt failure (corrupt ciphertext, a
+// master-key rotation whose backfill hasn't finished, ...) into a bare
+// `AppError::Internal`, which propagates through an unguarded `?` inside
+// `row_to_json` (doc.rs:1719-1748). That function runs once per row in
+// `list()`'s loop AND once for `get()` — with no per-row catch either
+// place. So ONE corrupted / currently-unopenable level-1/2 cell aborts the
+// ENTIRE call as HTTP 500 `{"code":"internal"}`, potentially discarding
+// hundreds of unrelated rows on the same page. This is NOT the account-PII
+// contract: `/user/profile` degrades per-field via an `unreadable` array
+// instead of failing the whole request. Documents did not get that
+// treatment — do not model a `data_secret` field as "decrypts to null on
+// failure like account PII does"; model `get()`/`list()` as able to throw
+// outright whenever level-1/2 data is on the page.
 
 import type { HttpCore } from "./http.js";
 import type { Doc, FieldDecl, Hook, ListOptions } from "./types.js";
@@ -39,14 +55,19 @@ export class ResourceClient<T extends Record<string, unknown> = Record<string, u
     });
   }
 
-  /** Fetch one doc by tid (secret fields decrypted). */
+  /** Fetch one doc by tid (secret fields decrypted). Throws HTTP 500
+   *  `internal` if a level-1/2 field on this row can't be decrypted — see
+   *  the module header; there is no partial/degraded result. */
   async get(tid: string): Promise<Doc<T>> {
     return this.http.post<Doc<T>>("/app/doc/get", { tid });
   }
 
   /** List docs, optionally filtered/paged. `where` is a containment +
    *  comparison filter evaluated against `data_indexed` (level-0 fields
-   *  only — secret fields are not searchable by design). */
+   *  only — secret fields are not searchable by design). NOTE: if ANY row
+   *  in the page carries a level-1/2 field that fails to decrypt, the WHOLE
+   *  call throws HTTP 500 `internal` — see the module header. There is no
+   *  per-row skip; one bad cell can take down an otherwise-healthy page. */
   async list(opts: ListOptions = {}): Promise<Doc<T>[]> {
     return this.http.post<Doc<T>[]>("/app/doc/list", { resource_ma: this.ma, ...opts });
   }
@@ -123,9 +144,20 @@ export class ResourceClient<T extends Record<string, unknown> = Record<string, u
     return this.http.post<ResourceDef>("/app/resource/get", { tid });
   }
 
-  /** Update this resource's definition (name/fields/hooks) and/or its
-   *  per-RESOURCE-TYPE ACL arrays. To CREATE a new resource use
+  /** Update this resource's definition (name/fields/hooks/code guards)
+   *  and/or its per-RESOURCE-TYPE ACL arrays. To CREATE a new resource use
    *  `tfl5.createResource(...)` instead.
+   *
+   *  The `*_code` fields are server-side JS guards run in a QuickJS sandbox
+   *  (≤100ms wall clock, ≤16MiB heap, no network/files) on the matching doc
+   *  lifecycle event (hooks.rs). The code sees one global, `ctx`:
+   *  `ctx.event`, `ctx.data` (the incoming payload — mutable in before_*),
+   *  `ctx.doc`/`ctx.old_doc` (current row / pre-update snapshot), `ctx.user`,
+   *  `ctx.resource`, `ctx.app`, `ctx.now_ms`, and `ctx.reject(msg, code?)` to
+   *  block the write (surfaces as `code: "hook_reject"`). `after_*` hooks are
+   *  side-effect only — their return value is ignored. Pass `""` to clear a
+   *  guard; omit to leave it unchanged. See api-reference.md "JS code hooks"
+   *  for the full ABI.
    *
    *  Resource-ACL (`readers/editors/deletable/noaccess`) gates every
    *  `/app/doc/*` op on this resource TYPE — a coarser layer than per-doc ACL
@@ -133,7 +165,19 @@ export class ResourceClient<T extends Record<string, unknown> = Record<string, u
    *  (`managers`/`designers`/`authors` are NOT enforced as a doc gate — only the
    *  four arrays here are; see acl-model.md "Resource-level ACL".) */
   async putSchema(
-    def: { name?: string; fields?: FieldDecl[]; hooks?: Hook[] } & ResourceAcl,
+    def: {
+      name?: string;
+      fields?: FieldDecl[];
+      hooks?: Hook[];
+      /** JS guard run before a create; can mutate `ctx.data` or `ctx.reject(...)`. */
+      before_create_code?: string;
+      /** JS guard run after a create; side-effect only. */
+      after_create_code?: string;
+      /** JS guard run before an update; can mutate `ctx.data` or `ctx.reject(...)`. */
+      before_update_code?: string;
+      /** JS guard run after an update; side-effect only. */
+      after_update_code?: string;
+    } & ResourceAcl,
   ): Promise<ResourceDef> {
     const tid = await this.resolveTid();
     return this.http.post<ResourceDef>("/app/resource/update", { tid, ...def });
@@ -147,6 +191,71 @@ export class ResourceClient<T extends Record<string, unknown> = Record<string, u
   /** Declarative-hook accessor (require_fields / set_fields / webhook). */
   get hooks(): HooksAccessor {
     return new HooksAccessor(this as ResourceClient<Record<string, unknown>>);
+  }
+
+  // ---- Resource-type lifecycle + storage cleanup -----------------------
+  //
+  // `/app/resource/del`, `/app/resource/constraints` and
+  // `/app/resource/orphan-drop` (resource.rs:50-52). Without these, cleaning
+  // up storage after deleting a resource type means hand-rolling a raw POST.
+
+  /**
+   * Soft-delete THIS resource TYPE — the whole schema plus every row it
+   * owns, not a single doc (for that, see {@link ResourceClient.del}).
+   * Manager on the app.
+   *
+   * Refused with `resource_referenced_by_link` (HTTP 400) while another
+   * live resource has a `link`/`multilink` field pointing at this one —
+   * remove or repoint that field first. If the physical storage reclaim
+   * fails, the delete still succeeds (`result:true`) and this resource
+   * shows up under `orphans` in {@link ResourceClient.constraints}; use
+   * {@link ResourceClient.orphanDrop} to finish that cleanup.
+   */
+  async deleteType(): Promise<void> {
+    const tid = await this.resolveTid();
+    await this.http.post("/app/resource/del", { tid });
+  }
+
+  /**
+   * App-wide resource-constraints dashboard: per-resource-type roster and
+   * storage counts, plus the list of soft-deleted types whose doc storage
+   * was never reclaimed (`orphans`). Editor on the app — the response
+   * exposes ACL roster sizes and storage-table identifiers, which Reader
+   * should not see.
+   *
+   * Per-tenant rate-limited (30/min, keyed by `app_tid`) — a burst throws
+   * `RateLimitError` (HTTP 429, code `rate_limit_exceeded`) with
+   * `retryAfter` set.
+   *
+   * NOTE: the result covers EVERY resource type in the scoped app, not
+   * just `this.ma` — it lives on `ResourceClient` because that's where
+   * `/app/resource/*` + the app scope already meet, not because it's
+   * specific to one resource.
+   */
+  async constraints(): Promise<ResourceConstraints> {
+    return this.http.post<ResourceConstraints>("/app/resource/constraints", {});
+  }
+
+  /**
+   * Finish an interrupted storage reclaim for an already-soft-deleted
+   * resource type. Manager on the app. Idempotent — re-running after the
+   * storage is already gone returns `dropped_rows: 0`.
+   *
+   * Refused with `resource_not_deleted` (HTTP 409, not 200) if the target
+   * is still LIVE — this endpoint only finishes a cleanup
+   * {@link ResourceClient.deleteType} already started; it can never touch
+   * a live resource's data.
+   *
+   * @param tid Resource-type tid to reclaim, typically taken from
+   *   {@link ResourceConstraints.orphans}. Omit to target THIS client's own
+   *   resource (the tid `resolveTid()`/`deleteType()` already cached) — the
+   *   common case of cleaning up right after deleting it.
+   */
+  async orphanDrop(tid?: string): Promise<{ dropped_rows: number }> {
+    const target = tid ?? (await this.resolveTid());
+    return this.http.post<{ dropped_rows: number }>("/app/resource/orphan-drop", {
+      tid: target,
+    });
   }
 }
 
@@ -172,7 +281,61 @@ export interface ResourceDef {
   name?: string;
   fields?: FieldDecl[];
   hooks?: Hook[];
+  /** Server-side JS guards (QuickJS sandbox). See {@link ResourceClient.putSchema}. */
+  before_create_code?: string;
+  after_create_code?: string;
+  before_update_code?: string;
+  after_update_code?: string;
   [k: string]: unknown;
+}
+
+/** Per-role ACL roster sizes for one resource, as returned by
+ *  {@link ResourceClient.constraints}. */
+export interface ResourceAclBreakdown {
+  managers: number;
+  designers: number;
+  authors: number;
+  editors: number;
+  readers: number;
+  deletable: number;
+  noaccess: number;
+}
+
+/** A dashboard heads-up on one resource type. `flags` calls out things
+ *  worth an operator's attention: `"empty"` (no docs), `"stale"` (has docs,
+ *  none touched in 30 days) and `"no_acl"` (nobody rostered on any of the
+ *  five roster arrays). */
+export interface ResourceConstraintEntry {
+  tid: string;
+  ma: string;
+  name: string;
+  description: string | null;
+  doc_count: number;
+  share_count: number;
+  hook_count: number;
+  field_count: number;
+  acl_user_count: number;
+  acl_breakdown: ResourceAclBreakdown;
+  storage_table: string;
+  updated_at: number;
+  flags: Array<"empty" | "stale" | "no_acl">;
+  sharing: boolean;
+  status: number;
+}
+
+/** A soft-deleted resource type whose doc storage was never reclaimed —
+ *  see {@link ResourceClient.orphanDrop}. */
+export interface ResourceOrphan {
+  tid: string;
+  name: string;
+  doc_count: number;
+  storage_table: string;
+}
+
+/** Result of {@link ResourceClient.constraints}. */
+export interface ResourceConstraints {
+  resources: ResourceConstraintEntry[];
+  orphans: ResourceOrphan[];
 }
 
 /** Read/replace the hook array on a resource. Hooks live on the resource

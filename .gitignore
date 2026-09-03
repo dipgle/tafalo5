@@ -3,3 +3,8 @@ dist/
 *.tsbuildinfo
 package-lock.json
 .DS_Store
+
+# Local-only workspace tooling. This repo is public; neither of these is part
+# of the published SDK or its docs.
+.tmp/
+.quality-gate.env

@@ -4,16 +4,16 @@
 //
 // ⚠ DEFAULT-OFF: the entire durable-operator subsystem is gated behind the
 // server env var `TFL5_DURABLE_ENABLED` (default FALSE — see
-// crates/system/src/state.rs:434-441, `durable_enabled_from_env`). On a
+// crates/system/src/state.rs, `durable_enabled_from_env`). On a
 // deployment where it isn't set, every method below (send/stats/subscribe/
 // mail grants) responds BEFORE any auth/DB work with a `durable_disabled`
-// code (crates/routes/src/durable.rs:3671-3678 for `send`, 3927-3934 for
-// `stats`, 3998-4003/4062-4067/4109-4114 for the mail-grant endpoints,
-// crates/routes/src/durable_proj.rs:447-455 for `subscribe`). It's NOT a
+// code — `durable_msg`, `durable_stats` and the three mail-grant handlers
+// in crates/routes/src/durable.rs, `subscribe` in
+// crates/routes/src/durable_proj.rs. It's NOT a
 // 404 and NOT a generic 500 — if you're seeing `durable_disabled`, check the
 // deployment's env, not your code. `subscribe` has a second, independent
-// gate: `TFL5_DURABLE_PROJECTIONS` (code `projections_disabled`,
-// durable_proj.rs:456-464).
+// gate: `TFL5_DURABLE_PROJECTIONS` (code `projections_disabled`, same
+// handler).
 //
 // Send contract: crates/routes/src/durable.rs `durable_msg`
 //   POST /durable/:op_id/:instance_key/msg
@@ -24,7 +24,7 @@
 //   POST /durable/:op_id/:instance_key/stats
 //   Auth: require_app_perm(Reader)
 //
-// Mail-grant contract: crates/routes/src/durable.rs (3978-4143)
+// Mail-grant contract: crates/routes/src/durable.rs
 //   POST /app/durable/mail-grant{,/revoke,/list}
 //   Auth: require_app_perm(Manager) on the RECIPIENT app (body.app_tid)
 //
@@ -35,29 +35,42 @@
 //   DurableSubscription below. Auth: cookie session, require_app_perm(Reader).
 //
 // op_id and instance_key are validated server-side to [A-Za-z0-9_-]{1..=64}
-// (durable.rs:3564-3577, `validate_durable_ident`).
+// (durable.rs, `validate_durable_ident`).
 //
-// --- A transport gap worth knowing about ------------------------------------
+// --- How the send envelope reaches you --------------------------------------
 //
 // `durable_msg`'s response places `instance_tid`/`timestamp`/`deduplicated`
-// as SIBLINGS of `data`, not nested inside it (durable.rs:3885-3897):
+// as SIBLINGS of `data`, not nested inside it:
 //   { result: true, data: <operator's return value>, instance_tid, timestamp, deduplicated? }
-// This SDK's shared transport, `HttpCore.post()` (http.ts), only returns the
-// unwrapped `data` field — it has no method that surfaces envelope-level
-// siblings (the internal reference SDK adds a second method, `postFull`,
-// for exactly this; this package's `http.ts` does not have one, and this
-// file may not add it). So `send()` below returns ONLY the operator's data;
-// `instanceTid`/`timestamp`/`deduplicated` are not currently retrievable
-// through it. The placement/busy conditions (`instance_busy`, `wrong_cell`,
+// `HttpCore.post()` returns only the unwrapped `data`, which drops all
+// three, so `send()` uses `HttpCore.postFull()` (http.ts) — the
+// whole-envelope variant whose own doc comment names this endpoint as the
+// reason it exists — and returns a {@link DurableSendResult} carrying the
+// operator's `data` alongside `instanceTid`, `timestamp` and
+// `deduplicated`. Sibling clients do the same where the envelope matters
+// (`billing.invoiceIssue`, `files`' upload pair).
+//
+// REFUSALS STILL THROW, and that is not a choice this file can make:
+// `postFull` shares `unwrap()` with `post()`, and `unwrap()` treats ANY
+// `result:false` — with or without a `code` — as an error. So every
+// placement/capacity/rollout condition (`instance_busy`, `wrong_cell`,
 // `wrong_cell_needs_idem`, `cell_forward_failed`, `instance_quota`,
-// `tick_deadline`, `durable_disabled`) all arrive as HTTP 200 with
-// `result:false` + a `code` field — `HttpCore.post()` treats ANY
-// `result:false` (with or without a `code`) as an error and throws, so
-// these surface as a thrown `Tfl5Error` rather than a non-throwing result
-// shape. Check `err.code`; see {@link isDurableRetryable} and {@link
-// durablePlacement} below for ergonomic helpers, and `DnsRecord`/`revoke()`
-// in the sibling `email.ts`/`f3.ts` for the same transport limitation
-// biting other endpoints.
+// `tick_deadline`, `durable_disabled`) arrives as HTTP 200 + `result:false`
+// and surfaces as a thrown `Tfl5Error`, never as a soft result field. The
+// internal reference SDK returns those as `{result:false, busy/wrongCell}`
+// booleans because ITS `postFull` deliberately does not throw on
+// `result:false`; this package's does, and http.ts is not ours to change.
+// Check `err.code`, and use the helpers below: {@link isDurableRetryable},
+// {@link durablePlacement}, {@link durableQuota}, {@link
+// durableTickDeadline}. A refusal's own `data` payload (the quota numbers,
+// the tick budget) is preserved on `err.body.data`.
+//
+// One more `result:false` shape has no `code` at all: the envelope mirrors
+// the operator's own verdict (`"result": outcome.ok`), so a guest that
+// answered not-ok yields a thrown `BadRequestError` with `code` defaulted
+// to `"bad_request"` and the guest's value on `err.body.data`. It is not a
+// transport failure and {@link isDurableRetryable} correctly returns false
+// for it.
 
 import { Tfl5Error } from "./errors.js";
 import type { HttpCore } from "./http.js";
@@ -68,7 +81,13 @@ import type { HttpCore } from "./http.js";
 
 /** Input for {@link DurableClient.send}. */
 export interface DurableSendInput {
-  /** Target app tid (injected automatically when `tfl5.useApp(...)` is set). */
+  /**
+   * Target app tid. REQUIRED here, unlike most inputs in this SDK: the
+   * transport would inject `useApp()`'s value for an absent `app_tid`, but
+   * this type does not let the field be absent. A durable send addresses a
+   * specific instance's persistent state, so the app that owns it is named
+   * at the call site rather than inherited from ambient config.
+   */
   appTid: string;
   /**
    * Durable operator id — must match `[A-Za-z0-9_-]{1..=64}`. Identifies the
@@ -86,17 +105,48 @@ export interface DurableSendInput {
   /**
    * Client-chosen deduplication token. A retry using the same `idemKey`
    * (same app + instance) does not re-deliver — the server returns the
-   * original message's journaled result instead (silently, from this
-   * method's point of view — see the module-level note on why
-   * `deduplicated` isn't surfaced).
+   * original message's journaled result, flagged
+   * {@link DurableSendResult.deduplicated}. Supply one on any send you
+   * might retry: it is also what makes a cross-cell forward exactly-once
+   * (`wrong_cell_needs_idem` refuses the hop without it).
    */
   idemKey?: string;
 }
 
 /**
+ * Result of {@link DurableClient.send} — the whole success envelope, not
+ * just the operator's return value.
+ *
+ * Only ACCEPTED deliveries produce this shape. Every refusal throws (see
+ * the module header), so `result` is always `true` here; it is kept on the
+ * type because it is what the wire says and because a caller logging the
+ * envelope should log what it received.
+ */
+export interface DurableSendResult<T = unknown> {
+  /** Always `true` — a `result:false` envelope is thrown, not returned. */
+  result: true;
+  /** The WASM operator's own return value. */
+  data: T;
+  /**
+   * Persistent instance identifier — the row the oplog, lease and
+   * snapshots hang off. This is the only place the SDK can hand it to you:
+   * it is an envelope sibling, so a plain `post()` would drop it.
+   */
+  instanceTid: string;
+  /** Server clock, epoch-ms. */
+  timestamp: number;
+  /**
+   * `true` when this was a duplicate `idemKey` retry: nothing re-executed
+   * and `data` is the ORIGINAL message's journaled result. Normalized to a
+   * boolean — the server omits the field entirely when it is false.
+   */
+  deduplicated: boolean;
+}
+
+/**
  * Stable `code` values a `send`/`stats`/`subscribe` call can raise as a
  * thrown {@link Tfl5Error} — never a distinct non-throwing shape (see the
- * module-level transport note). Check `err.code` against these to decide
+ * module header). Check `err.code` against these to decide
  * whether a retry makes sense; `"wrong_cell"` / `"wrong_cell_needs_idem"`
  * additionally carry the owning cell — see {@link durablePlacement}.
  */
@@ -119,12 +169,16 @@ export const DURABLE_RETRYABLE_CODES = [
    *  (timeout/network); retry — the propagated `idemKey` makes it exactly-
    *  once. */
   "cell_forward_failed",
-  /** App is at its concurrent-instance ceiling (license tier). Retry once
-   *  an instance idles out, or upgrade tier. */
+  /** App is at its concurrent-instance ceiling (license tier). Gates NEW
+   *  activations only — live instances keep serving. Retry once one idles
+   *  out, or raise the tier; the two numbers behind the decision are on
+   *  the error — see {@link durableQuota}. */
   "instance_quota",
   /** The guest stalled past its per-message wall-clock budget and was
-   *  trapped; nothing was journaled. Retry — a fresh delivery cold-
-   *  recovers cleanly. */
+   *  trapped; nothing was journaled (the message transaction rolls back by
+   *  default — see {@link DurableClient.send}). Retry: a fresh delivery
+   *  cold-recovers cleanly. The budget itself is on the error — see
+   *  {@link durableTickDeadline}. */
   "tick_deadline",
   /** `subscribe` only: per-app distinct live projection-key quota reached
    *  (HTTP 402, code `proj_keys_quota`). */
@@ -146,11 +200,77 @@ export function isDurableRetryable(
 }
 
 /** The owning cell to retry against, extracted from a `wrong_cell` /
- *  `wrong_cell_needs_idem` error (durable.rs:3750-3770 resolves these
- *  best-effort — empty strings when the server couldn't look them up). */
+ *  `wrong_cell_needs_idem` error (the server resolves these best-effort —
+ *  empty strings when it couldn't look them up). */
 export interface DurableCellTarget {
   cellId: string;
   baseUrl: string;
+}
+
+/**
+ * The two numbers behind an `instance_quota` refusal, from the error's
+ * `data` payload. Without them "retry or upgrade the tier" is a decision
+ * no caller can actually make — one instance over the line and a hundred
+ * over it look identical.
+ */
+export interface DurableQuotaInfo {
+  /** Instances currently live for this app. */
+  liveInstances: number;
+  /** The app's ceiling, from its license tier. */
+  maxConcurrentInstances: number;
+}
+
+/** The per-message wall-clock budget behind a `tick_deadline` refusal,
+ *  from the error's `data` payload. How far past the budget the guest
+ *  would have run is NOT reported — the trap fires AT the deadline rather
+ *  than letting the tick finish, so that number does not exist. */
+export interface DurableTickDeadlineInfo {
+  tickDeadlineMs: number;
+}
+
+/** Refusals whose `data` payload this module knows how to read. */
+interface DurableRefusalBody {
+  data?: {
+    live_instances?: number;
+    max_concurrent_instances?: number;
+    tick_deadline_ms?: number;
+  };
+}
+
+/**
+ * Extract the live/max instance counts from an `instance_quota` error.
+ * Returns `undefined` for any other error, and for an `instance_quota`
+ * whose payload is missing or non-numeric — a back-off that invented
+ * numbers would be worse than one that admits it has none.
+ *
+ * @example
+ * catch (err) {
+ *   const q = durableQuota(err);
+ *   if (q) {
+ *     // e.g. surface "12 of 12 instances busy" instead of a bare code,
+ *     // and back off proportionally to the overshoot.
+ *   }
+ * }
+ */
+export function durableQuota(err: unknown): DurableQuotaInfo | undefined {
+  if (!(err instanceof Tfl5Error) || err.code !== "instance_quota") return undefined;
+  const data = (err.body as DurableRefusalBody).data;
+  const live = data?.live_instances;
+  const max = data?.max_concurrent_instances;
+  if (typeof live !== "number" || typeof max !== "number") return undefined;
+  return { liveInstances: live, maxConcurrentInstances: max };
+}
+
+/**
+ * Extract the per-message wall-clock budget from a `tick_deadline` error.
+ * Returns `undefined` for any other error, or when the payload is absent
+ * — see {@link durableQuota} on why it does not guess.
+ */
+export function durableTickDeadline(err: unknown): DurableTickDeadlineInfo | undefined {
+  if (!(err instanceof Tfl5Error) || err.code !== "tick_deadline") return undefined;
+  const ms = (err.body as DurableRefusalBody).data?.tick_deadline_ms;
+  if (typeof ms !== "number") return undefined;
+  return { tickDeadlineMs: ms };
 }
 
 /**
@@ -178,7 +298,7 @@ export function durablePlacement(err: unknown): DurableCellTarget | undefined {
 // stats()
 // ---------------------------------------------------------------------------
 
-/** Result of {@link DurableClient.stats} (durable.rs:3955-3961). */
+/** Result of {@link DurableClient.stats} (durable.rs, `durable_stats`). */
 export interface DurableStatsResult {
   fuel_used_total: number;
   busy_ms_total: number;
@@ -204,7 +324,8 @@ export interface DurableMailGrantInput {
   opId?: string;
 }
 
-/** Result of {@link DurableClient.mailGrantCreate} (durable.rs:4043-4050). */
+/** Result of {@link DurableClient.mailGrantCreate} (durable.rs,
+ *  `durable_mail_grant`). */
 export interface DurableMailGrantCreateResult {
   /** `false` when the exact (recipient, sender, op-scope) grant already
    *  existed — idempotent, not an error. */
@@ -215,14 +336,16 @@ export interface DurableMailGrantCreateResult {
   timestamp?: number;
 }
 
-/** Result of {@link DurableClient.mailGrantRevoke} (durable.rs:4088-4092). */
+/** Result of {@link DurableClient.mailGrantRevoke} (durable.rs,
+ *  `durable_mail_grant_revoke`). */
 export interface DurableMailGrantRevokeResult {
   /** Rows deleted — `0` (no matching grant) or `1`. */
   revoked: number;
   timestamp?: number;
 }
 
-/** One row from {@link DurableClient.mailGrantList} (durable.rs:4126-4136). */
+/** One row from {@link DurableClient.mailGrantList} (durable.rs,
+ *  `durable_mail_grant_list`). */
 export interface DurableMailGrantRow {
   sender_app_tid: string;
   /** `null`/absent = app-wide grant (all recipient operators). */
@@ -231,7 +354,7 @@ export interface DurableMailGrantRow {
   created_at: number;
 }
 
-/** Result of {@link DurableClient.mailGrantList} (durable.rs:4138-4142). */
+/** Result of {@link DurableClient.mailGrantList}. */
 export interface DurableMailGrantListResult {
   grants: DurableMailGrantRow[];
   timestamp?: number;
@@ -260,26 +383,41 @@ export class DurableClient {
    * Posts to `POST /durable/${opId}/${instanceKey}/msg` with
    * `{ app_tid, msg, idem_key }`. The server creates the instance on first
    * delivery, or reuses the warm instance when one is already running.
-   * Resolves with the WASM operator's own return value.
+   * Resolves with a {@link DurableSendResult}: the operator's return value
+   * on `.data`, plus the envelope metadata (`instanceTid`, `timestamp`,
+   * `deduplicated`) that a plain `post()` would have discarded.
    *
    * Every placement/capacity/rollout condition — busy instance, wrong cell,
    * quota, tick deadline, subsystem disabled — throws a {@link Tfl5Error}
-   * (see the module-level transport note for why this differs from a
+   * (see the module header for why this package cannot return them as a
    * "soft" non-throwing result). Use {@link isDurableRetryable} to check
-   * whether it's worth retrying, and {@link durablePlacement} to find the
-   * owning cell on a `wrong_cell*` error.
+   * whether it's worth retrying, {@link durablePlacement} to find the
+   * owning cell on a `wrong_cell*` error, and {@link durableQuota} /
+   * {@link durableTickDeadline} to read the numbers a sensible back-off
+   * needs.
+   *
+   * Retry safety of `tick_deadline` is now structural, not a promise: the
+   * message transaction is owned by a guard that ROLLS BACK in `Drop`
+   * unless a successful `COMMIT` marked it committed, so a trapped tick
+   * journals nothing and cannot leak an open transaction back into the
+   * connection pool (durable.rs, `TxGuard`).
    *
    * @example
    * try {
-   *   const result = await tfl5.durable.send<{ count: number }>({
+   *   const res = await tfl5.durable.send<{ count: number }>({
    *     appTid: "app-xxx",
    *     opId: "counter",
    *     instanceKey: "user-42",
    *     msg: { action: "increment", by: 1 },
    *     idemKey: "req-abc-001",
    *   });
-   *   console.log(result.count);
+   *   console.log(res.data.count, res.instanceTid);
+   *   if (res.deduplicated) {
+   *     // Nothing re-executed: this is the original delivery's result.
+   *   }
    * } catch (err) {
+   *   const q = durableQuota(err);
+   *   if (q) console.warn(`${q.liveInstances}/${q.maxConcurrentInstances} instances live`);
    *   if (isDurableRetryable(err)) {
    *     // back off and retry (or redirect via durablePlacement(err))
    *   } else {
@@ -287,10 +425,40 @@ export class DurableClient {
    *   }
    * }
    */
-  send<T = unknown>(input: DurableSendInput): Promise<T> {
+  async send<T = unknown>(input: DurableSendInput): Promise<DurableSendResult<T>> {
     const body: Record<string, unknown> = { app_tid: input.appTid, msg: input.msg };
     if (input.idemKey !== undefined) body["idem_key"] = input.idemKey;
-    return this.http.post<T>(`/durable/${input.opId}/${input.instanceKey}/msg`, body);
+    // `postFull`, not `post`: `instance_tid` / `timestamp` / `deduplicated`
+    // are envelope SIBLINGS of `data`, and `post` returns `data` alone.
+    // Refusals still throw — `postFull` shares `unwrap()` (see header).
+    const env = await this.http.postFull<{
+      result?: boolean;
+      data?: T;
+      instance_tid?: string;
+      timestamp?: number;
+      deduplicated?: boolean;
+    }>(`/durable/${input.opId}/${input.instanceKey}/msg`, body);
+    // A 2xx `result:true` envelope without `instance_tid`/`timestamp` is
+    // not a shape this endpoint produces; say so rather than handing back
+    // a result whose `instanceTid` is silently `""` or whose clock is 0.
+    if (
+      typeof env.instance_tid !== "string" ||
+      env.instance_tid === "" ||
+      typeof env.timestamp !== "number"
+    ) {
+      throw new Error(
+        "@tfl5/sdk: durable.send() got an accepted envelope without `instance_tid` + " +
+          "`timestamp` — the response did not come from " +
+          "/durable/:op_id/:instance_key/msg.",
+      );
+    }
+    return {
+      result: true,
+      data: env.data as T,
+      instanceTid: env.instance_tid,
+      timestamp: env.timestamp,
+      deduplicated: env.deduplicated === true,
+    };
   }
 
   /**

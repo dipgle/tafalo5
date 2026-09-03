@@ -19,6 +19,9 @@
 //   POST /app/f3/grants/list — JSON; Manager on the app
 //
 // See {@link F3Level} for what each security level actually does.
+//
+// Storage quota: `upload()` can now be refused on quota (`quota_app_max_storage`,
+// HTTP 400) — see {@link F3Client.upload}'s doc comment for why that's new.
 
 import type { HttpCore } from "./http.js";
 
@@ -28,9 +31,10 @@ import type { HttpCore } from "./http.js";
 
 /**
  * F3 security level. Mirrors the server's `f3_files.level` column
- * (f3.rs:243-245 validates `1..=3`; there is no level 0 — every F3 file is
- * encrypted). Numbers are the wire values; use the named members so a
- * reader doesn't have to memorize which number means what.
+ * (f3.rs, `if !(1..=3).contains(&level)` — currently f3.rs:289 — validates
+ * `1..=3`; there is no level 0 — every F3 file is encrypted). Numbers are
+ * the wire values; use the named members so a reader doesn't have to
+ * memorize which number means what.
  */
 export enum F3Level {
   /**
@@ -40,9 +44,10 @@ export enum F3Level {
   Internal = 1,
   /**
    * Identical crypto to {@link Internal}, but EVERY open is written to
-   * `f3_access_log` (f3.rs:425-436, `write_access_log(..., "read", ...)`
-   * fires whenever `level >= 2`). Use this when you need an audit trail of
-   * who viewed the file, not just who could.
+   * `f3_access_log` (f3.rs, the `if level >= 2 { write_access_log(...,
+   * "read", ...) }` guard ahead of the backend read — currently f3.rs:536,
+   * with the deny-path call at f3.rs:574). Use this when you need an audit
+   * trail of who viewed the file, not just who could.
    */
   Confidential = 2,
   /**
@@ -183,6 +188,16 @@ export class F3Client {
    * the whole stream finishes), but this method always sends them in the
    * conventional safe order `app_tid → doc_tid → level → name → file`
    * anyway.
+   *
+   * Can now be refused on storage quota: `enforce_storage_delta` (f3.rs:348)
+   * charges this upload's CIPHERTEXT bytes against `apps.used_storage`,
+   * checked BEFORE the bytes reach the storage backend, and throws
+   * `BadRequestError` (`code: "quota_app_max_storage"`, HTTP 400) over the
+   * cap. Before that wiring, F3 bytes never touched `used_storage` and an
+   * upload could not fail on quota at all — this is a genuinely new
+   * refusal a caller may not be handling yet. The per-file 100 MB cap
+   * (`MAX_FILE_BYTES`) is unrelated and unchanged; quota is an additional
+   * gate, not a replacement.
    */
   async upload(input: F3UploadInput): Promise<F3FileMeta> {
     const form = new FormData();
@@ -261,8 +276,9 @@ export class F3Client {
 
   /**
    * Soft-delete a file. Requires Editor+ on the doc AND the doc's
-   * `deletable` ACL (f3.rs:617-621) — Editor alone is not sufficient if the
-   * doc's ACL restricts who may delete.
+   * `deletable` ACL (f3.rs, `if !doc_acl.is_deletable_by(&perm)` — currently
+   * f3.rs:732) — Editor alone is not sufficient if the doc's ACL restricts
+   * who may delete.
    */
   del(f3Tid: string): Promise<void> {
     return this.http.post("/app/f3/delete", { f3_tid: f3Tid }).then(() => undefined);

@@ -102,6 +102,30 @@ export class HttpCore {
   }
 
   /**
+   * POST `multipart/form-data` and return the WHOLE envelope, not just
+   * `data` — the multipart counterpart of {@link postFull}.
+   *
+   * The file write paths put `warnings` at the top level, beside `data`:
+   * writing to a tier that a live snapshot shadows succeeds and is invisible,
+   * and `warnings[{code:"file_write_shadowed_by_snapshot", msg,
+   * live_snapshot}]` is how the server says so. {@link postForm} unwraps
+   * `data` and drops it, which turns a deliberate warning back into the
+   * silent failure it was added to end. Errors are thrown exactly as
+   * {@link postForm} throws them.
+   */
+  async postFormFull<T = unknown>(path: string, form: FormData): Promise<T> {
+    if (this.appId && !form.has("app_tid")) form.append("app_tid", this.appId);
+    const res = await this.fetchImpl(this.url(path), {
+      method: "POST",
+      headers: this.headers(), // let fetch set the multipart boundary
+      body: form,
+      credentials: this.auth === "cookie" ? "include" : "same-origin",
+    });
+    this.captureCookies(res);
+    return this.unwrap<T>(res, { envelope: true });
+  }
+
+  /**
    * POST and return the WHOLE envelope, not just `data`.
    *
    * Several handlers put meaningful fields as siblings of `data` rather than

@@ -71,12 +71,73 @@ export interface MountGoogleButtonOptions {
    *     server verifies the credential against the app's own OAuth client.
    */
   appId?: string;
+  /**
+   * Render the button even when the operator HAS declared
+   * `google_allowed_origins` and this page's origin is not among them.
+   *
+   * Off by default, because the default is the honest one: Google itself
+   * refuses the exchange for an unlisted origin, so rendering the button
+   * there produces a control that looks fine and fails on click. Set this
+   * only when you know the comparison is wrong on your deployment — e.g. a
+   * proxy serves the page under a hostname the operator listed under a
+   * different one.
+   */
+  allowUnlistedOrigin?: boolean;
+}
+
+/**
+ * The unauthenticated `GET /platform/info` body. Read by a sign-in page
+ * before any cookie exists, so it carries only what is safe to publish.
+ */
+export interface PlatformInfo {
+  /** Base domain for per-app test subdomains (`<app_tid>.test.<base>`). */
+  test_subdomain_base?: string;
+  /** Operator-wide Google OAuth client id, or the app's own when the
+   *  request carried `?app_tid=`. */
+  google_client_id?: string;
+  /**
+   * Origins the operator declared to Google for that client id, already
+   * lowercased and stripped of a trailing slash by the server.
+   *
+   * **An empty array means "not declared", not "none allowed".** Treat it as
+   * no constraint — that is the compatibility rule the platform locks with a
+   * counter-test, so that forgetting to declare the list can never hide a
+   * button that works.
+   */
+  google_allowed_origins?: string[];
+  microsoft_client_id?: string;
+  telegram_bot_username?: string;
+  sso_authority_host?: string;
+  /**
+   * Whether `POST /reg` is behind the bot gate. Mirrors exactly what
+   * switches the gate server-side, so a page can stop submitting
+   * registrations that will be refused for a missing token.
+   */
+  turnstile_enabled?: boolean;
+  /**
+   * The public site key the widget needs. Can be `null` WHILE
+   * `turnstile_enabled` is true — an operator set the secret and forgot the
+   * site key. That is a half-configured deployment worth reporting, not
+   * something to paper over with a widget that cannot load.
+   */
+  turnstile_site_key?: string | null;
 }
 
 /** Handle returned by {@link mountGoogleButton}. */
 export interface GoogleButtonHandle {
   /** The client id that was actually used (resolved from config or fetched). */
   clientId: string;
+  /**
+   * The `/platform/info` body this mount read, when it read one. Absent when
+   * the caller supplied `clientId` and the fetch failed — the helper treats
+   * that as "no constraint known" rather than a reason to refuse.
+   */
+  platformInfo?: PlatformInfo;
+}
+
+/** Same normalisation the server applies to each declared entry. */
+function normalizeOrigin(o: string): string {
+  return o.trim().replace(/\/$/, "").toLowerCase();
 }
 
 // Minimal ambient shape of the slice of Google Identity Services we call.
@@ -145,21 +206,41 @@ export async function mountGoogleButton(
     tfl5.useApp(options.appId);
   }
 
-  let clientId = options.clientId;
-  if (!clientId) {
-    // When appId is set, fetch the APP's own google_client_id via ?app_tid=.
-    const infoUrl = options.appId
-      ? `${host}/platform/info?app_tid=${encodeURIComponent(options.appId)}`
-      : `${host}/platform/info`;
-    const info = await fetch(infoUrl)
-      .then((r) => r.json() as Promise<{ google_client_id?: string }>)
-      .catch(() => ({}) as { google_client_id?: string });
-    clientId = info.google_client_id;
-  }
+  // Fetched even when the caller supplied `clientId`: the body carries the
+  // origin allowlist, and the whole point of reading it is to refuse BEFORE
+  // rendering rather than let the click 403. Best-effort — a failed fetch
+  // means "no constraint known", never "refuse".
+  // When appId is set, this also resolves the APP's own google_client_id.
+  const infoUrl = options.appId
+    ? `${host}/platform/info?app_tid=${encodeURIComponent(options.appId)}`
+    : `${host}/platform/info`;
+  const info = await fetch(infoUrl)
+    .then((r) => r.json() as Promise<PlatformInfo>)
+    .catch(() => undefined);
+
+  const clientId = options.clientId ?? info?.google_client_id;
   if (!clientId) {
     throw new Error(
       "@tfl5/sdk/ui: no google_client_id — pass { clientId } or have the " +
         "operator set TFL5_GOOGLE_CLIENT_ID.",
+    );
+  }
+
+  // The question this answers is not "is Google enabled" but "will Google
+  // accept the address this page is served from". A page on an origin the
+  // operator never declared renders the button fine and then fails the
+  // exchange — which is why the platform started publishing the list.
+  const declared = (info?.google_allowed_origins ?? []).map(normalizeOrigin);
+  const here = normalizeOrigin(window.location.origin);
+  if (declared.length > 0 && !declared.includes(here) && !options.allowUnlistedOrigin) {
+    throw new Error(
+      `@tfl5/sdk/ui: this page's origin (${here}) is not one of the ` +
+        `${declared.length} origin(s) the operator declared for this Google ` +
+        `client id (${declared.join(", ")}). Google would refuse the ` +
+        `credential exchange, so no button was rendered. Add this origin to ` +
+        `TFL5_GOOGLE_ALLOWED_ORIGINS and to the OAuth client in Google Cloud ` +
+        `— per-app test subdomains (<app_tid>.test.<base>) need listing too ` +
+        `— or pass { allowUnlistedOrigin: true } to render anyway.`,
     );
   }
 
@@ -185,7 +266,7 @@ export async function mountGoogleButton(
     },
   );
 
-  return { clientId };
+  return { clientId, platformInfo: info };
 }
 
 async function handleCredential(

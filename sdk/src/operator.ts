@@ -4,12 +4,52 @@
 //   - tenant WASM operators uploaded via /app/wasm/upload (shipped)
 //
 // WASM is tfl5's ONE sandboxed server-side code lane (no JS/Lua eval).
-// A module runs fuel/memory/time-bounded (defaults 50M fuel / 64 MiB /
-// 5 s, per-tier tunable) and reaches data via host calls that run AS the
-// invoking user — it can never exceed the caller's ACL and only touches
-// its own app. It can run as a doc-lifecycle hook (`"type":"wasm"`) or via
-// this dispatch route. Full reference: docs/api-reference.md
-// §Operators → "WASM operators".
+// A module runs fuel-, memory- and time-bounded, and reaches data via host
+// calls that run AS the invoking user — it can never exceed the caller's
+// ACL and only touches its own app. Two of the three bounds are per-tier,
+// one is not: CPU (50M fuel) and linear memory (64 MiB) are defaults the
+// app's license tier raises (`licenses.wasm_max_fuel` /
+// `wasm_max_memory`), while the 5 s outer wall clock is a fixed
+// defence-in-depth ceiling no tier lifts — budget the slow work, don't
+// expect to buy more of it. It can run as a doc-lifecycle hook
+// (`"type":"wasm"`) or via this dispatch route. Full reference:
+// docs/api-reference.md § "WASM operators — tenant server-side code".
+//
+// WHAT `host_query` RETURNS — three gates, the same ones `/app/doc/list`
+// applies, so a module and the HTTP list endpoint now answer identically
+// for the same user:
+//   1. App permission for the invoking user (Reader), resolved inside the
+//      host itself rather than trusted from the caller.
+//   2. The RESOURCE's own ACL (`readers`/`editors`/`noaccess`). A denied
+//      caller gets an EMPTY ARRAY, not an error — the same answer the
+//      HTTP path gives, so the module cannot be used to probe whether a
+//      resource exists.
+//   3. Row-level scope + PII level, per row: rows outside the caller's
+//      cohort are dropped, rows whose binding grants only Aggregate access
+//      are dropped entirely, and Masked rows are PII-masked before the
+//      guest sees them.
+// Gates 1 and 2 always run. Gate 3 is CONDITIONAL, on exactly the same two
+// switches `/app/doc/list` obeys: the deployment sets `TFL5_ENFORCE_SCOPE`,
+// AND the app declares `acls.scope.field_map`. With either one absent the
+// scope filter resolves to "unconstrained" and every row survives — so a
+// module tested on a deployment with enforcement off has not been tested
+// against gate 3 at all. With BOTH present, a resource missing from
+// `field_map` fails CLOSED: the query errors out rather than answering
+// unfiltered.
+// Two edges worth knowing when gate 3 IS live. Masking is guarded on the
+// resource actually declaring PII fields, so a Masked binding against a
+// resource that declares none returns the row unmodified — the binding is
+// not what masks, the field list is. And `host_query` answers `{ok, data}`
+// with no `meta`, where `/app/doc/list` reports `scope_filter_applied` and
+// a `pii_aggregate_dropped` count: a guest CANNOT tell a filtered result
+// from a complete one, so never write module logic that infers "no rows
+// were hidden" from the response.
+// Gate 2 and the Aggregate/Masked half of gate 3 are recent: before them
+// a user excluded from a resource's ACL got real rows through an operator
+// while the same user got an empty list over HTTP, and Aggregate/Masked
+// rows arrived whole. Field-level encryption is unchanged and independent:
+// `host_query` only ever reads `data_indexed`, never decrypts
+// `data_secret`.
 //
 // AUTH: an action NOT in the operator's `public_actions()` requires the
 // caller to hold Reader on the app (security review H2). Public actions
@@ -64,9 +104,14 @@ export class IntegrationsClient {
  * Tenant WASM operator lifecycle (`/app/wasm/*`). All three are
  * **Manager**-gated. Flow: `upload` a version (stored inactive, validated
  * for the ABI) → `activate` it (one live version per `(app, op_id)`).
- * The guest module must export `memory`, `tfl5_alloc`, `tfl5_invoke`; see
- * the internal `wasm-operator-abi.md`. Sandbox limits + ACL behaviour:
- * docs/api-reference.md §Operators → "WASM operators".
+ * The guest module must export `memory`, `tfl5_alloc(i32) -> i32` and
+ * `tfl5_invoke(i32, i32) -> i64`, with `host_log` / `host_call` imported
+ * under the module name `"tfl5"`; request and response are JSON over
+ * linear memory. Byte-level guest ABI reference:
+ * docs/wasm-operator-abi.md. Endpoint shapes and the per-invocation
+ * payload caps: docs/api-reference.md § "WASM operators — tenant
+ * server-side code". What a module can READ once it is running is the
+ * three-gate contract at the top of this file.
  */
 export class WasmClient {
   constructor(private readonly http: HttpCore) {}

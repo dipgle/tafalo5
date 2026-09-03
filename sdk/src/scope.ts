@@ -23,6 +23,18 @@ export interface ScopeBinding {
   params?: Record<string, string | string[]>;
   /** Optional label for auditing/debugging; not enforced. */
   role_code?: string;
+  /**
+   * PII narrowing applied to rows THIS binding matches. `"F"`/`"Full"`
+   * (default — anything unrecognised falls back here too) leaves the row
+   * unchanged. `"M"`/`"Masked"` masks that resource's declared `pii_fields`.
+   * `"A"`/`"Aggregate"` drops the row from `/app/doc/list` (counted in
+   * `meta.pii_aggregate_dropped`) and makes `/app/doc/get` refuse it with
+   * `pii_aggregate_only` (HTTP 400) — unless the caller sends an
+   * `X-Audit-Reason` header, which escalates that read to Full and is
+   * logged with `drill_down:true`. When several bindings match the same
+   * row, the LEAST-strict level wins (F beats M beats A). See
+   * docs/scope.md §8. */
+  pii_level?: "F" | "Full" | "M" | "Masked" | "A" | "Aggregate";
   [k: string]: unknown;
 }
 

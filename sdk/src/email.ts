@@ -13,8 +13,40 @@
 //   POST /app/email/dkim/create   — mint a DKIM keypair for (app, domain) (Manager)
 //   POST /app/email/dkim/list     — list DKIM keys (selector + public DNS) (Reader)
 //   POST /app/email/dns-records   — assemble SPF/DKIM/DMARC/MX records (Reader)
+//
+// DKIM IS A PRECONDITION OF SENDING, NOT A NICETY. `send` refuses any mail
+// the platform could not sign: the domain it resolves — explicit
+// `from_domain` or the app's oldest key — must have a DKIM key registered
+// for THIS app. Provision order for a new app is therefore
+// `dkimCreate(domain)` → publish `dnsRecords(domain)` → `send(...)`.
+// See {@link EMAIL_DKIM_NOT_CONFIGURED} and {@link EMAIL_INVALID_RECIPIENT}
+// for the two coded refusals `send` raises.
 
 import type { HttpCore } from "./http.js";
+
+// ---- Stable error codes --------------------------------------------------
+//
+// Both refusals below are 400s raised by `/app/email/send` BEFORE anything
+// is queued, so nothing was sent when you see them. Switch on these
+// constants rather than on `msg`, which the server may reword or localize.
+
+/**
+ * `/app/email/send`: no DKIM key exists for the (app, domain) pair the
+ * send would have used — either the explicit `from_domain`, or the app's
+ * oldest key when `from_domain` was omitted and there is none. Mint one
+ * with {@link EmailClient.dkimCreate} (then publish the DNS records) and
+ * retry; retrying without that changes nothing.
+ */
+export const EMAIL_DKIM_NOT_CONFIGURED = "email_dkim_not_configured" as const;
+
+/**
+ * `/app/email/send`: one of `to` is not a plausible address. The server's
+ * rule (shared with the user-email fields, so it cannot drift between two
+ * regexes): trimmed, non-empty, ≤254 chars, no whitespace, exactly one
+ * `@`, non-empty local part, and a domain of ≥2 non-empty dot-separated
+ * labels. Deliberately NOT full RFC 5322. `msg` names the offending value.
+ */
+export const EMAIL_INVALID_RECIPIENT = "email_invalid_recipient" as const;
 
 // ---- Request types -------------------------------------------------------
 
@@ -25,11 +57,37 @@ export interface SendEmailInput {
    * the app, or with `from_domain` when supplied.
    */
   from_local: string;
-  /** Override the sender domain. Falls back to the first DKIM key (by
-   *  `created_at ASC`, i.e. the OLDEST configured domain — email.rs:82-96).
-   *  Throws `BadRequestError` if neither is available. */
+  /**
+   * Sender domain. NOT a free-text override: whatever you pass must have a
+   * DKIM key registered for THIS app AND THAT domain, or the send is
+   * refused with `BadRequestError`, `code: "email_dkim_not_configured"`
+   * (`EMAIL_DKIM_NOT_CONFIGURED`). Passing a domain the app has no key for
+   * used to be accepted and answered `{result:true, queued:true}` for mail
+   * the platform could never sign — the refusal is the fix, not a
+   * regression.
+   *
+   * Matched case-insensitively and trimmed, so `" ACME.com "` finds the
+   * key stored as `acme.com`.
+   *
+   * Omit it and the server falls back to the app's OLDEST DKIM key (by
+   * `created_at ASC`). That branch is refused with the SAME code when the
+   * app has no DKIM key at all — so `email_dkim_not_configured` means
+   * "create a key first" in both directions; use {@link
+   * EmailClient.dkimList} to see which domains actually exist.
+   */
   from_domain?: string;
-  /** One or more recipient addresses. At least one required. */
+  /**
+   * One or more recipient addresses. At least one required, and each is
+   * shape-validated server-side — a bare `"not-an-email"` is refused with
+   * `BadRequestError`, `code: "email_invalid_recipient"`
+   * (`EMAIL_INVALID_RECIPIENT`), and the offending value is named back in
+   * `msg` (it is the caller's own input, not a secret). Previously such a
+   * value was accepted and queued for delivery.
+   *
+   * The check is plausibility, not deliverability: it rejects malformed
+   * strings, it does not prove the mailbox exists. Validate in your form
+   * too — this is the trust boundary, not the UX.
+   */
   to: string[];
   subject: string;
   /** HTML body. At least one of `html` or `text` is required. */
@@ -103,10 +161,11 @@ export interface InboxMessage {
 
 /**
  * Result of `/app/email/send`. Async/queued mode (the default — see
- * {@link EmailClient.send}) only sets `queued`/`tid`/`from`/`to`
- * (email.rs:129-138); the legacy sync path (`TFL5_QUEUE_SYNC=1`) instead
- * sets `tid`/`from`/`to`/`provider`/`provider_msg_id` with no `queued` field
- * (email.rs:204-214) — check for `queued` to tell which one you got.
+ * {@link EmailClient.send}) only sets `queued`/`tid`/`from`/`to`; the
+ * legacy sync path (`TFL5_QUEUE_SYNC=1`) instead sets
+ * `tid`/`from`/`to`/`provider`/`provider_msg_id` with no `queued` field —
+ * check for `queued` to tell which one you got. `from` is the address the
+ * server actually used, i.e. `from_local@<resolved DKIM domain>`.
  */
 export interface SendEmailResult {
   queued?: boolean;
@@ -164,10 +223,28 @@ export class EmailClient {
   constructor(private readonly http: HttpCore) {}
 
   /**
-   * Send a transactional email from the app's DKIM-configured domain.
+   * Send a transactional email from a DKIM-configured domain of the app.
    * Returns queued metadata (async default) or delivery confirmation
    * (sync when the server has `TFL5_QUEUE_SYNC=1`). Requires Manager on
    * the app.
+   *
+   * VALIDATED BEFORE QUEUEING, in this order — every one of these throws
+   * `BadRequestError` and nothing is sent:
+   *   1. mailler not configured on the deployment (no `code`);
+   *   2. no DKIM key for the (app, domain) pair →
+   *      {@link EMAIL_DKIM_NOT_CONFIGURED}. Both the explicit
+   *      `from_domain` and the omitted-domain fallback go through this;
+   *   3. `from_local` empty or containing `@` (no `code`);
+   *   4. `to` empty (no `code`), then any implausible recipient →
+   *      {@link EMAIL_INVALID_RECIPIENT};
+   *   5. neither `html` nor `text` (no `code`).
+   * The two coded refusals are the ones worth branching on in a UI; the
+   * order matters because a request wrong in two ways reports the first.
+   *
+   * A `{queued: true}` answer therefore means the platform accepted mail
+   * it can actually sign — which was not true before these checks existed.
+   * It still does not mean the recipient's server accepted it: delivery
+   * outcome shows up in {@link listSends} as `status`.
    *
    * `app_tid` is auto-injected via `useApp()`.
    */
@@ -233,18 +310,21 @@ export class EmailClient {
    *
    * `app_tid` is auto-injected via `useApp()`.
    *
-   * Returns the array of DNS records directly (email.rs:537-542 sends
-   * `"data": resp.records` — the handler's `data` field IS the array, not
-   * a `{records: [...]}` wrapper). The handler ALSO sends a sibling
-   * `"mail_host"` field at the envelope's top level, next to `data` — this
-   * SDK's shared transport, `HttpCore.post()`, only returns the unwrapped
-   * `data` and has no way to surface that sibling (same limitation as
-   * `durable.send()`'s `instance_tid`/`timestamp` — see durable.ts's
-   * module-level note). The internal reference SDK's `DnsRecordsResult`
-   * type — `{ records: DnsRecord[]; mail_host?: string | null }` — does
-   * NOT match what actually comes back through `post()`: calling
-   * `.records` on the resolved value would be `undefined`, because the
+   * Returns the array of DNS records directly (the handler sends
+   * `"data": resp.records`, so `data` IS the array — not a
+   * `{records: [...]}` wrapper). The internal reference SDK's
+   * `DnsRecordsResult` type — `{ records: DnsRecord[]; mail_host?: string
+   * | null }` — does NOT match what comes back through `post()`: reading
+   * `.records` off the resolved value gives `undefined`, because the
    * resolved value already IS the array.
+   *
+   * The handler ALSO sends a sibling `"mail_host"` at the envelope's top
+   * level, next to `data`, which `post()` discards. That is a choice, not
+   * a transport limitation: `HttpCore.postFull()` exists and returns the
+   * whole envelope (`durable.send()` and `billing.invoiceIssue()` use it).
+   * This method keeps the array return because the records are what a
+   * caller publishes; if you need `mail_host`, call `postFull()` on your
+   * own `HttpCore` (exported from the package root) against the same path.
    */
   dnsRecords(input: DnsRecordsInput): Promise<DnsRecord[]> {
     return this.http.post<DnsRecord[]>("/app/email/dns-records", input);

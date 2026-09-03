@@ -76,9 +76,17 @@ export interface UserEmail {
   /** Hex-encoded SHA-256 of the canonical address. Use as the key for
    *  `emailRemove` / `emailPromotePrimary` / `emailSendVerification`. */
   email_hash: string;
-  /** Decrypted address, or `null` if decryption failed (rare — a key
-   *  rotation gone wrong downgrades a single row rather than the whole list). */
+  /** Decrypted address, or `null` — check {@link unreadable} on this same
+   *  row before treating `null` as "no address": it's only that if
+   *  `unreadable` is `false`. When `unreadable` is `true`, the row exists
+   *  and its ciphertext is sitting right there — this process just can't
+   *  open it right now (e.g. a master-key rotation whose backfill hasn't
+   *  finished), which is a very different fact than "never added". */
   email: string | null;
+  /** `true` when this row's ciphertext exists but could not be decrypted
+   *  — `email` is `null` for a reason that is NOT "no address entered".
+   *  `false` on every healthy row. */
+  unreadable: boolean;
   is_primary: boolean;
   verified: boolean;
   /** Epoch-ms. */
@@ -87,18 +95,44 @@ export interface UserEmail {
   verified_at: number | null;
 }
 
-/** Full profile as returned by `profile()` (`POST /user/profile`). */
+/**
+ * Full profile as returned by `profile()` (`POST /user/profile`).
+ *
+ * READ {@link unreadable} BEFORE TRUSTING A `null` ON `email`/`name`/
+ * `mobile`. Those three columns are field-level encrypted; `null` used to
+ * mean only one thing ("never set"), but a column whose ciphertext exists
+ * and simply can't be opened right now (an unfinished master-key rotation,
+ * a retired secondary key) decrypts to the exact same `null` — silently,
+ * with nothing else on the wire to tell the two apart. `unreadable` closes
+ * that gap: a `null` field is only "not filled in" if that field's name is
+ * ABSENT from `unreadable`. Present in `unreadable` + `null` value means
+ * "there IS a value here, this response just couldn't decrypt it" — show
+ * "temporarily unavailable", never an empty/placeholder state that reads
+ * as "add your email".
+ */
 export interface Profile {
   tid: string;
   username: string;
   license_tid: string;
   license: AccountLicenseTier | null;
-  /** Decrypted primary email address. */
+  /** Decrypted primary email address. See the interface-level note on
+   *  {@link unreadable} before treating `null` as "not set". */
   email: string | null;
-  /** Decrypted display name. */
+  /** Decrypted display name. See the interface-level note on
+   *  {@link unreadable} before treating `null` as "not set". */
   name: string | null;
-  /** Decrypted mobile number. */
+  /** Decrypted mobile number. See the interface-level note on
+   *  {@link unreadable} before treating `null` as "not set". */
   mobile: string | null;
+  /**
+   * Names of the top-level PII fields above (`"email"`, `"name"`,
+   * `"mobile"`) whose ciphertext is present but could not be decrypted on
+   * this call. Empty array on every healthy account — additive, so code
+   * that ignores it behaves exactly as before. Non-empty is itself a
+   * signal worth surfacing (e.g. to an admin), independent of which UI
+   * field it affects.
+   */
+  unreadable: string[];
   email_verified: boolean;
   /** All email addresses (primary + secondaries), primary-first. */
   emails: UserEmail[];
