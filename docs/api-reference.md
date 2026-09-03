@@ -56,6 +56,8 @@ documented here. Ask your operator.
   Tokens are minted by the operator (`/admin/token/mint`) and act **as the
   subject user** — same ACL, no extra powers. A bearer token that isn't a
   tfl5 service token (e.g. someone else's JWT) is ignored, not rejected.
+  A token may additionally be **scoped to a set of request paths** —
+  see [Service-token scopes](#service-token-scopes).
 - **Success envelope:**
   ```json
   { "result": true, "data": <object|array>, "timestamp": 1700000000000 }
@@ -77,18 +79,69 @@ documented here. Ask your operator.
   | Not signed in / expired session | **401** | `{isSignout:true, result:true, code:"unauthorized"}` |
   | Signed in but not permitted | **200** | `{result:false, msg:"Access denied", code:"access_denied"}` |
   | Not found | **200** | `{result:false, msg:"not found", code:"not_found"}` |
+  | Refused — a quota is spent | **402** | `{result:false, msg, code}` (+ `data`) |
+  | Refused — conflicts with current state | **409** | `{result:false, msg, code}` (+ `data`) |
+  | Refused — payload over a cap | **413** | `{result:false, msg, code}` (+ `data`) |
   | Rate limited | **429** | `{result:false, code:"rate_limit_exceeded"}` + `Retry-After` |
   | Server error | **500** | `{result:false, msg:"internal error", code:"internal"}` — the real cause is never echoed |
 
-  Two operator escape hatches restore the legacy behaviour during a
-  migration window: `TFL5_LEGACY_BADREQUEST_200=1` (400 → 200) and
-  `TFL5_LEGACY_UNAUTHORIZED_200=1` (401 → 200). Because of these, and
-  because `access_denied` / `not_found` are 200 by design, a correct client
-  checks `result` + `code` **and** the status — not the status alone.
-- **Soft rejections.** Independently of the table above, many handlers
-  return HTTP 200 with `{"result": false, "msg": ..., "code": ...}` for
-  business-rule failures (quota full, folder not empty, duplicate name,
-  nothing-to-publish). These are normal outcomes, not transport errors.
+  Operator escape hatches restore the legacy behaviour during a migration
+  window, but **each covers exactly one mechanism** —
+  `TFL5_LEGACY_BADREQUEST_200=1` (the 400 class → 200),
+  `TFL5_LEGACY_UNAUTHORIZED_200=1` (401 → 200) and
+  `TFL5_LEGACY_REFUSAL_200=1` (the 402/409/413 refusal class → 200) — and
+  some statuses no flag can move (see below). Because of all this, and
+  because `access_denied` / `not_found` are 200 by design, a correct
+  client checks `result` + `code` **and** the status — not the status
+  alone.
+- **Business refusals: the status is now per-refusal, and you may not
+  hard-code it.** Older releases answered HTTP 200 for every
+  business-rule failure. A refusal now carries a status chosen at the
+  refusal site, because the three answers mean different things to a
+  client deciding whether to retry, to pay, or to give up: **402** when a
+  quota is spent, **409** when the request conflicts with a state the
+  caller must change first, **413** when a payload is over a cap.
+
+  The **envelope is unchanged**: `{result:false, msg, code, timestamp}`,
+  plus a `data` object *only* at sites that have numbers to report (cap,
+  used, remaining). Where a refusal has no numbers, `data` stays
+  **absent** — it is never emitted as `"data": null`, so a `code`-based
+  classifier written against the old 200s keeps working untouched.
+
+  **There is no single "refusal" switch, because there is no single
+  refusal mechanism.** Three separate ones produce non-200 rejections, and
+  they revert differently:
+
+  | Mechanism | Status | Reverts with | Example codes |
+  |---|---|---|---|
+  | per-site refusal | 402 / 409 / 413 | `TFL5_LEGACY_REFUSAL_200=1` | `quota_exceeded`, `owner_protected`, `resource_not_deleted`, `domain_quota_reached` |
+  | coded bad request | 400 | `TFL5_LEGACY_BADREQUEST_200=1` | `conflict`, `pack_not_buyable`, `file_too_large` (write side) |
+  | metered-credit refusal | 402 | **nothing — cannot be reverted** | `insufficient_credits` |
+
+  The third row is not an oversight: a metered handler that needs an exact
+  402 builds the response itself rather than routing through the shared
+  error type, which has no 402 variant of its own. Two consequences a
+  client must handle: the flag your operator set will **not** flatten it,
+  and its envelope carries **no `timestamp`** — it is
+  `{result:false, msg, code}` and nothing else, the one refusal shape in
+  this document missing that field.
+
+  Two more things follow, and both bite:
+  - **ACL denials did not move.** `access_denied` is still HTTP 200, by
+    design. A client that tests `res.ok` alone still reads "success" on
+    every permission failure. That check has never been sufficient and
+    still is not.
+  - **The conversion is per-site, not universal.** Plenty of business
+    refusals remain handler-authored 200 envelopes — `folder_not_empty`,
+    `acl_token_unknown`, `user_not_found`, `acl_array_too_large`,
+    `draft_disk_missing`, `share_not_found` and others. Treat the status
+    as informative and the pair (`result`, `code`) as authoritative; the
+    per-endpoint sections and the [error-code table](#error-codes) give
+    the real status for each code.
+
+  Sizes in refusal messages are rendered from binary values with decimal
+  labels — 52,428,800 B prints as `50.0MB`. Compare the byte counts in
+  `data`, never the words in `msg`.
 - **Rate limits** (per cell, operator-tunable):
   `/login`, `/reg`, `/auth/*`, `/user/2fa/*` → 10 req/min per IP
   (`TFL5_RATE_AUTH_PER_MIN`); `/app/doc/*`, `/app/file/upload`,
@@ -106,12 +159,24 @@ documented here. Ask your operator.
   author short-circuits every check, so ownership stays an unrescindable
   recovery path. The same bypass applies to per-doc ACL for the app
   owner/managers and for a doc's own author.
-- **Signout envelope — two shapes.** Most handlers answer **401** +
+- **Signout envelope — three shapes, and `result` lies in two of
+  them.** Most handlers answer **401** +
   `{"isSignout": true, "result": true, "code": "unauthorized"}`. A few
   wire-compat handlers — `/user`, `/app/list`, and `/app/update`'s create
   branch — instead answer **HTTP 200** with a bare
-  `{"isSignout": true, "result": true}` and no `code`. Treat `isSignout`
-  as the signal, not the status.
+  `{"isSignout": true, "result": true}` and no `code`. The
+  [`/service/*`](#service-entitlements) pair answers **HTTP 200** with
+  `{"isSignout": true, "result": false}`.
+
+  Note what that first shape does: **`result` is `true` on a request
+  that was refused for having no session.** A client branching on
+  `result` alone reads "you are not logged in" as success, and the same
+  client reads the `/service/*` variant as failure — two opposite
+  conclusions from the same condition. The field is not a verdict on the
+  request here; it is a legacy transport flag.
+
+  **Treat `isSignout` as the signal** — check it before `result` and
+  before the status, on every response.
 - **Email-verification gate — owner-only.** Write-class levels (Manager /
   Designer / Editor) additionally require `users.email_verified = TRUE`
   **only when the caller is the app's own author**. A user who reached
@@ -125,6 +190,118 @@ documented here. Ask your operator.
   are not sent). Allowed request headers include `Authorization`,
   `Content-Type`, `Cookie`, `id_app`, `x-tfl5-sdk-version`,
   `x-share-token`.
+
+---
+
+## Service-token scopes
+
+A service token may carry a `scopes` list that restricts **which request
+paths it may reach**. The restriction is enforced by middleware in front
+of the handlers, so it applies before any ACL check and independently of
+what the subject user is allowed to do. Scopes only narrow a token; they
+can never grant it something its subject lacks.
+
+**A scope is a request path prefix, matched on segment boundaries, or
+the literal `*`.**
+
+| Scope | Permits | Refuses |
+|---|---|---|
+| `/app/bundle` | `/app/bundle`, `/app/bundle/upload`, `/app/bundle/activate` | `/app/bundlefoo`, `/app/bundle-admin/wipe` |
+| `/app/bundle/` | identical — a trailing slash is ignored | — |
+| `*` | everything | nothing |
+| `""` (blank entry) | nothing | everything |
+
+The boundary rule is the point: a prefix match alone would let
+`/app/bundle` reach `/app/bundle-admin/wipe`. Matching requires the next
+character to be `/`, or an exact equality.
+
+### Two grandfather clauses, both load-bearing
+
+**1. An empty `scopes` list means unrestricted.** The column defaults to
+an empty array, so *every token minted before scopes existed* carries
+`{}` and is unaffected. Enforcement is opt-in by minting, never
+retroactive.
+
+**2. A scope the gate cannot evaluate does not restrict.** Only entries
+equal to `*` or beginning with `/` are evaluated. A token whose scopes
+are all dot-named labels — `["app.list"]`, `["user.read"]` — has nothing
+evaluable in it and is therefore treated as **unscoped**, with a warning
+logged server-side. This is the trap worth stating plainly: a label list
+*looks* like a restriction and is not one.
+
+**A mixed list is enforced against the evaluable half only.** Given
+`["app.list", "/app/bundle"]`, the path scope is enforced and the legacy
+label neither widens it back nor matches anything itself — `app.list`
+does not match `/app/list`. So adding a path scope beside your old
+labels does tighten the token; it does not leave a hole.
+
+### Refusals
+
+| Code | Status | When |
+|---|---|---|
+| `token_scope_denied` | **403** | the request path is outside the token's evaluable scopes. `data: {path, scopes}` |
+| `token_scope_unavailable` | **503** | the gate could not read the token's scopes — fail-closed, retry |
+
+`data.scopes` is the **full** stored list, including any unevaluable
+legacy labels, while `msg` names only the evaluable subset — so the two
+can legitimately differ in length.
+
+The 503 fires only when a bearer token with the service-token prefix is
+present *and* the scope lookup itself errors (a database problem). An
+**unknown** token does not produce it: the gate falls through to the
+normal anonymous path, deliberately, so it cannot be used to
+distinguish "no such token" from "wrong scope".
+
+### What the gate does not cover
+
+The middleware wraps the main application router, not every route on the
+process. These are reachable by a scoped token regardless of its
+scopes: `/healthz`, `/livez`, `/metrics`, `/security/csp-report`,
+`/ws/chat`, `/ws/durable/subscribe`, the public asset routes, and the
+cluster-lifecycle operator routes `/admin/cell/drain`,
+`/admin/cell/resume` and `/admin/version/apply`. Scopes are a blast-radius
+control for the application API; they are not a substitute for the
+platform-admin gate or for mTLS on the lifecycle routes.
+
+The gate also matches on the token hash alone — expiry and revocation
+are enforced on the authentication path, not here.
+
+### Minting (`/admin/token/mint`)
+
+Platform-admin only. **Body:** `{admin_app_tid, user_tid, name,
+scopes?, ttl_days?}`. `name` is capped at **200 bytes** (bytes, not
+characters — a Vietnamese or emoji name reaches the cap sooner than its
+length suggests). `ttl_days` must be positive; omitted or non-positive
+means no expiry.
+
+**Response `data`:** `{tid, token, name, scopes, scopes_enforced,
+scope_note, user_tid, expires_at, created_at}`. `token` is the plaintext
+and is shown **once** — only its hash is stored.
+
+**`scopes_enforced` and `scope_note` exist so a caller learns in-band
+whether their scopes took effect**, rather than discovering months later
+that a token they believed was restricted never was. There are three
+outcomes:
+
+| `scopes` you sent | `scopes_enforced` | Meaning |
+|---|---|---|
+| empty | `false` | unrestricted: the token can do everything its subject can |
+| non-empty, but no entry is `*` or starts with `/` | `false` | **not enforced** — as written, this token is unrestricted |
+| at least one `*` or `/…` entry | `true` | refused on any path outside its scopes |
+
+Read `scopes_enforced` at mint time and fail your provisioning if it is
+false when you meant to restrict.
+
+**Revoking is not idempotent in its reply.** `/admin/token/revoke`
+answers HTTP 200 `{result:false, msg:"Token not found or already
+revoked"}` with **no `code` field** when the tid is unknown *or* already
+revoked — the two are deliberately indistinguishable. Do not treat the
+missing `code` as a malformed response, and do not retry on it. Success
+is `data: {tid, revoked_at}`.
+
+`/admin/token/list` returns unrevoked tokens only (cap 500) as
+`{tid, user_tid, name, scopes, created_by, created_at, expires_at,
+last_used_at}` — the plaintext token never appears again.
 
 ---
 
@@ -189,6 +366,21 @@ documented here. Ask your operator.
 { "result": false, "msg": "Invalid username or password.",
   "code": "auth_invalid_credentials", "timestamp": ... }
 ```
+
+**Username matching folds case and Vietnamese diacritics.** `/reg`
+stores the *folded* form of whatever username was typed, so someone who
+registered as `rdA_x` is stored as `rda_x` — and signing in as `rdA_x`
+used to fail. Login now matches the raw string **or** the folded form,
+preferring an exact raw match when both exist (rows written before the
+folding existed may hold usernames that no longer round-trip).
+
+The folding is Vietnamese-specific, not general Unicode normalisation:
+it maps the precomposed Vietnamese vowel families to their base letters
+and `đ`/`Đ` to `d`/`D`, strips a fixed set of punctuation
+(`! % ^ * ( ) + = < > ? / , : ; ' " & # [ ] ~ $` — `@`, `.`, `_` and
+`-` survive), turns whitespace runs and edge dashes into `_`, then
+lower-cases. Accents outside that table (`ü`, `ñ`, Cyrillic, …) pass
+through untouched. Envelope and error codes are unchanged.
 
 **Notes:** legacy SHA-256 hashes silently rehash to argon2id on
 successful login. Fires `auth.login.success` / `auth.login.fail`
@@ -312,8 +504,44 @@ to `consumed`.
 
 **Body:** `{ "session_id": "..." }`.
 
-**Response data:** one of `{"status":"pending"|"approved"|"expired"|"consumed"}`.
-On `consumed` also returns `user: {tid, username}`.
+**Response data:** `{"status": …}`, one of `"pending"`, `"expired"`,
+`"rejected"` or `"consumed"`. On the poll that *performs* the
+transition to `consumed`, the reply also carries `user: {tid, username}`
+and sets the cookie; a later poll of the same already-consumed session
+reports `consumed` with neither.
+
+`"approved"` is never observed on the wire — an approved session is
+transitioned to `consumed` within the same request. `"expired"` is also
+what an **unknown** `session_id` returns, deliberately, so polling is
+not an oracle for which ids exist.
+
+### POST /auth/qr/reject
+
+**Auth:** **none — deliberately.** Body: `{session_id}`. Cancels a
+pending QR handshake from the phone side.
+
+**Response:** `data: {rejected: true}` on success, or HTTP 200
+`{result:false, msg:"QR session not found, expired, or already
+approved."}` — byte-identical to `/auth/qr/approve`'s failure message,
+so neither endpoint can be used to probe which session ids are real.
+
+**Why there is no gate here, when `/approve` requires one.** Approving
+*asserts an identity* ("sign that desktop in as me"), so it needs a
+session. Refusing asserts nothing; the person holding the phone that
+scanned the code just wants to say "not this" — and that phone very
+often has not signed in yet, which is the exact situation the flow
+exists for. So the gate is possession of the `session_id` and nothing
+more.
+
+That is not an open door. The session id is 32 random bytes — 256 bits
+— and it is the *same* secret that already gates `/auth/qr/poll`, which
+is strictly more powerful because it mints a cookie. Anyone who could
+guess it could already consume the sign-in; being able to cancel it adds
+no capability. The blast radius of a mistaken reject is one aborted
+handshake, and the desktop simply starts another.
+
+**Rejection is legal only from `pending`.** A Cancel that races in after
+an Approve cannot revoke a session that has already been handed out.
 
 ### POST /auth/telegram/link
 
@@ -455,10 +683,36 @@ page. No `platform` block (that is only on `/user`).
 **Response `user` fields:** `tid, username, license_tid,
 license:{tid,name,description,user_max_apps,user_max_total_storage,
 app_max_storage}|null, email, name, mobile, email_verified,
-emails:[{email_hash,email,is_primary,verified,added_at,verified_at}],
+emails:[{email_hash,email,unreadable,is_primary,verified,added_at,verified_at}],
 auth_methods[], has_password, app_count, total_used_storage, created_at,
-erase_requested_at, erase_after`. PII is decrypted on the fly; fields the
-server cannot decrypt come back `null`.
+erase_requested_at, erase_after, unreadable[]`.
+
+**PII is decrypted on the fly, and `unreadable` tells you when that
+failed.** A `null` PII field used to mean two incompatible things —
+"the user never filled this in" and "the ciphertext exists but this cell
+cannot open it right now" — and nothing on the wire distinguished them.
+It does now:
+
+- **`user.unreadable`** is an array of field names whose stored
+  ciphertext could not be decrypted on this request. It contains only
+  `"email"`, `"name"` and/or `"mobile"`; it is `[]` on a healthy
+  account and is never null or absent.
+- **`emails[].unreadable`** is a **boolean** on each address row (not an
+  array). When true, that row's `email` is `null` for the same reason.
+  The identical flag appears on `/user/email/list` rows.
+
+**The reading rule:** a null field is "not filled in" **only if its name
+is absent from `unreadable`**. Present in `unreadable` means the value
+exists and this cell could not open it — typically a half-finished
+master-key rotation. Do not render it as empty, do not offer to
+"restore" it by having the user retype it, and do not treat it as
+consent to overwrite. The response still succeeds: one unopenable column
+does not fail the profile.
+
+> Note the deliberate contrast with document data. Account PII degrades
+> per field; encrypted **doc** fields do not degrade at all — one
+> unopenable cell fails the whole read with a 500. See [One unopenable
+> cell fails the whole read](#one-unopenable-cell-fails-the-whole-read).
 
 ### POST /user/profile/update
 
@@ -658,9 +912,34 @@ have granted you.
 `audience_type` ∈ `user | group | role | app_members`. `resolve` caps at
 300 user tids per call (extras are dropped), defaults to both facets when
 `facets` is omitted, and discloses nothing for banned or erased
-subjects. Every disclosure of *someone else's* facet writes an
-access-log row; viewing your own does not. `access-log` returns at most
-200 rows (default 50).
+subjects. `access-log` returns at most 200 rows (default 50), newest
+first, and each row is `{viewer_username, facet, action, granted,
+app_context, accessed_at}` — `viewer_username` and `app_context` may be
+null. The payload key is `log`, not `data`.
+
+**What the log records, and what it deliberately does not.** `action` is
+either `"resolve"` (with `granted: true`) or `"deny"` (with
+`granted: false`), and the writing rule is not symmetrical:
+
+| Situation | Row written? |
+|---|---|
+| Someone else's facet disclosed to a viewer | **yes** — `resolve`, one per facet |
+| A viewer refused **every** facet they asked for | **yes** — `deny`, one per refused facet |
+| A viewer refused **some** facets but granted others | **no** row for the refused ones |
+| You viewing your own facets | no |
+| Any lookup of a subject with `erased_at` set | no — nothing at all |
+| The subject simply has that facet unset | no |
+
+The partial-refusal hole is deliberate, not an oversight. A viewer who
+holds a grant on `avatar`, asks for the default `[avatar,
+display_name]`, and gets one of them is what *every ordinary render of a
+user list* looks like — for every viewer legitimately admitted, on every
+page. Logging it would write a "denied" row per render and push the
+probes actually worth seeing off the end of a log that holds at most 200
+rows. So the log answers **"who was turned away entirely"**, which is
+the shape of somebody fishing, and stays quiet about the routine partial
+grant. If you are auditing for probing, a run of `deny` rows is your
+signal; the absence of one does not prove nothing was refused.
 
 Codes: `facet_invalid`, `avatar_too_large`, `avatar_invalid`,
 `display_name_invalid`, `audience_type_invalid`, `audience_ref_required`,
@@ -686,7 +965,22 @@ quota.
 minus `apps_created_total`). When that balance has never been
 provisioned the platform falls back to the license-tier cap
 (`user_max_apps`, or a per-user override). Either way, exhaustion is
-`code: "quota_exceeded"`.
+`code: "quota_exceeded"` — but at **HTTP 402**, and `data` names *which*
+model you hit, because the remedy differs:
+
+```json
+{ "cap": "app_create_rights", "rights": 5, "created": 5,
+  "remaining": 0, "refundable_on_delete": false }
+```
+```json
+{ "cap": "user_max_apps", "max": 3, "used": 3,
+  "refundable_on_delete": true }
+```
+
+`refundable_on_delete` is the field to branch a UI on: deleting an app
+frees a `user_max_apps` slot immediately, and gives back **nothing** on
+the rights model — rights are consumed for good. Note `remaining` appears
+on the rights shape only.
 
 **Body:**
 ```json
@@ -696,15 +990,45 @@ provisioned the platform falls back to the license-tier cap
     "name":        "string",        // required on create, ≤ 200 chars
     "description": "string",        // optional, ≤ 2000 chars
     "icon":        "data:image/...",// optional; small inline data URL
-    "single_page": "index.html"     // optional SPA shell — see below
+    "single_page": "index.html",    // optional SPA shell — see below
+    "error_page":  "404.html"       // optional custom 404 — see below
   }
 }
 ```
 
-`single_page` names an HTML file (relative to the app's served root).
-When set, a client-routed deep link that matches no file serves that
-shell instead of a 404 — HTML5-history routing for SPAs. `""` clears it
-back to 404 behaviour; omitting it preserves the current value.
+**`single_page`** names an HTML file (relative to the app's served
+root). When set, a deep link that matches no file serves that shell
+instead of a 404 — HTML5-history routing for SPAs. It applies **only to
+extension-less paths**: a miss that looks like an asset (`/img/a.png`)
+is an asset fetch, not a route, and still gets a real 404.
+
+**`error_page`** names an HTML file served when nothing else matched.
+Unlike the SPA shell it is served at a **real HTTP 404**, with
+`Cache-Control: no-store` and no ETag, so crawlers and caches read it as
+the error it is. It works across all four serve tiers (file stage,
+object storage, snapshot and bundle).
+
+Both are tri-state: a path sets, `""` clears, omitting preserves.
+Editing either needs **Manager**.
+
+> **`error_page` does not un-soft-404 an SPA, and that is permanent.**
+> When an app sets both, the SPA shell is tried **first**, so
+> extension-less paths keep getting the shell at HTTP 200 and
+> `error_page` never sees them. This is not a gap awaiting a follow-up:
+> the server cannot know whether `/dashboard` is a real client-side
+> route or a typo, and returning a 404 page for one would break the app.
+>
+> So the division of labour is fixed:
+> - **asset-shaped misses** (anything with an extension) → `error_page`,
+>   at a real 404;
+> - **extension-less misses on an SPA** → the shell, at 200;
+> - **static sites with no `single_page`** → `error_page`, at a real
+>   404, for everything.
+>
+> If you are chasing soft-404 warnings in a search console for an SPA,
+> `error_page` will not fix them. The fix has to come from your own
+> router rendering a not-found view — the platform cannot make that call
+> for you.
 
 **ACL fields are rejected here, on both branches.** Passing
 `managers`/`editors`/… (flat or nested under `acls`) fails with
@@ -715,8 +1039,9 @@ being silently dropped. Use [`/app/acl-set`](#post-appacl-set) or the
 **Response (success):** `{ result, data: <app row>, timestamp }`.
 
 **Notes:**
-- Validation soft-failures: `{"msg":"Name invalid","code":"validation_invalid"}`,
-  `{"msg":"Quota exceeded","code":"quota_exceeded"}`.
+- Validation soft-failure: `{"msg":"Name invalid","code":"validation_invalid"}`.
+  A spent create quota is **not** in that class — it is a 402 refusal
+  (above), with `data` naming the cap.
 - Side effects on create: per-app encryption key row (KMS-wrapped),
   `app.create` audit row, owner's app counters incremented in the same
   transaction.
@@ -740,17 +1065,51 @@ used_storage, created_at, updated_at}`, sorted by `created_at DESC`.
 **Body:** `{ "tid": "a-xxx" }`.
 
 **Response data:** the app row — `tid, name, description, icon,
-single_page, author, license_tid`, the six ACL arrays (`managers,
-designers, editors, readers, deletable, noaccess`) and joined license
-info (`license: {tid, name, description, app_max_storage, user_max_apps,
-user_max_total_storage}`).
+single_page, error_page, author, license_tid`, the six ACL arrays
+(`managers, designers, editors, readers, deletable, noaccess`), joined
+license info (`license: {tid, name, description, app_max_storage,
+user_max_apps, user_max_total_storage}`), plus:
+
+- **`my_level`** — what *this caller* may do here, one of `"owner"`,
+  `"manager"`, `"designer"`, `"editor"`, `"reader"`. It is decided by the
+  same function every gate calls, so a screen that hides a control on it
+  cannot disagree with the server. **Use this instead of reading the ACL
+  arrays.** Those arrays hold role and group tokens (`[r-…]`, `G_…`) that
+  only the server can resolve, so a front-end that infers a level from
+  them is building a second, wrong ladder.
+- **`error_page`** — the custom 404 page path, or `null`.
+- **`domains_quota`** — `{max, used}`, or **`null`** when the quota could
+  not be resolved. Null means *unknown*, never zero and never unlimited;
+  the server declines to guess, so a UI must not either.
 
 An unknown or inaccessible `tid` also answers `access_denied` — by
 design you cannot tell "no such app" from "not yours".
 
 ### POST /app/acl-set
 
-**Auth:** Manager on the app.
+**Auth: Manager is the floor, not the gate.** The level actually required
+is `strictest(Manager, ladder(buckets this call touches))`, where the
+ladder is:
+
+| Bucket touched | Level it demands |
+|---|---|
+| `managers` | **Owner** |
+| `designers` (and the retired `developers`) | Manager |
+| `editors`, `readers`, `deletable`, `noaccess` | Designer |
+| *no bucket touched* | Designer |
+
+The strictest demand across the buckets in play wins, then the endpoint
+floor holds it at Manager or above. **Owner means `apps.author` and
+nobody else** — no role, group or ACL entry can confer it — so appointing
+or removing a Manager is reachable only by the app's author, however many
+Managers an app has.
+
+**This endpoint prices the *change*, not the payload.** Each bucket is
+compared against its stored value by set-equality after normalisation
+(sorted, deduped, role tids bracketed), so re-posting a `managers` array
+identical to the one already there counts as untouched and demands no
+escalation. Only a bucket whose contents actually differ pulls its rung
+of the ladder in.
 
 **Body:** every ACL field is optional; omitted = preserve. There are six
 arrays — a `developers` key was retired from the API surface and is
@@ -767,9 +1126,40 @@ silently dropped if you send it.
 }
 ```
 
-**Guardrails (non-owner Manager only):**
-- Cannot remove themselves from `managers`.
-- Cannot add themselves to `noaccess`.
+**Guardrails — three checks, all skipped for the author.** They apply
+only when the caller is *not* the app's author; the author is exempt
+from all three, so ownership stays an unrescindable recovery path.
+
+- **Cannot remove themselves from `managers`.**
+- **Cannot add themselves to `noaccess`.**
+- **Cannot remove the app's author from `managers`.** Without this a
+  Manager could rewrite `managers` to a set excluding the owner. It is a
+  **delta** check, not a presence check: it fires only when the author
+  *was* in `managers` and the new array drops them. An app whose author
+  was never listed in `managers` is unaffected, which is what lets a
+  Manager edit an unrelated bucket without tripping it.
+
+The first two are evaluated against the caller's **full** permission set
+— role tokens (`[r-…]`), group tids, username and user tid — not their
+bare user tid. Checking the tid alone both false-rejected managers who
+hold their access through a role and gave false protection, because it
+missed the removal of the very role that granted the access.
+
+Failures are plain **400** `bad_request` with an explanatory `msg` and
+no dedicated `code`; match on the status.
+
+The same three checks apply to all three incremental
+[`/app/acl/*`](#incremental-acl-editing-appacl) writers —
+`/app/acl/set`, `/app/acl/revoke` and `/app/acl/bulk-import` — which
+share one implementation with this endpoint's inline copy.
+
+**`/app/member/set-direct-grants` does not run them.** It reaches the
+same ACL arrays through a different path with no lock-out guard of its
+own, so it is gated by the [bucket ladder](#post-appacl-set) alone —
+touching `managers` demands Owner, and Owner is the one caller all three
+checks exempt anyway. The practical consequence is narrow but real: the
+ladder, not a self-lockout guard, is what protects those arrays on that
+endpoint.
 
 **Caps:** 5000 entries per array → `acl_array_too_large`.
 
@@ -802,7 +1192,18 @@ row + `app.transfer-ownership` audit.
 
 ### POST /app/invite-user
 
-**Auth:** Editor on `app_tid`.
+**Auth: Editor on `app_tid` is the floor.** When the `role_tids` list is
+empty *after* the app-membership filter below — including the case where
+you sent none — the call also writes a direct `apps.readers` grant, so it
+takes the level that bucket demands and the gate becomes **Designer**. An
+invite that names at least one role belonging to the app stays at Editor.
+
+**The roleless invite now grants something.** It used to attach no role,
+write no grant, and still answer `result:true`: the person accepted the
+invitation and then could not open the app. A roleless invite now adds
+the invitee to `apps.readers` (idempotently), on **both** branches — the
+existing-user branch and the new-user magic-link claim path — so the
+invitation and the access arrive together.
 
 **Body:**
 ```json
@@ -900,6 +1301,7 @@ membership is deliberately **not** expanded into this view.
 |---|---|---|---|
 | `POST /app/member/list` | Designer | `{app_tid, search?, role_filter?, limit?, offset?}` | `{data:[…], total, limit, offset, next_offset}` |
 | `POST /app/member/get` | Designer | `{app_tid, user_tid}` | one member card; `not_found` if the user has no roles, no direct grant and isn't the author |
+| `POST /app/member/search` | Designer | `{app_tid, query, limit?}` | `[{user_tid, username, display_name}]` — find a person who is **not yet** a member, so you can add them |
 | `POST /app/member/set-roles` | **Manager** | `{app_tid, user_tid, role_tids[]}` | `{roles, added, removed}` |
 | `POST /app/member/set-direct-grants` | see below | `{app_tid, user_tid, grants:{<array>:bool}}` | `{applied:{…}}` |
 | `POST /app/member/remove` | Designer | `{app_tid, user_tid}` | strips the user from every role **and** every ACL array of the app |
@@ -915,21 +1317,64 @@ null PII.
   Designer granting themselves such a role would be privilege
   escalation.
 - `set-direct-grants` edits the app's ACL arrays directly, and its
-  required level scales with what you touch: `managers` → **Owner**;
-  `designers` / `developers` → **Manager**; anything else → **Designer**.
+  required level scales with what you touch by the [same
+  ladder](#post-appacl-set): `managers` → **Owner**; `designers` /
+  `developers` → **Manager**; anything else → **Designer**.
   Omitted array names are left unchanged. Unknown array name →
-  `validation_invalid`.
-- `remove` refuses to remove the app's author (`code:
+  `validation_invalid`. Two more refusals, both recent and both worth
+  handling: an empty `user_tid` → `validation_invalid`, and a **grant**
+  naming a user who does not exist → `user_not_found`. Existence is
+  checked on grants only — a *revoke* deliberately skips it, so a deleted
+  account's leftover access can still be stripped. Before those checks
+  existed, such a call answered `result:true` and spliced a blank or dead
+  entry into a live ACL array.
+- `search` is the one person-lookup an ordinary app owner can reach.
+  `query` must be ≥ 2 characters after trimming, else `query_too_short`;
+  `limit` defaults to 10 and clamps to 25. It matches on **username
+  only** (case-insensitively, with `%` and `_` treated as literals) and
+  excludes banned accounts. The platform's own directory search lives
+  behind `/admin/users/list`, which requires naming the platform-admin
+  app *and* being a Manager of it — an app owner naming their own app
+  gets a signout envelope, not results — so this endpoint, not that one,
+  is how an admin screen finds somebody to invite.
+- `remove` refuses only on the app's **author** (HTTP **409**, `code:
   "owner_protected"`) — transfer ownership first.
+
+> **`remove` is Designer-gated and strips everything, including
+> `managers`.** One statement clears the user from all seven `apps.*` ACL
+> columns — `managers, designers, developers, editors, readers,
+> deletable, noaccess` — and a second clears every role they hold in the
+> app. There is no lockout guard here beyond the author check, so:
+> - a **Designer can demote any Manager** who is not the app's author;
+> - the same call **lifts that person's `noaccess` veto**, because
+>   `noaccess` is cleared along with the grants.
+>
+> If you deliberately vetoed someone by putting them in `noaccess`,
+> "removing" them undoes the veto rather than reinforcing it. Only the
+> author is unremovable, and only the author can put a Manager back.
 
 ### Incremental ACL editing (`/app/acl/*`)
 
 `/app/acl-set` replaces all six buckets in one shot. These are the
-surgical equivalents over the same columns, all **Manager**-gated, all
-subject to the same 5000-entries-per-array cap
-(`acl_array_too_large`) and the same self-lockout guard (a non-owner
-Manager may not remove themselves from `managers` nor add themselves to
-`noaccess`).
+surgical equivalents over the same columns, all with **Manager as the
+floor and the [same bucket ladder](#post-appacl-set) on top** — touch
+`managers` and the call needs **Owner** — all subject to the same
+5000-entries-per-array cap (`acl_array_too_large`) and the same
+[three-check lock-out guard](#post-appacl-set) — a non-owner Manager may
+not remove themselves from `managers`, add themselves to `noaccess`, or
+remove the app's author from `managers`. All three share one
+implementation with `/app/acl-set`, so the three endpoints below cannot
+drift from it.
+
+> **The one trap worth knowing before you port a screen.**
+> `/app/acl-set` prices the **change**; `/app/acl/bulk-import` prices
+> **presence**. Bulk-import asks only whether a bucket key was *supplied*
+> — so a "save all six arrays" dialog that posts `managers` every time,
+> unchanged, is free on `/app/acl-set` and **demands Owner** on
+> `/app/acl/bulk-import`. The same dialog, moved from one endpoint to the
+> other, silently stops working for every Manager who is not the author.
+> On bulk-import, omission is the only discount: send only the buckets
+> you mean to change.
 
 | Endpoint | Body | Effect |
 |---|---|---|
@@ -939,9 +1384,32 @@ Manager may not remove themselves from `managers` nor add themselves to
 | `POST /app/acl/bulk-import` | `{app_tid, grants:{managers?,designers?,editors?,readers?,deletable?,noaccess?}}` | replace the buckets you supply, preserve the rest |
 
 Buckets are `managers, designers, editors, readers, deletable,
-noaccess`; an unknown name gives `unknown_acl_bucket`. Bare role tids are
-bracket-normalised on the way in, so passing `r-…` matches a stored
-`[r-…]`.
+noaccess`. Bare role tids are bracket-normalised on the way in, so
+passing `r-…` matches a stored `[r-…]`.
+
+> **A misspelled bucket name is caught on two of these three endpoints
+> and silently dropped on the third.**
+>
+> `/app/acl/set` and `/app/acl/revoke` take the bucket as a *string* and
+> validate it: an unknown name is refused `unknown_acl_bucket`.
+>
+> `/app/acl/bulk-import` takes a typed `grants` **object** whose six
+> keys are fixed fields. An unrecognised key does not match any of them
+> and is **discarded during parsing** — before the handler runs, without
+> a warning. The call then succeeds for whatever it did recognise and
+> answers `result: true`.
+>
+> So `{"grants": {"manager": [...]}}` — singular, a plausible typo for
+> `managers` — applies **nothing**, reports success, and leaves the real
+> `managers` bucket untouched. There is no code to match on and no
+> field in the response that reveals it.
+>
+> Two defences, since the server offers none: send only keys you have
+> spelled from the list above, and **verify with
+> [`/app/acl/list`](#incremental-acl-editing-appacl)** after a
+> bulk-import rather than trusting `result: true`. This is the one place
+> in the ACL surface where a successful response does not mean your
+> request was understood.
 
 ### POST /app/role/list-for-user
 
@@ -1036,7 +1504,9 @@ user cannot enumerate the roster or read your hook source.
 - `(app_tid, ma)` is unique among active resources; duplicates are a soft
   `result:false` with a message.
 - `fields[*].level` >= 1 = encrypted at rest (`data_secret`), and such a
-  field can never be filtered on.
+  field can never be filtered on. It also puts the whole read path on an
+  all-or-nothing footing — see [the decryption warning](#one-unopenable-cell-fails-the-whole-read)
+  below before declaring a field encrypted.
 - Creating a resource also creates its physical storage table. If that
   DDL fails, the partially-created resource row is rolled back.
 - Hook shape is validated — bad shape fails with `hook_invalid_shape`.
@@ -1154,13 +1624,31 @@ deletable` set the resource's own ACL arrays (the same seven arrays
 `/app/resource/get` returns). `/app/resource/update` is the endpoint
 that WRITES them — there is no separate resource-ACL route. Omitted =
 preserve (COALESCE-skip); an empty array clears the bucket. Role tids
-are bracket-wrapped (`[r-…]`) before persistence. These arrays gate
-every `/app/doc/*` op on that resource. Denial is deliberately
-asymmetric: **`/app/doc/list` returns an empty success page** (no
-existence leak), while `/app/doc/get`, `/create`, `/update`, `/del`,
-`/acl-set` and `/create-batch` return `access_denied`. Doc
-create/update/delete additionally require the resource's `editors` /
-`deletable`. `managers / designers / authors` are read back by
+are bracket-wrapped (`[r-…]`) before persistence.
+
+These arrays gate **almost** every `/app/doc/*` op on that resource —
+`list`, `get`, `create`, `update`, `del`, `upsert`, `create-batch` and
+`import`. Denial is deliberately asymmetric: **`/app/doc/list` returns
+an empty success page** (no existence leak), while the rest return
+`access_denied`. Doc create/update/delete additionally require the
+resource's `editors` / `deletable`.
+
+> **`/app/doc/acl-set` is the exception: it does not consult the
+> resource ACL at all.** Its gate is app-level Editor plus the doc's own
+> ACL (owner/manager or the doc's author) — the resource layer is not in
+> the path.
+>
+> So a caller excluded by a resource's `noaccess`, or simply absent from
+> a restrictive `editors`, is refused `update` and `del` on a document
+> and can still rewrite that document's per-doc ACL — including adding
+> themselves to its `editors`. Reaching it requires app-level Editor and
+> either app owner/manager standing or authorship of the doc, so this is
+> not an anonymous hole; but it does mean **the resource ACL is not a
+> complete containment boundary for a doc's permissions.** If you are
+> using resource-level `noaccess` to fence a group away from a class of
+> records, that fence does not cover per-doc ACL edits.
+
+`managers / designers / authors` are read back by
 `/app/resource/get` (owner/manager only) but have **no API write path at
 all** — neither create nor update accepts them.
 See [acl-model.md](acl-model.md) for the layered model.
@@ -1260,6 +1748,38 @@ the caller may access the app key. `next_cursor` accompanies a page that
 may have a successor. A `meta` block appears when [row-level
 scope](#row-level-scope-req-tfl5-006) is active. Resource-not-found
 returns `{"result":false,"code":"resource_not_found"}`.
+
+#### One unopenable cell fails the whole read
+
+Decryption of a `level: 1|2` field has **no per-row and no per-field
+fallback**. Any failure — a ciphertext this cell's key cannot open, a
+malformed envelope, a value that no longer deserialises — becomes a
+server fault, and it propagates straight out of the row loop. So a single
+bad cell aborts the **entire** response with HTTP **500**
+`{"code":"internal"}`, taking with it every unrelated row on the same
+page. On a 100-row page, ninety-nine readable rows are lost to the
+hundredth.
+
+This applies to `/app/doc/list` and `/app/doc/get` alike, and it is the
+shape you should expect during a master-key rotation or after a restore
+that brought back rows without their key.
+
+**Do not assume symmetry with account PII.** The `/user/profile` PII
+path degrades *gracefully* — an unreadable field comes back `null` and
+is named in [`unreadable[]`](#post-userprofile), and the rest of the
+response is served. Doc-field encryption does the opposite: it fails
+closed on the whole request. Two different subsystems, two different
+answers to the same underlying condition.
+
+Practical consequences:
+
+- Treat `level >= 1` as a per-resource decision with a blast radius of
+  the whole listing, not a per-field one.
+- A 500 from `/app/doc/list` on a resource that has encrypted fields is
+  more likely a key problem than a query problem; narrow it by paging
+  with a smaller `limit` (or `cursor`) until you isolate the row.
+- There is no request flag to skip, null out, or tolerate an unopenable
+  cell.
 
 ### POST /app/doc/create-batch
 
@@ -1374,6 +1894,10 @@ after a `list` lookup.
 `{tid, resource_tid, data, author, editors, readers, deletable,
 noaccess, deleted_at, created_at, updated_at}`. Missing → `not_found`.
 
+Encrypted (`level >= 1`) fields are decrypted into `data` on the way
+out, on the same all-or-nothing footing as `/app/doc/list` — see
+[One unopenable cell fails the whole read](#one-unopenable-cell-fails-the-whole-read).
+
 **Break-glass header.** When the caller's [scope](#row-level-scope-req-tfl5-006)
 binding is aggregate-level, reading an individual row is refused with
 `pii_aggregate_only` unless the request carries an `X-Audit-Reason`
@@ -1437,6 +1961,17 @@ owner/manager, doc author, or row.deletable member).
 
 **Body:** `{app_tid, tid, editors?, readers?, deletable?, noaccess?}`.
 COALESCE-skip semantics.
+
+**Response `data`:** `{tid, acl_updated: true}` — and nothing else.
+Unlike [`/app/file/acl-set`](#post-appfileacl-set), this endpoint does
+**not** echo the resulting arrays, even though it applies the same
+bracket normalisation on the way in. So a caller cannot see what was
+actually stored from the reply.
+
+If you need the post-write state — and you do, if you are rendering it —
+follow with [`/app/doc/get`](#post-appdocget), which returns the doc's
+`editors`/`readers`/`deletable`/`noaccess`. Do not assume the stored
+arrays equal the ones you submitted: a bare `r-…` is stored as `[r-…]`.
 
 ### POST /app/doc/import-preview  *(multipart)*
 
@@ -1600,8 +2135,31 @@ Which to use:
 | authoring pages in-product (visual/no-code editor) | **Site engine** — draft → preview → publish, per-file history |
 | managing individual assets with per-file ACL, signed URLs, trash | **Files** |
 
-Only Files participate in per-row ACL, quota accounting and the trash;
-bundle entries are public and quota-free by design.
+Quota accounting and the trash belong to Files alone. **Per-file ACL is
+not so simple**, and getting it wrong is a disclosure bug:
+
+- **Bundles are public by contract.** Bundle entries carry no per-file
+  ACL and none is consulted. A bundle *is* the front-end a tenant ships
+  to its users, so a non-default ACL belongs on user-uploaded data, not
+  on app code. Do not put anything private in a bundle.
+- **Snapshots are not public.** The snapshot tier enforces the `files`
+  row ACL for the path being served, exactly as the file and
+  object-storage tiers do. It has to: the snapshot tier has the
+  *highest* priority, so an ACL it skipped would be an ACL that
+  publishing silently removed.
+- **Files** enforce it as always.
+
+**The snapshot check reads the ACL live, not a copy frozen at publish
+time.** Two consequences worth relying on: revoking someone's access
+takes effect immediately, with no republish; and rolling back to an
+older snapshot still honours **today's** ACL rather than the one that
+was in force when that snapshot was made. A denial is served as a 404,
+not a 403 — the same non-disclosure the rest of the platform uses.
+
+One gap to know about: an entry still present in a snapshot whose
+underlying `files` row has since been deleted falls back to the legacy
+"no row, allow" rule and is served. Delete the bytes, not just the row,
+if the content is sensitive.
 
 ### Site engine (draft → publish)
 
@@ -1611,20 +2169,61 @@ pointer in one atomic step. Every endpoint is **Manager** on `app_tid`.
 
 | Endpoint | Body | Notes |
 |---|---|---|
-| `POST /app/site/put` | `{app_tid, path, kind?, content_text?, content_base64?, mime?}` | writes into the draft. `kind` is `file` (default use) or `page` (a JSON component tree). Exactly one of `content_text` / `content_base64`. Request cap 20 MB. Returns `{snapshot_id, blob_sha, size, deduped}` |
+| `POST /app/site/put` | `{app_tid, path, kind?, content_text?, content_base64?, mime?}` | writes into the draft. `kind` is `file` (default use) or `page` (a JSON component tree). Exactly one of `content_text` / `content_base64`. Per-file cap **50 MiB (52,428,800 B) on the decoded bytes** — both input shapes go through the one gate; over it, `file_too_large` whose `msg` names the path *and* both sizes. Body layer above it: 74,099,372 B (base64 of a maximal file plus 4 MiB of envelope). Returns `{snapshot_id, blob_sha, size, deduped}` |
 | `POST /app/site/delete` | `{app_tid, path}` | `{removed}` |
 | `POST /app/site/list` | `{app_tid}` | `{entries}` — the draft |
 | `POST /app/site/get` | `{app_tid, path}` | `{found, content_base64}` |
 | `GET /app/site/preview` | query `?app_tid=…&path=…` (`path` defaults to `index.html`) | renders/serves the **draft**; `page` entries are rendered to HTML, files streamed with their stored type and `Cache-Control: no-store`. Not a JSON envelope |
 | `POST /app/site/publish` | `{app_tid, note?}` | `{live_snapshot}`. An empty draft is refused ("nothing to publish") |
-| `POST /app/site/rollback` | `{app_tid, snapshot_id}` | re-points live at an earlier snapshot |
+| `POST /app/site/rollback` | `{app_tid, snapshot_id}` | re-points live at an earlier snapshot — see below |
 | `POST /app/site/history` | `{app_tid}` | `{snapshots}` |
 | `POST /app/site/file-history` | `{app_tid, path}` | `{versions}` — every version of one path |
 | `POST /app/site/blob` | `{app_tid, sha}` | `{found, content_base64}` — fetch by content hash |
-| `POST /app/site/backfill` | `{app_tid}` | one-shot import of an existing file tree into a first snapshot |
+| `POST /app/site/backfill` | `{app_tid}` | one-shot import of an existing file tree into a first snapshot — see below |
 
 Blobs are content-addressed and reference-counted, so re-publishing an
 unchanged file costs nothing (`deduped: true`).
+
+**`rollback` cannot target the app's own draft.** The draft is the
+working tree, not a published version; making it live would put
+unreviewed content in front of visitors, and worse, every subsequent
+save into the draft would change the live site the moment it was saved,
+because the pointer and the working tree would be the same snapshot.
+The attempt is refused **400** — a generic `bad_request`, with no
+dedicated code, so match on the status and read `msg`, which names
+`/app/site/publish` (turn the draft into a version) and
+`/app/site/history` (pick an existing one) as the two ways forward. A
+database constraint enforces the same invariant underneath, so it cannot
+be reached by any other route either.
+
+**Rollback never clears the live pointer.** No route in the platform
+sets `live_snapshot` back to null — publish, rollback and backfill all
+re-point it at some snapshot. So rolling back cannot "switch the site
+engine off" and fall through to the bundle or file tiers; once an app
+has published a snapshot, the snapshot tier keeps winning. If you need
+the lower tiers back, that is an operator action, not an API call.
+
+**`backfill` is all-or-nothing, and it will tell you when it did
+nothing.** Response:
+`{result, imported, snapshot_id, reason, file_count, truncated, skipped}`
+— `imported` is a boolean, and `reason` is one of:
+
+| `reason` | Meaning |
+|---|---|
+| `already_on_engine` | the app already has a snapshot; nothing to import |
+| `no_files` | the source tree was empty |
+| `too_many_files` | the tree is larger than one import may copy |
+
+The cap is 5000 files by default (`TFL5_BACKFILL_MAX_FILES`). **Over the
+cap, nothing at all is written** — no blobs, no snapshot row, no pointer
+flip — and `truncated` comes back true. A partial copy is deliberately
+not offered, because a partial copy would have gone live as the whole
+site.
+
+`skipped[]` names paths whose bytes could not be read. They are **not in
+the snapshot and will not be served**, so a backfill that reports
+`imported: true` with a non-empty `skipped` is a site with holes in it —
+check the array before you consider the migration done.
 
 ### Bundles (versioned static releases)
 
@@ -1640,8 +2239,19 @@ bundle entries carry no per-file ACL — they are public.
 alphanumeric plus `. _ -`, ≤ 64 chars), `notes` (optional), `file` (one
 `.zip`).
 
-**Caps:** zip ≤ 10 MB; ≤ 500 entries; ≤ 50 MB uncompressed; every entry
-must pass the extension allowlist.
+**Caps:** zip ≤ 50 MiB (52,428,800 B); ≤ 500 entries; ≤ 100 MiB
+(104,857,600 B) uncompressed; each individual entry also ≤ 50 MiB
+(52,428,800 B); every entry must pass the extension allowlist. An
+oversize zip is refused by the handler with `file_too_large`, and the
+message names both numbers — the size you sent and the cap.
+
+Above that handler sits a **body layer of 52 MiB (54,525,952 B)** — the
+50 MiB file cap plus 2 MiB of multipart envelope. A request larger than
+*that* never reaches the zip check at all: it answers
+`upload_request_too_large`, a size refusal naming the body cap, **not** a
+parse error. So `bundle_too_large` / `file_too_large` mean "the zip is
+too big", while `upload_request_too_large` means "the HTTP request is
+too big" — two different limits, two different codes.
 
 **Response `data`:** `{tid, app_tid, version, sha256, file_count,
 total_bytes, uploaded_at, original_filename}`.
@@ -1649,7 +2259,7 @@ total_bytes, uploaded_at, original_filename}`.
 **Codes:** `bundle_version_invalid`, `bundle_version_exists`,
 `bundle_invalid_zip`, `bundle_too_many_entries`, `bundle_too_large`,
 `bundle_decompress_failed`, `file_too_large`,
-`file_extension_not_allowed`.
+`upload_request_too_large`, `file_extension_not_allowed`.
 
 Uploading does **not** publish — the version is stored inert.
 
@@ -1669,6 +2279,33 @@ step. `bundle_no_previous` when there is nothing to go back to.
 
 **Auth:** Manager. **Body:** `{app_tid}`. Clears the active version —
 takes the site offline. Idempotent. `app_not_found` if the app is gone.
+
+### POST /app/bundle/delete
+
+**Auth:** Manager. **Body:** `{app_tid, version}`. Permanently removes
+one stored version and its bytes.
+
+**Response `data`:** `{app_tid, version, files_removed, bytes_freed}`.
+`bytes_freed` is the size recorded on the version row, not a fresh
+measurement of what was deleted. Writes a `bundle.delete` audit row.
+
+**Refusals** (all **400**):
+
+| Code | When |
+|---|---|
+| `bundle_is_live` | the version is the app's current one — unpublish or activate another first |
+| `bundle_is_rollback_target` | the version is the app's `previous_bundle_version`, i.e. what `/rollback` would go back to |
+| `bundle_not_found` | no such version for this app |
+| `app_not_found` | the app row is gone |
+
+The two guards exist so a delete cannot take the site offline and cannot
+quietly disarm rollback. Nothing is refused for being merely old.
+
+**Storage is deleted first, the row second.** An interruption between
+the two therefore leaves a row pointing at bytes that are gone rather
+than orphaned bytes nothing references — retry the same call to finish.
+Do not treat a repeated `bundle_not_found` after a failed delete as a
+lost version.
 
 ### POST /app/bundle/list
 
@@ -1697,13 +2334,26 @@ Files live in two stages — `release` (live) and `test` (staging).
 - `bundle` — text `"1"|"true"|"yes"`, optional: treat the single
   uploaded `.zip` as a tree to unpack server-side. Requires exactly one
   `file` part (`bundle_requires_single_zip`) and applies the same
-  500-entry / 50 MB-uncompressed / 10 MB-per-entry caps as
-  `/app/bundle/upload`.
+  500-entry / 100 MiB-uncompressed (104,857,600 B) / 50 MiB-per-entry
+  (52,428,800 B) caps as `/app/bundle/upload`. The entry cap and the
+  running uncompressed total are separate checks: one 60 MiB entry is
+  refused `file_too_large`, while many small entries summing past
+  104,857,600 B are refused `bundle_too_large`.
 - `bundle_prefix`, `scope_attrs` — optional.
 
-**Limits:** 10 MB per file, request body up to 100 MB. Extension
-allowlist: HTML/CSS/JS/JSON, common images, fonts, plain text. Banned
-ext → `file_extension_not_allowed`. Oversize → `file_too_large`.
+**Limits:** 50 MiB (52,428,800 B) per file, request body up to 100 MiB
+(104,857,600 B). Extension allowlist: HTML/CSS/JS/JSON, common images,
+fonts, plain text. Banned ext → `file_extension_not_allowed`. A single
+oversize file → `file_too_large`.
+
+The two numbers together decide what a *batch* may contain, and the
+constant records the arithmetic: **one 50 MiB file per request fits**,
+with room left for the multipart envelope; **two do not**; hundreds of
+ordinary assets are unaffected. An over-cap batch is refused **by size**,
+with `upload_request_too_large` naming the body cap — not as a parse
+failure, and not as `file_too_large`, because no individual file broke
+its own limit. Because each field is buffered whole, that refusal fires
+while reading the part, before the per-file check runs.
 
 > **Stage defaults are asymmetric, and the split is narrower than it
 > looks.** Only the two byte-writing calls — `/app/file/upload` and
@@ -1715,6 +2365,47 @@ ext → `file_extension_not_allowed`. Oversize → `file_too_large`.
 > take the read-side default: omit `stage` on a delete and you delete
 > from the **live** site. Always pass `stage` explicitly on anything that
 > changes state.
+>
+> An operator can close that asymmetry with
+> **`TFL5_STRICT_WRITE_STAGE=1`**, which makes those four ops default to
+> `test` as well. It is **off** by default, so do not rely on it — pass
+> `stage` yourself and your client behaves the same on every cell.
+
+#### `warnings[]` — your write may not be what visitors see
+
+Four routes — `/app/file/upload`, `/app/file/save`, `/app/file/del` and
+`/app/file/rename` — can return an **additive top-level `warnings`
+array** beside the usual payload:
+
+```json
+{ "result": true, "data": [ … ],
+  "warnings": [ { "code": "file_write_shadowed_by_snapshot",
+                  "msg": "…", "live_snapshot": "<snapshot id>" } ],
+  "timestamp": 1700000000000 }
+```
+
+It appears when the write targeted `stage=release` **and** the app is
+serving a published [site snapshot](#site-engine-draft--publish). The
+write succeeded and the bytes are stored — but the snapshot tier
+out-ranks the file tree in the [serve
+order](#publishing-a-frontend), so **visitors will not see the change**
+until the app publishes again or the snapshot is cleared. Silence here
+is the dangerous case: without the warning, a successful-looking write
+that changes nothing on the live site is indistinguishable from one that
+works.
+
+The key is **omitted entirely** when there is nothing to report — treat
+its absence as "no warnings", not as an older server.
+
+An operator can turn the same condition into a hard failure with
+**`TFL5_REFUSE_SHADOWED_FILE_WRITE=1`**, in which case the write is
+refused **409** with that same `file_write_shadowed_by_snapshot` code
+and `data: {live_snapshot}` instead of succeeding with a warning. So one
+code covers both a warning and a refusal — branch on the status, not on
+the code alone.
+
+`/app/file/acl-set` and `/app/folder/create` do **not** carry
+`warnings`, even though the strict-stage flag above does apply to them.
 
 **Quota:** release-stage uploads are charged against both the app's
 storage cap and the owner's total-storage cap. Overshoot →
@@ -1743,8 +2434,15 @@ release stage in first.
 }
 ```
 
-Same caps + extension gate as `/upload`; request body up to 20 MB. One
-file per call.
+Same 50 MiB (52,428,800 B) per-file cap and extension gate as `/upload`,
+checked on the **decoded** bytes. One file per call.
+
+**Request body cap: 74,099,368 B (~70.7 MiB)** — not a round number
+because it is derived rather than chosen: base64 costs 4/3, so a 50 MiB
+file arrives as ~69.9 MB of text, plus 4 MiB of slack for the rest of the
+JSON envelope. The old 20 MB figure was smaller than a maximal file's own
+encoding, which meant the handler's 50 MiB check could never fire — every
+large save died at the body layer instead, with the wrong code.
 
 ### POST /app/file/get
 
@@ -1753,10 +2451,14 @@ file per call.
 **Body:** `{app_tid, path, stage?}` (`stage` defaults to `release`).
 
 **Response data:** `{tid, path, stage, size, mime, content_base64}`.
-Files > 10 MB return HTTP 200 with `{"result":false,"msg":"file too
-large; use public asset URL","code":"file_too_large",
+
+**The read cap is 10 MiB (10,485,760 B) — a different number from the
+50 MiB you may write.** A file over it returns HTTP 200 with
+`{"result":false, "code":"file_too_large",
 "data":{path,size,mime,tid,max_bytes}}` — fetch those through
-`/app/file/sign-url` or the public URL instead. A file the caller may
+`/app/file/sign-url` or the public URL instead. So a perfectly legal
+upload can be unreadable through this endpoint; `data.max_bytes` is the
+authoritative read cap, and it is not the upload cap. A file the caller may
 list but not read at full fidelity under PII scoping returns
 `pii_aggregate_only`.
 
@@ -1773,7 +2475,11 @@ bypass).
 
 **Body:** `{app_tid, path, recursive?: false, stage?}`. Folder delete
 needs `recursive: true` when non-empty (else HTTP 200 +
-`{"result":false,"code":"folder_not_empty"}`). Soft-delete — the bytes
+`{"result":false,"code":"folder_not_empty","item_count":<n>}`). The
+refusal now carries `item_count` as a top-level field **and** names the
+same count in `msg`, so a confirmation dialog can say how much is about
+to go without a second round-trip. The count excludes the folder's own
+row — it is what `recursive: true` would delete. Soft-delete — the bytes
 move to trash and still count against quota until purged.
 Returns `{freed, is_dir, tid, trashed_at}`.
 
@@ -1788,6 +2494,18 @@ Returns `{freed, is_dir, tid, trashed_at}`.
 ```
 Every array field defaults to `[]` (replace; omitted=clear). 404 if
 no row.
+
+**Response `data`:** `{path, managers, editors, readers, deletable,
+noaccess}` — and those arrays are **what was stored, not what you
+sent**. Normalisation happens on the way in: a bare `r-…` comes back
+bracket-wrapped as `[r-…]`, and blank entries are gone. Echoing your
+input back would assert it had been kept verbatim when it had not, so
+the handler returns the stored truth instead. **Use the response to
+refresh your local state**; re-rendering from the request will drift
+from the server on the first role tid anyone types unbracketed.
+
+Note the asymmetry with the per-doc equivalent below: this endpoint
+echoes, `/app/doc/acl-set` does not.
 
 ### POST /app/file/rename
 
@@ -1898,19 +2616,42 @@ snapshots (`{ts, has_manifest}`) sorted newest first.
 
 **Auth:** Manager on `app_tid`. **Body:** `{app_tid, backup_ts?}`.
 
-Two modes:
-- `backup_ts` omitted or `0` → **pointer swap** back to the previous
-  release version: O(1), no file copying. Returns
-  `{current_release_version, previous_release_version}`; `code:
-  "no_previous_release"` when there is nothing to go back to.
-- `backup_ts` set → restore from that snapshot's manifest, after taking a
-  safety backup of the current release.
+**Two different operations behind one route**, and they answer with
+different shapes. Which one you get is decided by two conditions
+together, not by `backup_ts` alone:
 
-Both take the same per-app advisory lock as `/app/release`.
+- **Pointer swap** — taken when `backup_ts` is omitted or `0` **and** the
+  app is actually serving through a release pointer. O(1), no file
+  copying: current ↔ previous are swapped in a single UPDATE. Returns
+  `data: {current_release_version, previous_release_version}`. Nothing to
+  go back to → HTTP 200 `{result:false, code:"no_previous_release"}`.
+- **Snapshot restore** — taken when `backup_ts` names a snapshot, **or**
+  when the app has no release pointer at all. Restores that snapshot's
+  manifest after taking a safety backup of the current release. Returns
+  `data: {restored_from_ts, restored_rows, safety_backup_at}`.
+
+So an app that has never published through the versioned pipeline gets
+the restore path even from a bare `{app_tid}` call — it will look for
+snapshot `0` and fail there rather than reporting
+`no_previous_release`. Read `current_release_version` from
+`/app/release/list`'s companions before assuming which branch you are on,
+and branch your client on the keys you got back rather than on the
+request you sent.
+
+Both take the same per-app advisory lock as `/app/release`, and both
+write an `app.release.rollback` audit row (the pointer swap tags itself
+`mode: "pointer_swap"`).
 
 ---
 
 ## Roles
+
+**All four role endpoints are Manager-gated, and none of them is a
+Designer-level convenience.** A role tid can itself sit in
+`apps.managers`, so editing a role's membership is Manager appointment by
+proxy: at Designer, a user could grant themselves a Manager-conferring
+role and walk up the ladder. Roles never confer Owner — that stays
+`apps.author` — so Manager is the correct bar for all of them.
 
 ### POST /app/roles/list
 
@@ -1953,7 +2694,7 @@ dashboard without needing the platform-operator audit endpoints.
   "actor":           "u-xxx",            optional, filter by acting user
   "action":          "doc.upsert.update", optional, exact action match
   "action_prefix":   "doc.",             optional, LIKE 'prefix%'
-  "target_kind":     "app",              optional, currently always 'app' — see scope note
+  "target_kind":     "app",              optional — see scope below for the full set
   "target_tid":      "a-xxx",            optional
   "since_ms":        1735603200000,      optional, default = now - 7 days
   "until_ms":        1735689600000,      optional, default = now
@@ -1967,13 +2708,96 @@ dashboard without needing the platform-operator audit endpoints.
 `{"code":"audit_window_too_wide"}`. `since_ms > until_ms` →
 plain bad-request.
 
-**Scope (today):** the WHERE clause hard-binds
-`resource_type='app' AND resource_tid=$app_tid`. Only events explicitly
-targeting the app row surface (ACL changes, app rename, owner transfer,
-license-tier flips, version applies). Events on child resources (docs,
-files, shares) carry the child's tid and **do not** appear in this feed
-today. Adding `audit_log.app_tid` as a first-class column is a planned
-future migration.
+**Scope: the feed covers the app and its children.** Events on the app
+row surface directly (ACL changes, app rename, owner transfer,
+license-tier flips, version applies), and events on child rows are
+resolved by looking the child up in its own table and matching that
+table's `app_tid`. So `target_kind` is **not** always `"app"`; the
+complete set it can return is:
+
+| `target_kind` | Resolved through |
+|---|---|
+| `app` | the `audit_log` row's own `resource_tid` |
+| `doc` · `resource` | the `resources` table |
+| `file` · `folder` | the `files` table |
+| `app_source` | the `app_sources` table |
+
+Nothing else can appear — a row whose `resource_type` is outside that
+set is not in the feed at all, whatever it names.
+
+> **On a `doc` row, `target_tid` is the RESOURCE's tid, not the
+> document's.** Doc writes are filed under the resource they belong to,
+> and the document's own tid lives at **`detail.doc_tid`** — which means
+> it is only visible when you pass `include_payload: true`.
+>
+> A client that joins `target_tid` against its documents will match the
+> wrong key on every row, and silently: resource tids and doc tids are
+> both `r-`/`d-`-prefixed opaque strings, so the join does not error, it
+> just finds nothing (or, worse, groups every edit in a resource under
+> one heading). To attribute an edit to a document you must request the
+> payload.
+
+**What the feed does not cover.** Two whole classes of change are
+absent, and neither is a filter you can widen:
+
+- **Membership changes are structurally invisible.**
+  `/app/member/set-roles`, `/app/member/set-direct-grants` and
+  `/app/member/remove` all do write audit rows — but they file them
+  under `resource_type: "user"`, which is not one of the six kinds this
+  feed matches. So they cannot appear here however you filter. (They are
+  not lost; they are simply not reachable through the per-app feed.)
+- **Role changes write no audit row at all.** `/app/role/create`,
+  `/app/role/edit` and `/app/role/del` record nothing anywhere.
+
+That matters more than it looks, because a role tid can sit in
+`apps.managers`: the two operations that most change who holds power in
+an app — editing a role's membership, and granting someone a direct ACL
+bucket — are the two this dashboard cannot show. `app.acl_set` from
+[`/app/acl-set`](#post-appacl-set) *is* captured with its full
+after-state, so an ACL screen built on that endpoint is auditable while
+the equivalent built on the member endpoints is not. If you are relying
+on this feed for access review, bound the claim accordingly.
+
+Two more consequences worth planning for:
+
+- **Deleted children are not filtered out.** The lookup matches on the
+  child's tid and `app_tid` only, never on `deleted_at`, so the history
+  of a document survives the document. That is the point of an audit
+  log, but it does mean `target_tid` may not resolve to anything you can
+  fetch.
+- **`app_tid` is not a column on `audit_log`, and is not going to
+  become one by default.** The feed does the lookup instead. The
+  alternative of trusting an app id written into the row's own `detail`
+  was rejected deliberately: `detail` is not always server-authored —
+  some rows carry a caller's raw body — so an attacker could inject
+  themselves into another tenant's feed. Do not build on `detail` for
+  tenancy.
+
+**Refusals are events too.** A permission check that turns an identified
+caller away writes a row of its own:
+
+- `action` is exactly **`app.access.denied`** — one constant, so a
+  dashboard, an operator feed and an alerting rule cannot disagree about
+  the string. Reach it with `action_prefix: "app.access."` or an exact
+  `action` match.
+- `result` is `"failure"`, and `detail` carries
+  `{required_level, doc_tid}` — `required_level` naming the level the
+  caller lacked (`owner` / `manager` / `designer` / `editor` / `reader`)
+  and `doc_tid` being `null` for an app-level refusal and set for a
+  per-doc one. A doc refusal is still filed under the **app**, so it
+  shows up in this feed.
+- **Only identified callers are recorded.** Anonymous, expired and
+  banned callers fail earlier, so a burst of unauthenticated probing
+  leaves nothing here — this feed answers "who that I know tried to do
+  what they may not", not "who knocked".
+- **No sampling and no dedupe.** The same person hitting the same wall
+  fifty times writes fifty rows, because the repeat pattern *is* the
+  signal.
+- **No `client_ip` is stored.** At that layer there is no socket peer
+  and the only thing available is a caller-supplied `x-forwarded-for`
+  header, which nothing has validated. A spoofable IP in an audit row is
+  worse than an absent one, so the field stays empty rather than
+  plausible.
 
 **PII / payload:** `payload_json` is `null` unless caller passes
 `include_payload: true`. Even then, rows that operators flagged
@@ -2010,6 +2834,17 @@ server-side with `detail.redact: true` come back as
 
 `next_offset` is `null` when the response is the last page (fewer rows
 than `limit` returned, or `offset + limit` would exceed the 100k cap).
+
+**Three row keys are permanently null**, and no request can populate
+them: `target_path`, `request_id` and `correlation_tid`. They have no
+backing columns in the current schema and are emitted as literal nulls
+purely to keep the response shape stable for existing clients. Do not
+build a correlation or tracing feature on them, and do not read a null
+there as "this event had none" — nothing has ever written them.
+
+`source_ip` **is** real (it carries the row's recorded `client_ip`), but
+see the refusal note above for one whole class of row where it is null
+by design.
 
 ---
 
@@ -2061,9 +2896,24 @@ revocation / expiry / doc deletion. No cookie issued.
 
 ## Domains
 
+**Gates at a glance.** Binding a domain to your own app moved to
+**Manager** on 2026-08-17; only removal stayed Owner. Everything that
+acts on a *parent* domain — approving delegations, whitelists, modes —
+is Owner **and** additionally requires that the parent row belongs to
+the app you named.
+
+| Endpoint | Level |
+|---|---|
+| `/app/domain/preview` · `/add` · `/verify` · `/request` | **Manager** |
+| `/app/domain/list` | **Designer** |
+| `/app/domain/del` | **Owner** |
+| `/app/domain/mode` · `/label-rules` · `/get-config` · `/whitelist/*` · `/subs-of-parent` · `/delegation/test-pattern` · `/requests/received` · `/request/approve` · `/request/deny` | **Owner** of the parent, and the parent must belong to the named app |
+| `/app/domain/reclaim-sub` | **Owner** on the admin app you name |
+| `/app/domain/delegations/received` · `/requests/mine` · `/request/cancel` | no app-level permission — signed-in caller only |
+
 ### POST /app/domain/preview
 
-**Auth:** Owner on `app_tid`. Body: `{app_tid, domain}`.
+**Auth:** Manager on `app_tid`. Body: `{app_tid, domain}`.
 
 **Response** — one of several branches:
 - `already_owned: true` — this app already holds the domain.
@@ -2077,7 +2927,7 @@ On a local-dev host the reply is `auto_active: true`.
 
 ### POST /app/domain/add
 
-**Auth:** Owner on `app_tid`.
+**Auth:** Manager on `app_tid`.
 
 **Body:** `{app_tid, domain}`. There is **no** `verify_token` field —
 the A-record-only contract replaced the older TXT/token handshake. A
@@ -2086,8 +2936,28 @@ the A-record-only contract replaced the older TXT/token handshake. A
 disregard it.)
 
 **Behaviour:** verifies DNS, INSERTs `domains` row with `active = TRUE`.
-Quota gated by `licenses.domain_max_per_app`. Idempotent on
-same-app re-add.
+Idempotent on same-app re-add.
+
+**Two different quota refusals live here, with two different statuses.**
+Read them apart before you automate anything:
+
+| Code | Status | Source |
+|---|---|---|
+| `domain_quota_reached` | **402** | the app's own cap, `licenses.domain_max_per_app`, on `/preview` and `/add` |
+| `quota_reached` | **200** `{result:false}` | the delegation gate — a parent owner's `max_subs` grant is spent — on `/preview` and `/add` |
+
+`domain_quota_reached` is deliberately a hard status, and one of the few
+places the platform breaks its own 200-`{result:false}` habit. Answering
+200 here let an automated publish read "fine" and go on to make a DNS
+change that could never work; a 402 stops the pipeline at the step that
+actually failed.
+
+The delegation refusal is the softer one because it is remediable by
+asking a person — see
+[bind requests](#bind-requests-asking-a-parent-owner-for-permission).
+Note that on `/app/domain/request` the same delegation condition
+degrades further, to a **400 `bad_request`** with the `quota_reached`
+code dropped entirely, so do not match on that code there.
 
 ### POST /app/domain/list
 
@@ -2102,7 +2972,7 @@ domain row. Audit-logged.
 
 ### POST /app/domain/verify
 
-**Auth:** Owner on `app_tid`. Body: `{app_tid, tid}`. Recovery /
+**Auth:** Manager on `app_tid`. Body: `{app_tid, tid}`. Recovery /
 re-check for an existing row that's been flipped inactive (e.g. by
 the DNS recheck worker).
 
@@ -2196,7 +3066,7 @@ label-rule denial or an exhausted quota cannot be requested away).
 
 | Endpoint | Auth | Body | Notes |
 |---|---|---|---|
-| `POST /app/domain/request` | Owner of the requesting **app** + verified email | `{app_tid, domain, note?}` | Idempotent — resubmitting reuses the pending row and reports `already_pending`. Returns `{tid, parent_domain, requested_host, status, already_pending}` |
+| `POST /app/domain/request` | **Manager** on the requesting app + verified email | `{app_tid, domain, note?}` | Idempotent — resubmitting reuses the pending row and reports `already_pending`. Returns `{tid, parent_domain, requested_host, status, already_pending}` |
 | `POST /app/domain/requests/mine` | Authenticated | none | your own requests, ≤ 200, newest first |
 | `POST /app/domain/request/cancel` | Authenticated — **the original requester only** | `{request_tid}` | pending requests only |
 | `POST /app/domain/requests/received` | Parent owner | `{app_tid, domain}` | pending requests against that parent, oldest first |
@@ -2341,24 +3211,44 @@ A module reaches its app's data via host calls (`host_query` /
 - `host_mutate` create needs app-Editor + write-scope; update needs
   per-doc Editor + bidirectional scope (current **and** post-merge row).
 
-> **`host_query` is NOT the same gate as `/app/doc/list` — read this
-> before you rely on it.** Two checks that `/app/doc/list` performs are
-> missing on the query host call:
+> **`host_query` applies the same three gates as `/app/doc/list`.** A
+> module is not a way around the read path.
 >
-> - **Resource-level ACL.** `/app/doc/list` evaluates the resource's
->   `readers`/`editors`/`noaccess` and returns an empty list to a caller
->   the resource excludes. `host_query` does not, so that same caller
->   receives real rows through a module.
-> - **PII level.** `/app/doc/list` drops rows whose scope binding grants
->   only aggregate access and masks the ones marked masked. `host_query`
->   applies the plain scope filter, so those rows arrive whole.
+> 1. **App permission** for the invoking user, re-resolved *inside* the
+>    host rather than trusted from the module. A refusal is an error
+>    envelope (`code: "host_query_failed"`) and writes an access-denied
+>    audit row.
+> 2. **The resource's own ACL** (`readers`/`editors`/`noaccess`). A
+>    denied caller gets an **empty array, not an error** — the same
+>    no-existence-leak answer the HTTP path gives, so a module cannot
+>    probe for a resource it may not see.
+> 3. **Row-level scope and PII level.** Rows outside the caller's cohort
+>    are dropped, `Aggregate`-only rows are dropped entirely, and
+>    `Masked` rows are masked before the guest ever sees them.
 >
-> Per-doc `readers`/`noaccess` are *not* part of this difference: in this
+> Gate 3 is **environment-conditional in exactly the way
+> `/app/doc/list`'s is** — it does nothing unless `TFL5_ENFORCE_SCOPE`
+> is on *and* the app populated `apps.acls.scope.field_map`. Parity with
+> the HTTP path holds either way, but the fence is only as strong as
+> that configuration. An opted-in app querying a resource missing from
+> `field_map` fails **closed** with `scope_not_configured`.
+>
+> ⚠ Two things to design around:
+> - **An empty result is also what a denial looks like.** Never read
+>   empty as proof that no rows exist. (An *unknown* `resource_ma` does
+>   return an error, so a guest can tell "no such resource name" from
+>   "denied" — but never "denied" from "zero matching rows".)
+> - **`host_query` returns no `meta`.** Where `/app/doc/list` reports
+>   `meta.scope_filter_applied` and `meta.pii_aggregate_dropped`, the
+>   bridge returns only `{"ok":true,"data":[…]}`. A module cannot detect
+>   that filtering happened.
+> - A binding rated `Masked` against a resource that declares no
+>   `pii_fields` returns the row **unmodified** — masking needs a field
+>   list to act on.
+>
+> Per-doc `readers`/`noaccess` are not part of either path: in this
 > platform per-doc ACL gates writes (`update`, `del`, `acl-set`), not
-> reads, so `/app/doc/list` does not enforce them either. Treat a module
-> as able to see any level-0 field of any row in the app that the caller
-> has app-Reader on, and put anything more sensitive behind field-level
-> encryption rather than behind an ACL.
+> reads, so `/app/doc/list` does not enforce them either.
 
 ### ABI (compiling a module)
 
@@ -2369,6 +3259,12 @@ JSON passed over linear memory, and the ABI carries a version number.
 Any language that targets WASM (Rust, TinyGo, AssemblyScript) works.
 Additional per-invocation caps beyond the table above: 256 KiB per host
 request payload, 4 KiB per log line, and a limit on table elements.
+
+**The byte-level contract lives in
+[wasm-operator-abi.md](./wasm-operator-abi.md)** — memory layout, the
+full host-call surface, and an error-vs-silence table for the three
+gates above. This section is the REST-facing summary; that document is
+the reference to build a module against.
 
 ### Lifecycle endpoints (Manager on `app_tid`)
 
@@ -2562,8 +3458,7 @@ response is still success.
 {
   "app_tid":    "a-xxx",        required
   "from_local": "noreply",      required, no '@'
-  "from_domain":"acme.com",     optional; falls back to first DKIM-
-                                // configured domain for this app
+  "from_domain":"acme.com",     optional; validated — see below
   "to":         ["..."],        required, ≥ 1
   "subject":    "string",       required
   "html":       "string",       optional; html or text required
@@ -2571,6 +3466,34 @@ response is still success.
   "reply_to":   "string"        optional
 }
 ```
+
+**The sender is verified against a DKIM key before anything is
+queued.** Both shapes are checked, and both fail with the same code:
+
+- **`from_domain` given** — it is lower-cased and looked up among *this
+  app's* DKIM keys. No key for that specific domain → **400**
+  `email_dkim_not_configured`. Naming a domain the app has not
+  configured is not a way to borrow another app's signature.
+- **`from_domain` omitted** (or blank) — falls back to the app's oldest
+  DKIM key, as before. If the app has **no** key at all, that is the
+  same **400** `email_dkim_not_configured`, distinguished only by `msg`.
+
+Previously the explicit path was not checked at all, and the endpoint
+answered `{result:true, queued:true}` for mail the platform could never
+sign — a success envelope for a message that was going to be dropped
+downstream. Match on the code and treat it as "fix your DKIM setup",
+not as a transient failure.
+
+**Recipients are shape-checked too.** Every entry of `to[]` must be a
+plausible address — one `@`, non-empty local part, no whitespace, ≤ 254
+characters, and a domain of at least two non-empty dot-separated
+labels. The first bad one is refused **400** `email_invalid_recipient`,
+and the offending value is echoed back in `msg` so a UI can point at the
+right row. An empty `to[]` is a plain bad request with no code.
+
+Checks run in this order, so the first failure you see is the outermost
+one: mailer configured → DKIM/`from_domain` → `from_local` → recipients
+→ `html`/`text` present.
 
 **Response:** async by default — `{queued:true, tid, from, to}`.
 Sync path (`TFL5_QUEUE_SYNC=1`) waits for delivery and returns
@@ -2624,8 +3547,32 @@ need app-Manager.
 **Multipart fields:** `app_tid` (text), `doc_tid` (text), `level`
 (text, `"1"|"2"|"3"`, default `1`), `name` (text), `file` (binary).
 
-**Limits:** 100 MB per file. Levels: 1 = internal, 2 = confidential
-(per-access audit), 3 = top-secret (per-grantee envelope).
+**Limits:** 100 MB per file (the whole request is capped at 110 MB, so
+one maximal file plus its multipart envelope fits and two do not).
+Levels: 1 = internal, 2 = confidential (per-access audit), 3 =
+top-secret (per-grantee envelope).
+
+**F3 uploads consume storage quota, so size is not the only way this
+call fails.** The bytes are charged against both the app's storage cap
+and the owner's total-storage cap, and the check runs **before** the
+object is written, so a refusal leaves nothing behind. Overshoot →
+**400** `quota_app_max_storage` — the same code the ordinary file
+routes use, with only `msg` distinguishing the app cap from the owner
+cap.
+
+Two details that change the arithmetic:
+
+- **You are charged in ciphertext bytes, not plaintext.** Encryption
+  happens first and the encrypted length is what is billed, so budget
+  slightly above the file size you uploaded.
+- **A re-upload of content the doc already holds skips the check.**
+  Likely duplicates are not charged, so an idempotent retry of a large
+  attachment will not fail on quota even when a first upload would.
+
+Before this was wired in, F3 bytes never touched the app's
+`used_storage` at all and an F3 upload could not fail on quota — if you
+are reading an older integration that only handles `file_too_large`,
+that is why.
 
 ### POST /app/f3/edit
 
@@ -2733,6 +3680,37 @@ at most 32 of them; each field may set `type` (`string`, `email`,
 `number` or `bool`) and `max_len` (1..=65535). Anything else →
 `public_form_schema_invalid` (or `public_form_scope_attrs_invalid`).
 
+### POST /admin/public-form/get-config
+
+App-scoped like its siblings, despite the `/admin/` prefix.
+
+**Auth:** **Designer** on `app_tid` — matching the *write* gate above,
+not `/list`'s Manager. Reading a form's shape is part of editing it.
+
+**Body:** `{app_tid, form_id?}` (a blank `form_id` counts as absent).
+
+**Response `data`, two shapes:**
+
+- **with `form_id`** — `{form_id, configured, schema}`. `configured` is
+  a boolean and `schema` is the object or `null`.
+- **without `form_id`** — `{forms, form_ids}`, where `forms` is the
+  whole `public_forms` map and `form_ids` is an array of its keys. Note
+  the map is **nested under `forms`**, not returned bare.
+
+**A missing app and an unconfigured form are different answers.** A
+`app_tid` that does not exist (or that you cannot see) is `not_found` —
+which, as everywhere on this platform, arrives as HTTP 200
+`{result:false, code:"not_found"}`. A form that simply has no config is
+**not** an error: it is `configured: false` with `schema: null`. An app
+with no forms at all returns `forms: {}`, never null.
+
+Under [row-level scope](#row-level-scope-req-tfl5-006), a caller whose
+binding is not global must name `form_id` → 400 `scope_form_required`.
+
+**Read before you write.** `set-config` replaces a form's schema
+wholesale and a `null` schema deletes the form, so a UI that edits
+without reading first is writing over state it cannot see.
+
 ### POST /admin/public-form/list
 
 **Auth:** **Manager** on `app_tid` (again app-scoped, not platform).
@@ -2783,31 +3761,85 @@ room's `min_level` (default Reader), and the caller's row-level scope
 must admit the room. `room` defaults to `general`. A draining node
 answers 503 + `service_draining` with `Retry-After`.
 
+**Query:** `?app_tid=…&room=…`, plus the optional `&since_ts=<ms>`
+resume cursor described below.
+
 **Frames are JSON text** (binary frames are refused with
-`binary_unsupported`):
+`binary_unsupported`). There are **five** server frames, not four:
 
 | Client sends | Server sends |
 |---|---|
 | `{"type":"ping"}` | `{"type":"pong","ts"}` |
 | `{"type":"msg","text":"…"}` | `{"type":"msg","tid","from","from_user_tid","room","text","ts"}` broadcast to the room |
-| — | `{"type":"welcome","username","app_tid","room","ts"}` on connect |
+| — | `{"type":"welcome","username","app_tid","room","resume_from","ts"}` on connect |
+| — | `{"type":"deleted","tid","room","ts"}` when a moderator retracts a message |
 | — | `{"type":"error","code","msg","ts"}` |
 
+> **A client that ignores `deleted` leaves retracted messages on screen
+> forever.** It is sent on every moderator delete
+> (`/admin/chat/delete-message`), carries the `tid` of the message to
+> remove and the tombstone timestamp in `ts`, and it is the only signal
+> a live socket gets — `/app/chat/history` simply omits deleted rows, so
+> a session that never refetches never learns.
+>
+> Cross-cell fan-out for retractions rides a **separate** channel from
+> the one messages use. That is deliberate: during a rolling upgrade, a
+> peer still running the previous build parses everything on the message
+> channel as an insert, and would re-broadcast the row that was just
+> deleted as a live message. It does not listen on the delete channel at
+> all, so the worst case mid-rollout is the old behaviour — no
+> cross-cell retraction — never a resurrection.
+
 Error codes on the socket: `invalid_json`, `unknown_type`, `empty_msg`,
-`persist_failed`, `lagged` (you fell more than 128 frames behind;
-recoverable), `binary_unsupported`.
+`persist_failed`, `lagged` (recoverable — see below),
+`binary_unsupported`.
 
 A message is persisted **before** it is broadcast, and you see your own
 message via the broadcast rather than a local echo. Delivery is
 cross-cell.
 
+#### Resuming after a drop (`since_ts`)
+
+Connect with `?since_ts=<epoch_ms>` and the server replays the room's
+messages **strictly newer** than that cursor before the live stream
+starts: oldest-first, tombstoned rows excluded, each frame an ordinary
+`msg` carrying an extra **`"resumed": true`** so a client can render
+backfill differently from live traffic. The `welcome` frame echoes the
+cursor back as `resume_from` (null on a first connect).
+
+The replay is capped at **200 messages**. Past that — or if the replay
+query fails — the server sends **`{"type":"error","code":"lagged"}`
+instead of the replay, not after it**: you get zero backfill frames and
+must reload through `/app/chat/history`. Treat `lagged` as "my cursor is
+too old, refetch", never as "I have some of it".
+
+`lagged` also arrives on a live socket that falls too far behind the
+broadcast buffer. Same remedy either way.
+
 ### POST /app/chat/history
 
 **Auth:** same gate as the socket — the room's `min_level` plus scope.
 
-**Body:** `{app_tid, room?, limit?, before_ts?}` (`limit` 1..=200,
-default 50). Returns `{messages:[{tid, from_user_tid, from, text, ts}],
-next_before_ts}`, newest first. Deleted messages are never included.
+**Body:** `{app_tid, room?, limit?, before_ts?, after_ts?}` (`limit`
+1..=200, default 50). Returns `{messages:[{tid, from_user_tid, from,
+text, ts}], next_before_ts, next_after_ts}`. Deleted messages are never
+included.
+
+**Paging goes both ways, and the sort order never changes.** `before_ts`
+and `after_ts` bound opposite ends of one window, both **exclusive**,
+and they compose — send both to fetch a bounded slice. Rows always come
+back **newest-first**, whichever cursor you used; `after_ts` changes
+*which* messages you get, not their order. (The websocket resume replay
+is the opposite, oldest-first — do not share a rendering path between
+the two without re-sorting.)
+
+- `next_before_ts` is the timestamp of the **oldest** row on the page —
+  page backwards into history with it.
+- `next_after_ts` is the timestamp of the **newest** row — poll forwards
+  for new messages with it, which is how a client catches up without a
+  socket.
+
+Both are `null` on an empty page.
 
 ### Moderation (app-scoped, despite the `/admin/` prefix)
 
@@ -2816,12 +3848,34 @@ next_before_ts}`, newest first. Deleted messages are never included.
 | `POST /admin/chat/list-messages` | **Manager** on the app | `{app_tid, room?, limit?, before_ts?, include_deleted?}` |
 | `POST /admin/chat/delete-message` | **Manager** on the app | `{app_tid, tid}` — soft delete, idempotent (`already_deleted` / `not_found`) |
 | `POST /admin/chat/set-room-config` | **Designer** on the app | `{app_tid, room, min_level?, scope_attrs?}` — omitting both deletes the room config |
+| `POST /admin/chat/get-room-config` | **Designer** on the app | `{app_tid, room}` → `data: {app_tid, room, configured, min_level, scope_attrs}` |
 
 `min_level` ∈ `Reader | Editor | Designer | Manager`
 (`chat_room_level_invalid`); `scope_attrs` must be a flat string map
 (`chat_room_scope_attrs_invalid`); an empty room name is
 `chat_room_required`. Setting a room's config is Designer-gated —
 deliberately a higher bar than day-to-day moderation.
+
+> **Read the config before you write it — `set-room-config` is a
+> partial set over a value you cannot otherwise see.**
+>
+> Send only `min_level` and the room keeps its `scope_attrs`. Send
+> **neither** field and the whole room entry is deleted, scope binding
+> included. Until `get-room-config` existed, nothing could show an
+> operator that a `scope_attrs` was there at all — so an editor screen
+> was writing over state it had no way to display, and a "clear this
+> field" gesture could silently drop a scope binding somebody depended
+> on.
+>
+> `configured` is reported separately from the values on purpose: a room
+> with no entry and a room explicitly configured to `Reader` resolve to
+> the same effective level, and only the second one has anything for a
+> "Remove config" button to destroy. `min_level` is the **raw stored
+> value** — it is `null` on an unconfigured room rather than being
+> resolved to the `Reader` default, so you can tell the two apart.
+> `scope_attrs` is `{}` when absent.
+>
+> The delete branch answers `data: {app_tid, room, removed: true}`.
 
 ---
 
@@ -2855,6 +3909,18 @@ retryable), `wrong_cell` / `wrong_cell_needs_idem` /
 `cell_forward_failed` (placement; supply an `idem_key` to let the
 platform forward), `instance_quota`, `tick_deadline` (the guest blew its
 per-message wall-clock budget).
+
+**Two of those now carry the numbers you need to back off with.** Both
+are HTTP 200 `{result:false, code, msg, data, timestamp}` envelopes:
+
+| Code | `data` | What to do with it |
+|---|---|---|
+| `instance_quota` | `{live_instances, max_concurrent_instances}` | you are at the ceiling, not near it — shed or wait for instances to retire rather than retrying immediately |
+| `tick_deadline` | `{tick_deadline_ms}` | the budget your guest overran, so you can size the work per message instead of guessing |
+
+Without those figures a caller can only retry blindly, which is the one
+strategy guaranteed not to help with a concurrency ceiling. Neither
+carries a `retryable` flag — read the code.
 
 ### POST /durable/:op_id/:instance_key/stats
 
@@ -2912,15 +3978,92 @@ the client sends is refused with `read_only_stream`.
 
 ### GET /billing/catalog
 
-**Auth:** Anonymous. Returns `{services:[{id, name, description,
-subject_kinds, plans:[{plan, display_name, price_cents, billing_period,
-features, limits, display_order, self_service, is_default}]}]}` for
-active services and catalog-visible plans.
+**Auth:** Anonymous. Returns active services and catalog-visible plans:
+
+```json
+{ "services": [ { "id": "...", "name": "...", "description": "...",
+    "subject_kinds": ["app"],
+    "plans": [ { "plan": "pro", "display_name": "Pro",
+                 "price_cents": 1000, "currency": "USD",
+                 "vat_rate_bps": 1000, "vat_cents": 100,
+                 "total_cents": 1100,
+                 "billing_period": "month", "features": {},
+                 "limits": {}, "display_order": 1,
+                 "self_service": true, "is_default": false } ] } ],
+  "money": { "currency": "USD", "minor_units": 2,
+             "vat_rate_bps": 1000, "prices_include_vat": false },
+  "payment_providers": [ { "id": "binance", "settles": true,
+                           "hosted_checkout": true } ] }
+```
+
+**Two traps in the money block, and both produce a wrong price on screen
+if you miss them.**
+
+- **`prices_include_vat` is `false`.** `price_cents` is the pre-tax
+  figure; VAT is added on top by the same function that computes the
+  invoice, and the result is already on the plan as `vat_cents` and
+  `total_cents`. **Render `total_cents`** — quoting `price_cents` to a
+  customer under-states what they will be billed. VAT defaults to
+  1000 bps (10 %) and the arithmetic is round-half-up integer maths, so
+  the platform's number and yours will only agree if you take theirs.
+- **`minor_units` is not always 2.** It is **0** for zero-decimal
+  currencies (VND, JPY, KRW, CLP, ISK, PYG, RWF, UGX, VUV, XAF, XOF,
+  XPF, KMF, DJF, GNF, BIF) and **3** for BHD, IQD, JOD, KWD, LYD, OMR
+  and TND; everything else is 2. Format every `*_cents` figure as
+  `value / 10 ** minor_units`. Dividing by 100 is wrong for 23 of the
+  currencies the platform can be configured with — on a VND cell it
+  renders a bill 100× too small.
+
+The cell's currency is `TFL5_BILLING_CURRENCY` (three ASCII letters; an
+invalid value logs a warning and falls back to **USD**, which is also the
+default).
+
+**`payment_providers` always lists every provider**, configured or not —
+so the array is not a "what can I pay with" list on its own. `settles`
+is the field that answers that: it is true only when the cell can verify
+that provider's signed webhook, i.e. only then can a payment through it
+be recognised at all. `hosted_checkout` says whether the provider will
+return a ready-made payment page; only `binance` can ever report it
+true. A provider with `settles: false` still accepts a checkout call —
+you get a recorded order and no way to pay it.
 
 ### POST /billing/account
 
-**Auth:** Authenticated — always the caller's own account. Returns
-`{apps_used, user_max_apps, current_plans}`.
+**Auth:** Authenticated — always the caller's own account.
+
+**Response `data`:** `{apps_used, user_max_apps, current_plans,
+current_subscriptions, model, effective_cap, apps_created_total,
+remaining, refundable_on_delete}`.
+
+**`user_max_apps` is not the cap the server enforces**, and reading it
+alone is the mistake this endpoint was extended to stop. The enforced
+pair is **`effective_cap` + `model`**:
+
+- `model: "rights"` — the account is on the consumable model. The gate
+  compares `apps_created_total` against `effective_cap`, and
+  `effective_cap` is the **greater** of the rights the account bought
+  and any `user_max_apps` an `account` service grant confers. So a
+  service grant can raise the ceiling without ever touching the rights
+  balance, which is exactly why `user_max_apps` on its own tells you
+  nothing.
+- `model: "plan"` — the legacy tier branch, where `effective_cap` is the
+  tier's concurrent cap.
+
+**The two numbers do not even measure the same thing.**
+`app_create_rights` is a **lifetime** counter — deleting an app refunds
+nothing — while `user_max_apps` is a **concurrent** cap, where deleting
+an app frees a slot straight away. `refundable_on_delete` is the field
+that tells a UI which sentence to show, and it matches the `data` block
+on the [402 refusal](#post-appupdate) so both surfaces agree.
+
+`current_plans` is a map `service_id → plan` of active user-subject
+entitlements. `current_subscriptions` is a map
+`service_id → {plan, status, current_period_end}` built from
+*user-subject* `subscriptions` rows excluding `canceled` ones
+(`suspended` is included). It is what lets a client warn a user before
+they re-buy an account plan they already hold — see
+[change-plan](#post-billingsubscriptionchange-plan) for why that
+warning matters.
 
 ### POST /billing/checkout
 
@@ -2930,9 +4073,41 @@ default); Authenticated + verified email for `subject_type: "user"`.
 **Body:** `{subject_type?, app_tid?, service_id, plan, provider?,
 idem_key?}`.
 
-**Response:** `{order_ref, amount_cents, provider, status:"pending"}`,
-plus provider-specific fields (a checkout URL / QR payload) **only when
-that provider is configured**. `idem_key` is scoped per subject.
+**Response:** `{order_ref, amount_cents, currency, provider,
+status:"pending"}`, plus provider-specific fields (a checkout URL / QR
+payload) **only when that provider is configured**. `idem_key` is scoped
+per subject.
+
+`currency` is **not** part of that conditional group: it is returned on
+every checkout, configured provider or not, and it is returned on both
+branches. On a fresh order it is the unit the order was recorded in; on
+an idempotent replay it is read back **from the stored order**, not from
+today's price sheet, so re-hitting a key after a currency change still
+quotes what the customer was actually charged. `/billing/app-rights/checkout`
+behaves the same way on both branches.
+
+### POST /billing/subscription/preview-change
+
+**Auth:** Owner on `app_tid`. **Body:** `{app_tid, service_id, plan}` —
+the same body [change-plan](#post-billingsubscriptionchange-plan) takes.
+
+**Read-only.** It opens no transaction and writes nothing, and it
+refuses the same cases the apply refuses, so you can price a switch
+before offering it.
+
+**Response `data`:** `{service_id, from_plan, to_plan, cadence_change,
+refund_cents, due_cents, new_period_end, net_cents, settlement,
+currency, credit_balance, sufficient_credit, as_of}`.
+
+`cadence_change` is a boolean — true when the switch also changes the
+billing period. `net_cents` is signed: positive means the customer owes,
+negative means they are owed. `settlement` is `"debit"` / `"credit"` /
+`"none"`, derived from the sign of `net_cents`.
+
+**`sufficient_credit` is the field that turns a 402 into a decision.**
+It is `net_cents <= 0 || credit_balance >= net_cents` — that is, whether
+the apply would go through. Check it and you can offer a top-up before
+the customer meets `insufficient_credits`, instead of after.
 
 ### POST /billing/subscription/change-plan
 
@@ -2940,15 +4115,61 @@ that provider is configured**. `idem_key` is scoped per subject.
 
 Prorates the switch and settles the difference against the app's credit
 balance in one transaction. Returns `{old_plan, plan, net_cents,
-settlement: "debit"|"credit"|"none", current_period_end}`. Insufficient
-balance → **402** `insufficient_credits`. A concurrent change →
-`conflict`.
+currency, settlement: "debit"|"credit"|"none", current_period_end}`.
+Insufficient balance → **402** `insufficient_credits`. A concurrent
+change → `conflict`.
+
+> **Proration is app-subject only, and the silence around that costs
+> money.** Both this endpoint and `/preview-change` hard-code
+> `subject_type = "app"` and sit behind an app-Owner gate. There is no
+> user-subject equivalent — none is missing by oversight, there simply
+> is no door.
+>
+> So buying an **account** plan the user already holds has to go through
+> [`/billing/checkout`](#post-billingcheckout), and that endpoint never
+> looks for an existing subscription: it reads the user, the price and
+> the idempotency key, and nothing else. Activation then upserts the
+> row, replacing the plan at **full price** and **resetting the
+> period** — whatever was left of the plan being replaced is forfeited,
+> silently and with no refund line anywhere.
+>
+> A client cannot make the server prorate this. What it can do is
+> *warn*: read `current_subscriptions` from
+> [`/billing/account`](#post-billingaccount), and if the service is
+> already held, say so before the button is pressed.
 
 ### POST /billing/history
 
 **Auth:** Owner on `app_tid`. **Body:** `{app_tid}`. Returns
 `{subscriptions, credit_balance, paid_orders:{subscription, credit},
 invoices}` — the last 20 of each list.
+
+**A grant is not a subscription, and `subscriptions[]` carries both.**
+The list is a full outer join of the entitlements the app actually has
+against the billing rows that paid for them, so each row is:
+
+`{service_id, plan, status, billing_plan, billing_status,
+current_period_end, provider, provider_ref, granted_by, updated_at,
+source}`
+
+- **`plan` / `status` are what is ENFORCED.** These are what the app is
+  being served.
+- **`billing_plan` / `billing_status` are what was CHARGED**, and they
+  are `null` when nothing was. The two pairs **can disagree** — an app
+  whose billing row says `pro` while its entitlement says `demo` is
+  being served demo — and both are reported rather than reconciled,
+  because reconciling them would hide the discrepancy you need to see.
+- **`source`** is `"subscription"` when a billing row exists and
+  `"grant"` when it does not. It is computed from the join, not guessed
+  from which fields are populated.
+- `current_period_end` falls back to a grant's `expires_at` when there
+  is no billing period, and `granted_by` names who issued a grant.
+
+**Most plans on this platform arrive by grant, not by card** — the
+platform's own note records `subscriptions` at 0 rows against
+`app_services` at 813 on the dev database. A client that ignores
+`source` will therefore offer "Cancel subscription" for a plan nobody
+is paying for, on most of the rows it renders.
 
 ### Invoices
 
@@ -2959,18 +4180,110 @@ All Owner-gated on `app_tid`.
 | `POST /billing/invoice/issue` | `{app_tid, order_ref, vat_rate_bps?}` | idempotent per `order_ref`; VAT defaults to 10 % (1000 bps) |
 | `POST /billing/invoice/get` | `{app_tid, invoice_no?}` or `{app_tid, order_ref?}` | |
 | `POST /billing/invoice/pdf` | same | returns `application/pdf` bytes |
-| `POST /billing/invoice/email` | `{app_tid, invoice_no?, order_ref?, resend?}` | `{emailed, email: "sent"\|"not_configured"\|"no_owner_email"\|"already_emailed"\|"send_failed"}` |
+| `POST /billing/invoice/email` | `{app_tid, invoice_no?, order_ref?, resend?}` | `{result, emailed, email, invoice_no}` — see below |
 
 `issue` also reports `e_invoice`. No tax-authority e-invoice connector
 ships with the platform, so on a stock deployment that field is always
 `"not_configured"`.
 
+**`/billing/invoice/email` has five outcomes and one of them is a
+failure.** `email` is one of `"sent"`, `"not_configured"` (no mailer
+wired on the cell), `"no_owner_email"`, `"already_emailed"` (idempotent
+no-op) or `"send_failed"`. Four of those ride in a **success** envelope
+(`result: true`), because "there was no mailer" and "it had already gone"
+are both normal answers. **`send_failed` is not**: the mailer refused the
+message, so the receipt was not sent, and the reply is
+`result: false` with `code: "send_failed"` alongside the same `email`
+field. A client that only reads `email` still works; one that reads
+`result` now learns something it previously could not.
+
+Unlike the rest of this area, that response is **flat** —
+`{result, emailed, email, invoice_no, timestamp}` with no `data`
+wrapper, plus `code` and `msg` on the failure branch.
+
 ### Credits
 
 | Endpoint | Auth | Body |
 |---|---|---|
-| `POST /billing/credits/checkout` | Owner on `app_tid` | `{app_tid, credit_amount, amount_cents?, currency?, provider?, idem_key?}` |
+| `POST /billing/credits/packs` | Authenticated | none → what is buyable right now |
+| `POST /billing/credits/checkout` | Owner on `app_tid` | `{app_tid, pack_id, provider?, idem_key?}` |
 | `POST /billing/credits/balance` | Owner on `app_tid` | `{app_tid}` → `{balance}` |
+| `POST /billing/credits/ledger` | Owner on `app_tid` | `{app_tid, before_id?, limit?}` |
+
+#### POST /billing/credits/packs
+
+**Auth:** signed in. No body is read at all — the handler takes no
+payload. Returns `{packs:[{id, credits, price_cents, valid_from,
+valid_to}], currency}`; `valid_to` is null for an open-ended offer.
+
+Its sale-window predicate is the same one checkout applies, so **the
+list is exactly the set checkout will accept** — a screen built from it
+cannot offer a pack the server then refuses.
+
+**An empty `packs` array is a real answer, not an error.** The platform
+seeds no pack, deliberately: what a credit costs is a business decision
+and a made-up default would be a wrong price shipped quietly. Until an
+operator configures one, credits are unbuyable and every checkout
+answers `pack_not_buyable`.
+
+#### POST /billing/credits/checkout
+
+**Auth:** Owner on `app_tid`. **Body:** `{app_tid, pack_id, provider?,
+idem_key?}`.
+
+**The buyer no longer prices their own purchase.** `credit_amount`,
+`amount_cents` and `currency` are **not accepted** — both the quantity
+and the price come from the `credit_packs` row named by `pack_id`, and
+both are snapshotted onto the order, so a later price edit cannot
+retro-change an order already placed. An unknown, inactive or
+out-of-window pack is **400** `pack_not_buyable`.
+
+> **`pack_id` is required and has no default, and an old client fails
+> loudly on purpose.** A request still carrying the retired
+> `{credit_amount, amount_cents}` body is rejected during JSON
+> deserialisation — *before* the handler runs — rather than falling
+> through to pack 0 or to the caller's own price.
+>
+> That rejection is **not a platform envelope**. It is the framework's
+> own **HTTP 422** with a `text/plain` body
+> (`Failed to deserialize the JSON body into the target type: missing
+> field \`pack_id\``): no `result`, no `code`, no `msg`, no
+> `timestamp`. It looks like no other error in this document, and a
+> client that parses every response as JSON will fail on the parse
+> rather than on the field. Handle a non-JSON 422 as "my request body is
+> the wrong shape".
+
+**Response `data`:** `{order_ref, credit_amount, amount_cents, pack_id,
+currency, provider, status:"pending"}`.
+
+**Replaying an `idem_key` returns a narrower object.** The idempotent
+branch answers `{order_ref, credit_amount, amount_cents, pack_id,
+provider, status, idempotent:true}` — it gains `idempotent` and, unlike
+every other checkout in this section, **omits `currency`**. Do not read
+`currency` unconditionally off this endpoint; fall back to
+`money.currency` from [`/billing/catalog`](#get-billingcatalog) when the
+replay branch fired.
+
+#### POST /billing/credits/ledger
+
+**Auth:** Owner on `app_tid`. **Body:** `{app_tid, before_id?, limit?}`
+— `limit` clamps to 1..=200, default 50. Page backwards with
+`before_id`.
+
+**Response `data`:** `{entries:[{id, delta, reason, ref, balance_after,
+created_at}], has_more}`.
+
+- `delta` is signed. `reason` is **never null** — the server substitutes
+  `"unknown"` rather than emit a hole — while `ref` *is* nullable.
+- **`balance_after` is returned as stored, never recomputed.** It is the
+  balance the platform recorded at the time of the entry, so a ledger
+  that does not sum to the current balance is evidence of a real
+  discrepancy rather than a rendering artefact. Do not "fix" it by
+  re-accumulating `delta` client-side; that would hide exactly the fault
+  the column exists to expose.
+- `has_more` is a heuristic on the id floor, not a lookahead — it can
+  read `true` on a page that turns out to be the last one. Treat an
+  empty next page as the end.
 
 ### App-creation rights
 
@@ -3008,10 +4321,20 @@ actually held, and any shortfall is reported rather than hidden.
 
 A parallel, token-based way to grant a capability without an ACL edit.
 
-| Endpoint | Auth | Body |
-|---|---|---|
-| `POST /service/list` | Authenticated | lists services visible to the caller |
-| `POST /service/redeem` | Authenticated **plus** ownership of the subject: a `user`-subject token must be your own account; an `app`-subject token needs **Owner** on that app | `{token}` |
+| Endpoint | Auth | Body | Returns |
+|---|---|---|---|
+| `POST /service/list` | Authenticated | `{}` — a JSON body is required to parse, its contents are ignored | `data` is a **bare array** of `{id, name, subject_kinds[], plans[]}` for active services |
+| `POST /service/redeem` | Authenticated **plus** ownership of the subject: a `user`-subject token must be your own account; an `app`-subject token needs **Owner** on that app | `{token}` | `data: {service_id, plan, subject_type, subject_id}` |
+
+On `/service/list`, `plans[]` is a sorted array of plan names (strings),
+not plan objects — for prices and features use
+[`/billing/catalog`](#get-billingcatalog).
+
+**Both answer a missing session unusually.** Instead of the 401
+`isSignout` envelope, they return **HTTP 200**
+`{"isSignout": true, "result": false}` — note `result` is **false**
+here, where the other wire-compat handlers send `true`. Branch on
+`isSignout`, not on the status and not on `result`.
 
 Redemption never trusts the identity inside the token — authorization is
 re-derived from the authenticated caller. Codes:
@@ -3097,12 +4420,49 @@ ids where it configured them, instead of the platform-global ones.
 
 **Response:**
 ```json
-{ "test_subdomain_base":  "...",
-  "google_client_id":     "...",
-  "microsoft_client_id":  "...",
-  "telegram_bot_username":"...",
-  "sso_authority_host":   "..." }
+{ "test_subdomain_base":     "...",
+  "google_client_id":        "...",
+  "google_allowed_origins":  ["https://app.example.com"],
+  "microsoft_client_id":     "...",
+  "telegram_bot_username":   "...",
+  "sso_authority_host":      "...",
+  "turnstile_enabled":       false,
+  "turnstile_site_key":      null }
 ```
+
+Every field except `google_allowed_origins` and `turnstile_enabled` may
+be `null` when the operator has not configured it.
+`google_allowed_origins` is always an array (possibly empty);
+`turnstile_enabled` is always a boolean. Note the two Turnstile fields
+are independent: `turnstile_enabled` can be `true` while
+`turnstile_site_key` is `null` on a half-configured cell, and you cannot
+render the widget in that state.
+
+> **`google_allowed_origins` exists so a sign-in page can refuse to
+> offer a button that will fail.** Google enforces its own per-client
+> origin allowlist. A host that is not on it renders the Google button
+> perfectly, reports itself ready, and then answers **403 on click** —
+> the failure arrives from Google, not from tfl5, so no platform error
+> code and no platform status will tell you about it. There is nothing
+> the server can reject on your behalf.
+>
+> Use the list the way the platform's own sign-in page does: if it is
+> non-empty and the current origin is not in it, mark Google
+> **unavailable** and point the user at an origin that works, rather
+> than rendering a button that 403s.
+>
+> The case that hits this hardest is multi-tenant test hosts. Every app
+> gets `<app_tid>.<test_subdomain_base>`, which is a distinct origin per
+> app and therefore needs to be covered by the operator's allowlist —
+> one entry per app, or a wildcard the provider accepts.
+>
+> The values are normalised on the way out: lower-cased, trailing
+> slashes stripped, empties dropped. Compare against a
+> similarly-normalised origin. And note the array is forced **empty**
+> when you passed an `app_tid` whose app brought its own
+> `google_client_id` — the operator's list does not apply to somebody
+> else's OAuth client, so an empty array there means "not applicable",
+> not "no restriction".
 
 ### GET /platform/version
 
@@ -3243,21 +4603,28 @@ therefore **HTTP 400**; the rest are handler-authored HTTP 200 envelopes
 | `password_required` / `owns_apps` / `no_pending_erasure` | 400 | `/user/data/erase*` |
 | `twofa_not_enrolled` / `twofa_not_confirmed` / `twofa_invalid` / `twofa_already_confirmed` | 400 | `/user/2fa/*` |
 | `twofa_locked`                  | 429  | `/user/2fa/verify` after 5 failures in 15 min |
-| `quota_exceeded`                | 200  | `/app/update` create — no app-creation rights left |
+| `quota_exceeded`                | **402** | `/app/update` create — the account's app allowance is spent. `data.cap` is `app_create_rights` (`{rights, created, remaining, refundable_on_delete:false}`) or `user_max_apps` (`{max, used, refundable_on_delete:true}`) |
 | `app_update_no_acl_fields` / `app_update_no_nested_acls` | 400 | ACL fields sent to `/app/update` |
 | `acl_array_too_large`           | 200  | ACL array over 5000 entries |
-| `unknown_acl_bucket`            | 200  | `/app/acl/set` `/revoke` bad bucket name |
-| `owner_protected`               | 200  | `/app/member/remove` on the app author |
+| `unknown_acl_bucket`            | 200  | `/app/acl/set` · `/revoke` bad bucket name. **Not raised by `/app/acl/bulk-import`** — there an unknown key is silently dropped and the call answers `result:true`; verify with `/app/acl/list` |
+| `acl_token_unknown`             | 200  | an ACL entry that names nobody — no user, role or group resolves it. Carries `unknown[]` listing the offenders. Only entries the call **adds** are checked, so an array already holding historical junk still saves; `G_author` and empty strings are skipped |
+| `user_not_found`                | 200  | `/app/member/set-direct-grants` **granting** to a tid/username that does not exist. Revokes deliberately skip the check, so a deleted account's access can still be stripped |
+| `query_too_short`               | 200  | `/app/member/search` with fewer than 2 characters after trimming |
+| `owner_protected`               | **409** | `/app/member/remove` on the app author — a state to change (transfer ownership), not a permission to be granted |
 | `config_patch_empty` / `config_too_large` | 400 / 200 | `/app/config/patch` |
-| `quota_app_max_storage`         | 400  | file upload/save — app or owner storage cap |
+| `quota_app_max_storage`         | 400  | app or owner storage cap — `/app/file/upload` · `/save` **and `/app/f3/upload`**, which charges ciphertext bytes. One code for both caps; only `msg` says which |
+| `file_write_shadowed_by_snapshot` | 409 / — | `/app/file/upload` · `/save` · `/del` · `/rename` writing to `release` while a site snapshot is live. Normally a `warnings[]` entry on a **successful** call; a 409 refusal only under `TFL5_REFUSE_SHADOWED_FILE_WRITE=1` |
 | `file_extension_not_allowed`    | 400  | upload/save — extension not on the allowlist |
-| `file_too_large`                | 400 / 200 | 400 on upload; 200 on `/app/file/get` over 10 MB |
-| `folder_not_empty`              | 200  | `/app/file/del` without `recursive: true` |
+| `file_too_large`                | 400 / 200 | one code, two different caps: **400** on a write over 50 MiB (52,428,800 B) — `/app/file/upload` · `/save` · `/app/site/put` · a bundle entry; **200** on `/app/file/get` over 10 MiB (10,485,760 B) |
+| `upload_request_too_large`      | 400  | the whole HTTP body exceeded its layer — 100 MiB (104,857,600 B) on `/app/file/upload`, 52 MiB (54,525,952 B) on `/app/bundle/upload`. No individual file broke its own cap |
+| `folder_not_empty`              | 200  | `/app/file/del` without `recursive: true`; carries `item_count` |
 | `pii_aggregate_only`            | 400  | aggregate-scope caller reading an individual row |
 | `bundle_version_invalid` / `bundle_version_exists` / `bundle_version_not_found` / `bundle_no_previous` / `bundle_invalid_zip` / `bundle_too_many_entries` / `bundle_too_large` / `bundle_decompress_failed` | 400 | `/app/bundle/*` |
+| `bundle_is_live` / `bundle_is_rollback_target` / `bundle_not_found` / `app_not_found` | 400 | `/app/bundle/delete` — the version is serving, is the rollback target, or does not exist |
 | `draft_disk_missing` / `no_previous_release` | 200 | `/app/release` `/rollback` guards |
 | `resource_not_found`            | 200  | bad `resource_tid` / `resource_ma` |
-| `resource_referenced_by_link` / `resource_not_deleted` | 400 / 200 | `/app/resource/del` · `/orphan-drop` |
+| `resource_referenced_by_link`   | 400  | `/app/resource/del` — a live `link`/`multilink` field points at it |
+| `resource_not_deleted`          | **409** | `/app/resource/orphan-drop` on a live resource — soft-delete it first |
 | `field_validation_failed`       | 400  | a schema validator rejected the value |
 | `link_resource_not_found` / `link_target_not_found` | 400 | a `link`/`multilink` value points nowhere |
 | `hook_validation_failed`        | 400  | a declared `require_fields` hook rejected the payload |
@@ -3277,6 +4644,11 @@ therefore **HTTP 400**; the rest are handler-authored HTTP 200 envelopes
 | `signed_url_invalid`            | 403  | `GET /_signed/:token` bad signature |
 | `public_form_not_configured` / `public_form_unknown_field` / `public_form_field_required` / `public_form_field_too_long` / `public_form_field_invalid_email` / `public_form_too_many_fields` / `public_form_rate_limited` / `public_form_quota_full` / `public_form_schema_invalid` / `public_form_scope_attrs_invalid` | 400 | public forms |
 | `chat_room_required` / `chat_room_level_invalid` / `chat_room_scope_attrs_invalid` | 400 | chat room config |
+| `email_dkim_not_configured`     | 400  | `/app/email/send` — the `from_domain` you named has no DKIM key on this app (or you named none and the app has no key at all) |
+| `email_invalid_recipient`       | 400  | `/app/email/send` — a `to[]` entry is not a valid address |
+| `domain_quota_reached`          | **402** | `/app/domain/preview` · `/add` — `licenses.domain_max_per_app` is spent. A hard status on purpose: answering 200 here let an automated pipeline read "fine" and go on to make a DNS change that could never work |
+| `quota_reached`                 | 200  | `/app/domain/preview` · `/add` — a *delegation* grant's `max_subs` is spent, not the app's own cap. Remediable by asking the parent owner. On `/app/domain/request` the same condition degrades to a 400 `bad_request` and this code is dropped |
+| `private_needs_request`         | 200  | `/app/domain/preview` · `/add` under a `private` parent with no whitelist entry — the entry point to [bind requests](#bind-requests-asking-a-parent-owner-for-permission) |
 | `license_tier_required`         | 200  | operator/WASM tier too low |
 | `tier_not_found` / `bad_target` / `missing_app_tid` | 200 | `/licenses/preview-upgrade` |
 | `not_first_user` / `no_self_service_tier` / `license_tier_not_self_service` | 200 | `/licenses/setup-tenant` |
@@ -3288,6 +4660,8 @@ therefore **HTTP 400**; the rest are handler-authored HTTP 200 envelopes
 | `durable_disabled` / `projections_disabled` | 200 | durable subsystem switched off |
 | `instance_busy` / `wrong_cell` / `wrong_cell_needs_idem` / `cell_forward_failed` / `instance_quota` / `tick_deadline` | 200 | durable message delivery |
 | `proj_keys_quota`               | 402  | `/ws/durable/subscribe` key quota |
+| `token_scope_denied`            | 403  | a service token whose `scopes` do not cover the request path; `data:{path, scopes}` |
+| `token_scope_unavailable`       | 503  | the scope gate could not read the token's scopes — fail-closed, retry |
 | `mtls_required`                 | 403  | operator endpoint reached on the wrong port |
 | `twofa_enrolment_required` / `twofa_required` | 403 | operator endpoints when the cell mandates 2FA |
 | `service_draining`              | 503  | node is draining |

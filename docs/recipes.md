@@ -101,7 +101,7 @@ codes are stable string prefixes: `doc.*`, `role.*`, `app.*`.
 - Hook firings live in `hook_invocations` (1 row per `after_*` run).
   Operator calls live in `op_invocations`. Query separately.
 
-**See also:** [acl-model.md §11](acl-model.md#11-audit--traceability),
+**See also:** [acl-model.md §13 Audit + traceability](acl-model.md#13-audit--traceability),
 [app-builder-guide.md §5.2 hooks](app-builder-guide.md#52-hooks-jsonb-array--declarative).
 
 ---
@@ -198,7 +198,7 @@ across all 200+ rows; removing them revokes. Zero doc updates.
 - Role cache invalidates automatically on edit; in-flight requests
   past the gate complete with the prior permission set.
 
-**See also:** [acl-model.md §6](acl-model.md#6-roles--the-indirection-that-makes-scaling-work),
+**See also:** [acl-model.md §8 Roles — the indirection that makes scaling work](acl-model.md#8-roles--the-indirection-that-makes-scaling-work),
 [api-reference.md POST /app/role/edit](api-reference.md#post-approleedit).
 
 ---
@@ -247,7 +247,7 @@ recipient never sees fields outside the list.
   full payload. Dot-paths work for nested keys (`payload.code`).
 - For ongoing access by a known user, prefer per-doc ACL (recipe #11).
 
-**See also:** [acl-model.md §8 Sharing](acl-model.md#8-acl-patching-endpoints),
+**See also:** [acl-model.md §10 ACL patching endpoints](acl-model.md#10-acl-patching-endpoints),
 [api-reference.md POST /app/share/create](api-reference.md#post-appsharecreate).
 
 ---
@@ -528,7 +528,7 @@ files, domains, share grants, operator configs.
   `errors[]`; the DB row is still removed. Ops sweep cleans up orphans.
 
 **See also:** [api-reference.md POST /app/del](api-reference.md#post-appdel),
-[acl-model.md §11](acl-model.md#11-audit--traceability).
+[acl-model.md §13 Audit + traceability](acl-model.md#13-audit--traceability).
 
 ---
 
@@ -569,7 +569,7 @@ still required to see the doc exists.
   membership may change (same scaling logic as recipe #4).
 
 **See also:** [acl-model.md §5](acl-model.md#5-per-row-acl--docs--files),
-[acl-model.md §8](acl-model.md#8-acl-patching-endpoints),
+[acl-model.md §10 ACL patching endpoints](acl-model.md#10-acl-patching-endpoints),
 [api-reference.md POST /app/doc/acl-set](api-reference.md#post-appdocacl-set).
 
 ---
@@ -627,10 +627,12 @@ atomically swaps them, snapshotting the outgoing release as a
 timestamped backup.
 
 **Quotas + lifecycle:**
-- Test stage cap: **50 MB per app** (separate from release quota).
+- Test stage cap: **52,428,800 B (50 MiB) per app** (separate from
+  the release quota) — `config.rs` `default_test_storage_cap`.
 - Test stage TTL: **14 days idle** — sweeper auto-clears
   (`auto_delete_at`).
-- File-extension allowlist + 10 MB per-file cap apply to both stages.
+- File-extension allowlist + **52,428,800 B (50 MiB)** per-file cap
+  apply to both stages (`file/mod.rs:84` `MAX_UPLOAD_BYTES`).
 - Release stage consumes the app's licensed `app_max_storage`.
 
 **Gotchas:**
@@ -695,8 +697,12 @@ serving:
 
 - **Live snapshot is serving** → author through `/app/site/put` +
   `/app/site/publish` (or the no-code builder / code editor UI), or
-  `/app/site/rollback` off the snapshot entirely if you want to fall
-  through to the tiers below.
+  `/app/site/rollback` to re-point `apps.live_snapshot` at an older
+  snapshot. There is **no way to fall back through to the tiers
+  below**: no route ever NULLs `live_snapshot` — `rollback` only
+  re-points it. Rollback also refuses the app's own draft as a
+  target, naming `/app/site/publish` or `/app/site/history` as the
+  way out (a DB CHECK constraint backs the same invariant).
 - **Bundle is serving** → ship a new bundle version and
   `/app/bundle/activate` it, or `/app/bundle/rollback` /
   `/app/bundle/unpublish` to stop using bundles for this app.
@@ -708,9 +714,16 @@ serving:
   refresh before suspecting the platform.
 
 **Gotchas:**
-- Uploading to a shadowed tier isn't rejected or warned about — the
-  write succeeds, it's just invisible. There's no "you have 3 tiers
-  active" banner; use the diagnosis calls above.
+- Uploading to a shadowed tier **is** reported now. `/app/file/upload`,
+  `/app/file/save`, `/app/file/del` and `/app/file/rename` return an
+  additive top-level `warnings: [{code, msg, live_snapshot}]` with code
+  `file_write_shadowed_by_snapshot` whenever `stage=release` and the
+  app has a live snapshot, and the same condition refuses with **HTTP
+  409** under `TFL5_REFUSE_SHADOWED_FILE_WRITE=1`. The array is omitted
+  when empty, so a client that never reads `warnings` sees exactly what
+  it saw before — which is the trap: a CI job wired that way still
+  ships nothing, silently. There's still no "you have 3 tiers active"
+  banner; use the diagnosis calls above.
 - A brand-new app with no site/bundle/release activity ever configured
   is always on tier 4 (legacy `public/`) — this recipe mostly matters
   for apps that have used the visual builder, the code editor, or a

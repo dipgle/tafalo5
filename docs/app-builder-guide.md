@@ -187,8 +187,12 @@ POST /app/update      (no tid → create mode)
 ```
 
 You become the app's `author` (immutable owner) and Manager. Your
-license tier defaults to `demo` (1 app, 5MB content cap, 10MB total
-quota). Upgrade via `/app/upgrade-license`.
+license tier defaults to `demo` (1 app, **52,428,800 B (50 MiB) per
+app**, **52,428,800 B account total**). Both numbers were raised to
+match the per-file upload cap exactly, on both the entitlement plan
+and the legacy `licenses` fallback — before that a file at the
+advertised size did not fit an empty free app. Upgrade via
+`/app/upgrade-license`.
 
 ### Step 3 — author your static FE
 
@@ -255,8 +259,9 @@ here, that's almost always why.
 Allowlist (both paths): `html htm css js mjs map json png jpg jpeg gif
 webp avif svg ico woff woff2 ttf otf txt xml md` (plus `csv xlsx docx`
 and a small set of binary types for downloadable assets: `sqlite db bin
-wasm zip tar gz`). Hard caps: **10MB per file**, **license-tier
-dependent total quota**.
+wasm zip tar gz`). Hard caps: **52,428,800 B (50 MiB) per file**
+(`file/mod.rs:84` `MAX_UPLOAD_BYTES`), **license-tier dependent total
+quota**.
 
 ### Step 4 — bind a domain
 
@@ -447,10 +452,28 @@ external service does it.
 ### 5.3 ACL arrays on a resource
 
 When you create a resource you implicitly become its author. The
-resource itself has 7 ACL arrays inherited from the app's defaults
-(see [acl-model.md](acl-model.md)). Patch them as you would the
-app's: `/app/acl-set` works on the app row; resource-level
-fine-grained edits live on the *doc* row, not the resource.
+`resources` row carries **7 ACL arrays** of its own — `managers`,
+`designers`, `authors`, `editors`, `readers`, `deletable`, `noaccess`
+(see [acl-model.md](acl-model.md)).
+
+Three levels, three different rows, three different endpoints. Mixing
+them up is the most common way to "set the ACL" and change nothing:
+
+| Level | Row | Written by |
+|---|---|---|
+| **L1 — app** | `apps` | `/app/acl-set` (replaces the buckets you supply, preserves the ones you omit) or `/app/acl/{set,revoke,bulk-import}` for incremental edits |
+| **L2 — resource type** | `resources` | `/app/resource/create` and `/app/resource/update` — **there is no `/app/resource/acl-set`** |
+| **L3 — one document** | `docs` | `/app/doc/acl-set` |
+
+⚠ Two traps on L2. The create/update bodies accept only **four** of the
+seven arrays — `readers`, `editors`, `noaccess`, `deletable`; the other
+three are returned by `/app/resource/get` but those request bodies do
+not take them. And `/app/resource/get` returns every ACL array as `[]`
+to a caller without control-plane visibility, so an empty array there
+means "you cannot see it", not "nobody is listed".
+
+In the SDK, L2 is `tfl5.resource(ma).setResourceAcl({...})`, which posts
+`/app/resource/update` underneath.
 
 ---
 
@@ -495,9 +518,22 @@ Be honest with yourself about these before you design:
   runs in a fuel/memory/time-bounded sandbox, either as a doc-lifecycle
   hook (`"type":"wasm"`) or an HTTP `/op/<id>/<action>` endpoint. Data
   access runs **as the calling user's ACL** — a module can never exceed
-  what the caller may see/edit. Full reference: api-reference.md
-  §Operators → "WASM operators". (Embedded JS/Lua `eval` is intentionally
-  NOT offered — WASM is the one sandboxed code lane.)
+  what the caller may see/edit, and a denied read comes back as an EMPTY
+  ARRAY rather than an error, so "empty" never proves "no such rows".
+  Full reference: wasm-operator-abi.md (the guest↔host contract).
+- **Per-resource JavaScript hooks** (QuickJS) — **SHIPPED**, and a second
+  sandboxed code lane alongside WASM. Code lives in the resource's own
+  `before_create_code` / `after_create_code` / `before_update_code` /
+  `after_update_code` columns and runs bounded to **100 ms** wall time and
+  a **16 MiB** heap (`crates/operators/src/js_hooks/mod.rs`,
+  `MAX_WALL_MS` / `MAX_HEAP_BYTES`). A *before* hook may rewrite the
+  payload or reject the write — the refusal arrives as the static
+  `code: "hook_reject"` with your own tag folded into `msg` as
+  `[<tag>] …`, so branch on the code and display the tag. An *after* hook
+  is fire-and-forget: its errors are logged and never fail the response,
+  and its mutations are deliberately not persisted. ⚠ Only those four
+  events are wired — a before-hook on any other event (e.g. `before_del`)
+  is silently inert.
 - **Marketplace / app catalog** — designed in vision, not built.
   Single-tenant deploys for now.
 - **Aggregate / GROUP BY queries** — `/app/doc/list` returns rows.

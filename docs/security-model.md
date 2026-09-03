@@ -21,6 +21,14 @@ hostile input:
 - Client-side "hide the button" logic is **UX only**, never a security control.
   If a field must be hidden from a role, hide it on the server (encryption level /
   scope PII level), not just in the SPA.
+- **A machine credential gets the same four layers, plus one fence of its own.** A
+  service token authenticates *as its bound user*, so that user's ACL is its
+  ceiling — and its `scopes` list, when it holds path prefixes, narrows it below
+  that ceiling before any handler runs. Two grandfather clauses mean a `scopes`
+  list is not automatically a restriction: an empty list is unrestricted, and so
+  is a list the gate cannot evaluate. **"My token has scopes" is not the same
+  claim as "my token is restricted"** — see [acl-model.md §14](acl-model.md)
+  before you describe a credential as limited.
 
 **Takeaway:** you can build a UI that trusts the server's answers; you cannot build
 security by trusting the client.
@@ -152,23 +160,81 @@ stating a reason. Refused attempts are logged too.
 
 ## 6. Auditing & traceability
 
-Every meaningful mutation writes a row to the platform audit log, with a
-**server-resolved** actor (not client-supplied) and timestamp. Two read surfaces:
+Mutations write a row to the platform audit log with a **server-resolved** actor
+(not client-supplied) and timestamp — but the coverage is not uniform, and
+promising a customer "every change is logged" overstates it. Role CRUD writes no
+row at all, doc writes are logged only for resources that opt in, and the
+`/app/member/*` mutations are recorded against the *user* rather than the app, so
+they never appear in the tenant feed below. The coverage table is in
+[acl-model.md §13](acl-model.md); read it before you write an audit claim into a
+contract.
+
+**Refusals are recorded, not just successes.** A permission check that turns an
+identified caller away writes its own row — `result: "failure"`, and a detail
+field naming the level the caller *lacked*. So an app owner can see who probed
+them, which is a capability worth telling your customers about. It applies only
+to callers who are somebody (valid session, live non-banned user, existing app):
+anonymous and expired callers fail earlier and are deliberately not recorded,
+because one row per unauthenticated poll would drown the table the owner is meant
+to read. No IP address is stored — at that layer the only address available is a
+spoofable header, and a forgeable IP in an audit row is worse than none.
+Details, including how to filter for these rows, in
+[acl-model.md §13](acl-model.md).
+
+Two read surfaces:
 
 - `POST /app/audit/list` — the **per-app** feed, gated on Manager of that
   `app_tid`. The authorised tid is also the query scope, so there is no way to read
-  another app's audit through it. Payload bodies are omitted unless you ask for
-  `include_payload`, and the window is capped at 90 days per call.
+  another app's audit through it. **It is not app-rows-only:** child-resource
+  events (docs, resources, files, folders, app sources) are included, resolved by
+  joining each child's own `app_tid` column rather than trusting an `app_tid` in
+  the payload — which a caller could otherwise forge to inject rows into another
+  app's forensic record. Rows for deleted children stay visible on purpose.
+  Payload bodies are omitted unless you ask for `include_payload`, and the window
+  is capped at 90 days per call.
 - `POST /admin/audit/{list,get,summary}` — the platform-wide view, platform-admin
   only.
 
-Two more tables complete the picture: PII reads on `/app/doc/{list,get}` write a
-row to the PII access log when scope is enforced (one row per *request*, carrying
-`row_count` — not one row per record returned), and F3 attachment opens write their
-own access-log row, readable via `/app/f3/access-log`. Both writes are
-**best-effort**: a failure is logged and the request still succeeds, so the access
-log is evidence, not a hard gate. Ordinary `/app/file/*` downloads do **not** write
-a PII access-log row.
+Three more tables complete the picture:
+
+- **The PII access log.** Reads on `/app/doc/{list,get}` write a row when scope is
+  enforced — one row per *request*, carrying `row_count`, **not** one row per
+  record returned. Ordinary `/app/file/*` downloads do **not** write one.
+- **The F3 attachment access log.** Attachment opens write their own row, readable
+  via `/app/f3/access-log` (Manager).
+- **The identity access log**, and this one is **not success-only.** When somebody
+  resolves another user's identity facets (`/user/identity/resolve`), disclosures
+  are recorded — and so is the specific shape *"this subject disclosed **nothing**
+  to this viewer"*, written as `action: "deny"`, `granted: false`. That is the
+  shape of being looked up by someone holding no grant at all, and it is the event
+  the subject is owed. The log is read by the **subject**, over their own rows
+  only, via `POST /user/identity/access-log`.
+
+  Three deliberate silences, each of which you must not read as "nobody looked":
+
+  - A **partial** refusal is not logged. A viewer holding a grant for `avatar` who
+    asks for `[avatar, display_name]` and gets one of them is what every ordinary
+    render of a user list looks like; recording it would write a denial row per
+    render and push the probes worth seeing off a log that returns at most 200
+    rows.
+  - A facet the subject simply never **set** is not a denial — an absent avatar is
+    not an access decision.
+  - **Nothing at all is written about a subject who has requested erasure.**
+    Erasure means no new personal data about them, and a row naming who looked
+    them up is exactly that. (A banned-but-present subject *is* still logged — they
+    exist, and the refusal is a fact about their account.) A viewer who looks
+    themselves up is not logged either.
+
+  Unlike the permission-refusal rows above, these carry a client IP and user
+  agent — this layer has an actual socket peer, not a caller-supplied header. Read
+  it as the connecting address: behind a reverse proxy that is the proxy, so
+  confirm your edge setup before treating it as the end user's IP.
+
+All of these writes are **best-effort**: a failure is logged and warned about, and
+the request still succeeds, so an access log is evidence rather than a hard gate.
+An identity disclosure has already happened by the time its log write runs —
+failing the request would only make the caller retry and disclose again — so a
+failed write is surfaced as a warning naming the viewer, never swallowed.
 
 ### Tamper-evidence: a signed hash-chain (and exactly what it proves)
 
@@ -244,21 +310,71 @@ your own template bugs.
 
 ---
 
-## 8. Published site content is public by contract
+## 8. Published site content — public by DEFAULT, and the two tiers differ
 
-When you publish a site through the content-addressed engine
-(`/app/site/*`, see [README](README.md)), the served bytes are **public**. The
-`/app/site/*` authoring endpoints are Manager-gated, and the in-editor
-`/app/site/preview` of an unpublished draft is Manager-gated — but once a snapshot
-is live, the serve path resolves `path → entry → blob` and returns the bytes with
-no per-file permission check. The schema reserves a per-entry ACL field, but
-**nothing populates or enforces it today**.
+The `/app/site/*` authoring endpoints are Manager-gated, and the in-editor
+`/app/site/preview` of an unpublished draft is Manager-gated. What happens once a
+snapshot is **live** depends on which serve tier answers, and the two are not the
+same contract:
 
-Practical rule: **never put a secret in a published site file.** Anything that must
-be access-controlled belongs in a doc (`/app/doc/*`, four ACL layers), a file with
-per-row ACL (`/app/file/*`), or an F3 attachment (§4) — not in the site bundle.
-This is the same contract the older bundle publish path had; the versioning engine
-did not change it.
+| Serve tier | Per-file ACL on the serve path? |
+|---|---|
+| **Snapshot** (content-addressed engine, `/app/site/*`) | **Yes** — enforced |
+| **Bundle** (the older publish path) | **No** — public by contract |
+
+**The snapshot tier does enforce per-file ACL.** It runs the same `files`-row
+evaluator the disk and object-storage tiers use, and it has to: this tier has the
+**highest** priority and short-circuits every other one, so an ACL it skipped
+would be an ACL that publishing silently removed. Three properties are worth
+knowing:
+
+- **The ACL is read LIVE, not frozen into the snapshot.** Revoking access takes
+  effect without republishing, and rolling back to an older snapshot still honours
+  today's ACL. The snapshot stores bytes; the `files` row keyed
+  `(app_tid, stage, path)` stores who may read them.
+- **The Release row is always consulted, on either stage.** On the sandbox/test
+  host the test-stage row is consulted *as well*, and **either verdict can deny** —
+  so the sandbox is never more permissive than whichever stage restricts the file.
+- **A denial is a 404**, not a 403 — the gate does not confirm that the path
+  exists.
+
+⚠ **"Enforced" is not "default-deny".** The evaluator allows when there is **no
+`files` row** and allows when the row's arrays are **all empty**. Fencing a
+published file is therefore opt-in: you get privacy by *setting* an ACL on it, and
+a file nobody ever ACL'd is public. Anonymous callers carry an empty permission
+set, so a file that *does* carry a positive ACL fails closed against them.
+
+🚨 **Known gap — an orphaned entry is served.** An entry still present in the
+snapshot whose `files` row has since been **deleted** falls into the evaluator's
+legacy "no row → allow" branch and **is served**. It is deliberately scoped out in
+the platform's own backlog, not an oversight you have found. So deleting the
+`files` row is *not* a way to un-publish a byte: republish the snapshot without the
+entry, or give the row a restrictive ACL instead of removing it.
+
+Two further carve-outs, both intentional: the app's own **error page** is served
+*before* the ACL gate (gating it would answer a bare 404 to exactly the visitors it
+was written for), and the **bundle** tier consults no `files` ACL at all, because a
+bundle is the front-end the tenant ships to its users — app code, not user data.
+
+⚠ **The six ACL columns on `snapshot_entries` are dead — do not build on them.**
+They are always `NULL`: the only writer is the draft-seeding copy, so what
+propagates is `NULL → NULL`, and nothing ever populates them. The migration that
+adds them reads as though snapshots carry their own ACL; they do not. The live
+`files` row is the only thing the gate consults.
+
+> **Provenance, stated honestly:** the above is documented from the serve path as
+> implemented. The commit that introduced this gate ships a self-declared
+> `NOT BUILT` footer — its author recorded that build, clippy and both new tests
+> had never run and that the red leg (revert the gate, watch the anonymous-404 leg
+> fail) was never done. The tests are present in the tree today, but **treat this
+> behaviour as read-from-code, not as test-pinned**, and verify it on your own cell
+> before you rely on it for a compliance claim.
+
+Practical rule, unchanged in spirit: **do not put a secret in a published site
+file.** The snapshot tier will fence a file you explicitly ACL, but the default is
+open, the orphaned-row gap is real, and the bundle tier does not fence at all.
+Anything that must be access-controlled belongs in a doc (`/app/doc/*`, four ACL
+layers), a file with per-row ACL (`/app/file/*`), or an F3 attachment (§4).
 
 ---
 
@@ -280,13 +396,14 @@ operator (§3).
 ## 10. Things that are OFF unless the operator turns them on
 
 Do not assume a subsystem is live just because its endpoints exist in the API
-reference. Three defaults worth knowing when you scope a project:
+reference. Four defaults worth knowing when you scope a project:
 
 | Subsystem | Default | Turned on by |
 |---|---|---|
 | Row-level [scope](scope.md) enforcement | **off** | `TFL5_ENFORCE_SCOPE` on the cell, *and* a per-app `field_map` |
 | Durable operator subsystem | **off** | `TFL5_DURABLE_ENABLED`; every durable endpoint returns "not enabled on this deployment" until then |
 | Payment providers | **off** | a provider is registered only if its webhook secret is in the environment; an unconfigured provider is indistinguishable from a 404 |
+| **Doc-write audit rows** | **off** | `audit_writes` on the resource, set through `/app/resource/{create,update}`. Nothing warns you it is off; the writes simply leave no trace (§6) |
 
 The pattern is deliberate — a new subsystem is opt-in, never on by default. Ask
 your operator which are enabled on the cell you're deploying to, and don't design a
@@ -307,12 +424,25 @@ security control around scope until you've confirmed it enforces (see
 - ⚠ "Tamper-proof audit trail" — it is **signed and tamper-evident** (§6), which
   detects edits by anyone without the operator's key. It is **not** operator-proof
   and not yet anchored off-box; don't market it as an immutable ledger.
+- ⚠ "Every change is logged" — **partial**, and the gaps are in the places people
+  assume are covered: role CRUD writes no row, doc writes are opt-in per resource,
+  and membership changes do not reach the tenant feed (§6 →
+  [acl-model.md §13](acl-model.md)). Refusals, by contrast, *are* recorded — an
+  app owner can see who probed them, and a user can see who was refused their
+  identity details.
+- ⚠ "Our API tokens are locked to one job" — **only if their scopes are path
+  prefixes.** An empty scope list, or a list of dot-named labels, leaves the token
+  with everything its user can reach (§1 → [acl-model.md §14](acl-model.md)).
 - ❌ "The platform / the vendor cannot read this" — **false** unless you do
   client-side E2E yourself.
 - ❌ "End-to-end / zero-knowledge encrypted" — **false** for platform-side
   encryption. Only your own client-side E2E earns that phrase.
-- ❌ "Files on our published site are private" — **false**. Published site content
-  has no per-file ACL (§8).
+- ⚠ "Files on our published site are private" — **only if you ACL'd them, and
+  only on the snapshot tier.** That tier does enforce per-file ACL against the live
+  `files` row; but the default is open (no row, or an empty ACL, both allow), an
+  entry whose `files` row was deleted is still served, and the older bundle tier
+  fences nothing. Don't promise this for a site as a whole — promise it per file
+  you have explicitly restricted and verified (§8).
 
 When in doubt, describe it as **"custodial, encrypted at rest, with a
 tamper-evident audit log"** — accurate, and it won't come back to bite you in a

@@ -83,10 +83,12 @@ surrounding primitives:
 
 | Platform primitive | Endpoints | SDK surface |
 |---|---|---|
-| `apps` (spine root) + 7-array ACL + members | `/app/update` `/app/get` `/app/list` `/app/acl-set` `/app/member/*` | `tfl5.apps` |
+| `apps` (spine root) + six-array ACL + members | `/app/update` `/app/get` `/app/list` `/app/acl-set` `/app/member/*` | `tfl5.apps` |
 | `roles` (per-app) | `/app/role/*` `/app/roles/list` | `tfl5.roles` |
 | `groups` (global) | `/admin/group/*` | `tfl5.groups` |
-| `resources` + `docs` | `/app/resource/*` `/app/doc/*` | `tfl5.resource(ma)` |
+| incremental ACL + membership admin (avoids the read-splice-post race of a whole-bucket write; bucket writes are priced by the ladder, so touching `managers` costs Owner, and `set-direct-grants` has **no Manager floor**) | `/app/acl/*` `/app/member/*` | `tfl5.access` |
+| per-tenant audit feed (**Manager**; coverage is bounded — member changes and role CRUD do **not** appear, see [acl-model.md](acl-model.md)) | `/app/audit/list` | `tfl5.audit` |
+| `resources` + `docs` | `/app/resource/*` `/app/doc/*` | `tfl5.resource(ma)`, `tfl5.createResource()` |
 | declarative hooks | `resources.hooks` | `tfl5.resource(ma).hooks` |
 | field-level encryption (level 0/1/2) | transparent — server splits `data_indexed`/`data_secret` | — you always read/write plain field values |
 | row-level scope | `/app/scope/*` | `tfl5.scope` |
@@ -97,28 +99,48 @@ surrounding primitives:
 | per-doc shares + link claim | `/app/share/*` | `tfl5.shares` |
 | signed inbound data channels | `/app/source/*` | `tfl5.sources` |
 | auth (cookie + bearer) + PDPD rights | `/login` `/logout` `/reg` `/user` `/auth/*` `/user/data/*` | `tfl5.auth` |
+| content-addressed site engine (draft → snapshot → publish/rollback) | `/app/site/*` | `tfl5.site` |
+| legacy versioned FE bundles | `/app/bundle/*` | `tfl5.bundles` |
+| custom domains + subdomain delegation | `/app/domain/*` | `tfl5.domains` |
+| oldest publish tier: test→release promotion + test-stage quota | `/app/release*` `/app/test/*` | `tfl5.stages` |
+| anonymous public-form submit + Designer/Manager admin | `/app/public-form/submit` `/admin/public-form/*` | `tfl5.publicForms` |
+| per-doc encrypted file vault (record-bound, distinct from `tfl5.files`) | `/app/f3/*` | `tfl5.f3` |
+| per-app outbound mail + DKIM + inbox | `/app/email/*` | `tfl5.email` |
+| per-app chat (REST scrollback + live socket + room config) | `/app/chat/history` `/ws/chat` `/admin/chat/*-room-config` | `tfl5.chat` |
+| billing: catalog, checkout, plan changes, prepaid credits, invoices, legacy per-tier licenses | `/billing/*` `/license*` | `tfl5.billing` |
+| the signed-in user's own account (profile, password, 2FA, multi-email) | `/user/*` `/user/2fa/*` | `tfl5.account` |
+| durable stateful actors (**default-OFF** — see §7) | `/durable/*` `/ws/durable/subscribe` | `tfl5.durable` |
 
 Anything not yet covered by a typed client: `tfl5.raw(path, body)` — a
 raw POST that still unwraps the `{result, data}` envelope and throws the
 same typed errors.
 
+`site`, `bundles` and `stages` are three publish tiers on the SAME app,
+resolved in that priority order at serve time: a live `site` snapshot
+shadows `bundles`, which shadows `stages`' legacy `public/` tree — and once
+an app has ever called `site.publish()`, the switch onto the snapshot tier
+is one-way for that app. See the module notes in `sdk/src/site.ts` and
+`sdk/src/deploy.ts` before wiring a publish flow onto more than one of
+these three.
+
 ### 4.1 Landing next (endpoint groups without a typed client yet)
 
-These endpoint groups are real and callable today via `tfl5.raw(...)` or
-plain `fetch`; typed SDK modules for them are being built out. Treat the
-names below as the REST surface they wrap, not as a preview of exact SDK
-method signatures — those may still shift before each module ships:
+Every endpoint group this section used to list here — site publishing,
+versioned bundles, F3 attachments, durable compute, email, billing,
+account, and chat — has since shipped a typed client; see the table above
+and their own sections below. What is left, genuinely uncovered by a typed
+client as of this write-up:
 
 | Area | Endpoints | What it's for |
 |---|---|---|
-| Site publishing | `/app/site/*` | The content-addressed draft → snapshot → publish/rollback engine behind the visual no-code builder and the in-browser code editor. See [app-builder-guide.md §2.1/§4](app-builder-guide.md#21-serving-precedence--read-this-before-you-upload-anything). |
-| Versioned code deploy | `/app/bundle/*` | Upload + activate a versioned FE build, with rollback. |
-| Per-doc encrypted attachments | `/app/f3/*` | Files bound to one doc's ACL and encryption key (distinct from the app-wide `tfl5.files`). |
-| Durable compute | `/durable/*`, `/ws/durable/subscribe` | The opt-in, **default-OFF** stateful/durable-execution operator — see [app-builder-guide.md §7](app-builder-guide.md#7-what-tfl5-does-not-give-you). |
-| Per-app email | `/app/email/*` | Send via the platform's mail service, list sends/inbox, DKIM + DNS record setup. |
-| Billing | `/billing/*` | The public pricing catalog, checkout, and provider webhooks. |
-| Account | `/user/*` (profile, 2FA, email management) | Broader account management alongside the PDPD rights already in `tfl5.auth` today. |
-| Realtime chat | `/ws/chat`, `/app/chat/history` | The first-party, Reader-gated, room-scoped WebSocket chat primitive. |
+| Telegram / VNeID sign-in | `/auth/telegram/*`, `/auth/vneid/*` | Alternative login providers alongside the magic-link/phone/QR/Google/Microsoft methods `tfl5.auth` already wraps — real and callable, just not typed yet. |
+| Chat moderation console | `/admin/chat/delete-message`, `/admin/chat/list-messages` | Per-message Manager operator actions. Deliberately left unwrapped (no shape trap worth a client for these two) — the room-*config* pair (`tfl5.chat.getRoomConfig`/`setRoomConfig`/`removeRoomConfig`) IS wrapped, because that write is destructive by omission. |
+
+Reach either with `tfl5.raw(path, body)` under a session with the right
+permission level. (A few other endpoint groups — `/billing/webhook/*`,
+`/billing/refund`, `/admin/license/*` — are deliberately **never**
+self-service; they're platform-admin/operator-only and stay reachable only
+via `raw()` under an operator session, not a roadmap gap.)
 
 ## 5. Docs & resources — `tfl5.resource(ma)`
 
@@ -171,9 +193,32 @@ Alternative sign-in methods all converge on the same session:
 await tfl5.auth.magicLink(email);                       // sends the email; always success-shaped
 await tfl5.auth.phoneStart(phone);                       // Zalo ZNS OTP
 const session = await tfl5.auth.phoneVerify(phone, otp);
-const { qr_id } = await tfl5.auth.qrStart();              // desktop shows a QR
-const session2 = await tfl5.auth.qrPoll(qr_id!);          // ...mobile approves it
 ```
+
+QR login is a start/poll pair, not one call, and `qrPoll()` never throws
+while you're merely waiting — it resolves on EVERY call (even
+`"expired"`/`"rejected"`), so branch on `.status` instead of relying on a
+throw to tell you when to stop:
+
+```ts
+const { session_id, approve_url } = await tfl5.auth.qrStart(); // render approve_url as a QR code
+
+for (;;) {
+  const poll = await tfl5.auth.qrPoll(session_id!);
+  if (poll.status === "consumed") break;         // signed in — poll.user names who
+  if (poll.status === "expired" || poll.status === "rejected") {
+    throw new Error(`QR login ${poll.status}`);  // start over with a fresh qrStart()
+  }
+  await new Promise((r) => setTimeout(r, 2000)); // still "pending" — poll again
+}
+```
+
+The field is `session_id`, not `qr_id` — the server (`auth_qr.rs`) has
+never had a `qr_id` field, so code built against the old `{ qr_id }` shape
+sent `qrPoll` a request missing its one required field on every call. The
+phone side can also back out of a session it scanned before approving it,
+with `tfl5.auth.qrReject(session_id)` — deliberately unauthenticated,
+since the phone that scans a QR code usually hasn't signed in yet.
 
 Google Sign-In needs Google's own script to render the button and run
 consent, so it's a separate opt-in bundle rather than part of headless
@@ -196,6 +241,15 @@ await mountGoogleButton(tfl5, {
 hasn't set `TFL5_GOOGLE_CLIENT_ID`. Calling `tfl5.auth.google(credential)`
 directly is the lower-level equivalent if you render the button yourself.
 
+`tfl5.auth.microsoft(idToken)` is the Azure AD / MSAL counterpart of
+`google()` — same `credential`-field shape (pass the ID token from
+`loginPopup`/`ssoSilent`) and the same `requires_password` link-proof
+flow on a refused email match — but there's no bundled button helper for
+it; render MSAL's own UI and call this directly. Its account-link policy
+is stricter than Google's (a Microsoft v2 ID token doesn't always carry a
+trustworthy verified-email claim), so more matches fall through to the
+password-proof gate than with `google()`.
+
 Telegram and VNeID sign-in are real platform endpoints
 (`/auth/telegram/*`, `/auth/vneid/*`) that `tfl5.auth` doesn't wrap yet —
 reach them with `tfl5.raw(path, body)` in the meantime.
@@ -216,7 +270,11 @@ try {
   // (default 24h) unless you call cancelErase() before it elapses.
 } catch (e) {
   if (e instanceof Tfl5Error && e.code === "owns_apps") {
-    console.warn("Transfer or delete these apps first:", e.body.app_tids);
+    // `ErrorEnvelope` types `body` generically (see §13), so a refusal's
+    // own extra fields need a cast — same pattern as every other coded
+    // refusal payload in this SDK.
+    const { app_tids } = e.body as { app_tids?: string[] };
+    console.warn("Transfer or delete these apps first:", app_tids);
   } else throw e; // password_required / totp_required / other
 }
 
@@ -254,14 +312,33 @@ for exactly what each one needs.
 ## 8. Files — `tfl5.files`
 
 ```ts
-await tfl5.files.upload({ path: "/avatars", file: someBlob, filename: "a.png" });
+const { files, warnings } = await tfl5.files.upload({ path: "/avatars", file: someBlob, filename: "a.png" });
+if (warnings?.length) {
+  // The bytes were written, but a live site-engine snapshot is shadowing
+  // this app's file tier — see the paragraph below.
+  console.warn(warnings[0]!.msg);
+}
 const list = await tfl5.files.list("/avatars");
-const { signed_url } = await tfl5.files.signUrl("/avatars/a.png", { expires_in_sec: 300 });
+const { signed_url } = await tfl5.files.signUrl(files[0]!.path, { expires_in_sec: 300 });
 await tfl5.files.rename(fileId, "new-name.png");
 await tfl5.files.del(fileId);      // soft-delete → trash
 await tfl5.files.restore(fileId);  // undo, while still in trash
 await tfl5.files.createFolder("/avatars/thumbs");
 ```
+
+`upload()` resolves to `{files, warnings?}`, not a bare array — `files`
+are the rows the server actually wrote, in request order; `warnings` is
+present only when non-empty, and it is not optional to handle. On an app
+that has ever published through the site engine (`tfl5.site`, §4 above),
+a release-stage write here still succeeds and the bytes still land in
+storage — but the visitor-facing serve path resolves through the live
+snapshot first and never reaches the file tier, so the write is a silent
+no-op from a visitor's point of view unless you check `warnings`. Branch
+on each entry's `code` (`"file_write_shadowed_by_snapshot"` today, stable
+across reword); see the `FileWriteWarning` doc block in
+`sdk/src/files.ts` for the full contract, including the operator setting
+(`TFL5_REFUSE_SHADOWED_FILE_WRITE=1`) that turns the same condition into a
+thrown error instead of a warning.
 
 Uploads are multipart only — never base64-in-JSON. `signUrl` mints a
 short-lived link (default 5 min, server-capped at 1 hour); mint it
@@ -269,7 +346,7 @@ on-demand at view time rather than persisting it. This client wraps the
 app-wide `/app/file/*` tier described in
 [app-builder-guide.md §3](app-builder-guide.md#3-building-blocks--when-to-use-what) —
 for your app's *published site* specifically (with draft/publish/rollback
-semantics), see the site engine in §4.1 above.
+semantics), see the site engine in §4 above.
 
 ## 9. Shares — `tfl5.shares`
 
@@ -345,10 +422,19 @@ export class Tfl5Error extends Error {
 |---|---|
 | `UnauthorizedError` | 401 — session missing/expired |
 | `AccessDeniedError` | 200 — authenticated, but lacks ACL on the target |
+| `TokenScopeDeniedError` | 403 — a scoped service token doesn't cover the requested path. Subclass of `AccessDeniedError`, so an `instanceof AccessDeniedError` check also catches it |
 | `NotFoundError` | resource/doc/row not found |
 | `BadRequestError` | 400 — malformed request / validation failure |
 | `RateLimitError` | 429 — has an optional `.retryAfter` (seconds) |
+| `PaymentRequiredError` | 402 — a spend or allowance was refused (app-creation quota, domain slot, prepaid credits, projection-key quota). Read `.cap` / `.refundableOnDelete` before telling a user what to do about it |
+| `TokenScopeUnavailableError` | 503 — the scope lookup itself failed, so the server refused rather than guessing; transient, safe to retry |
 | `InternalError` | 5xx — server-side failure |
+
+Capacity refusals (`PaymentRequiredError`) and service-token scope
+refusals (`TokenScopeDeniedError` / `TokenScopeUnavailableError`) all key
+off `.code`, never off the HTTP status alone — an operator flag can move
+some of these between 200/402/403/503 without moving the `code`. See each
+class's doc comment in `sdk/src/errors.ts` for the exact census.
 
 ```ts
 import { NotFoundError, AccessDeniedError, RateLimitError } from "@tfl5/sdk";

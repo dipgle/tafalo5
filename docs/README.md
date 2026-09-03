@@ -25,6 +25,16 @@ tfl5 without modifying the Rust core.
 6. **[recipes.md](recipes.md)** — practical "how do I X?" patterns
    (audit, bulk move, share with expiry, encrypted field, …).
    Search this when you hit a task.
+7. **[sdk.md](sdk.md)** — the official JS/TS client (`@tfl5/sdk`):
+   install, browser vs Node auth modes, and the map from platform
+   concept to client surface. Read it if you are writing a client
+   rather than calling the REST API by hand.
+8. **[wasm-operator-abi.md](wasm-operator-abi.md)** — the guest↔host
+   contract for WASM operators (required exports, host imports, JSON
+   envelopes, sandbox limits, upload/activate). Read only when you are
+   compiling a module — but read its §7 before you trust anything
+   `host_query` returns: an empty result is also what an ACL denial
+   looks like.
 
 ### If you're an AI agent picking up this folder
 Read app-builder-guide.md → acl-model.md → scope.md → security-model.md →
@@ -68,7 +78,7 @@ building.
 | Test/release stages + atomic promote | `/app/test/*`, `/app/release*` | api-reference §Stages |
 | Declarative hooks — `require_fields`, `set_fields`, `webhook`, `wasm` | `resources.hooks` JSONB | app-builder-guide §5.2 |
 | Official integrations: email, VietQR, VNeID, Zalo ZNS, Viettel SMS* | `/app/integrations/*`, `/op/<id>/<action>` | api-reference §Operators |
-| **WASM operators** — tenant server-side code, sandboxed + ACL-scoped (lifecycle hook or HTTP) | `/app/wasm/*`, `/op/<id>/<action>` | api-reference §Operators → WASM |
+| **WASM operators** — tenant server-side code, sandboxed + ACL-scoped (lifecycle hook or HTTP) | `/app/wasm/*`, `/op/<id>/<action>` | wasm-operator-abi.md · api-reference §WASM operators |
 | **Signed sources** — HMAC-authenticated ingest from external systems (HIS, payment gateway, IoT); write runs AS an auto-provisioned service principal through the same ACL gate as any user | `/app/source/*`, `/ingest/:source_tid` | api-reference §Signed sources |
 | WebSocket chat (session-authenticated, Reader-gated per app, persisted scrollback) | `/ws/chat`, `/app/chat/history` | api-reference §Chat |
 | License tiers, per-app quota, and app-creation rights bought in quantity packs | `/license`, `/licenses/*`, `/app/upgrade-license/*` | api-reference §License |
@@ -106,8 +116,14 @@ behaviour, so adopting the engine is opt-in per app. Older snapshots and
 their unreferenced blobs are reclaimed by a background collector that never
 touches the live or draft pointers.
 
-⚠ Published site content is **public** — the serve path applies no per-file
-permission check. See [security-model.md §8](security-model.md).
+⚠ **Which tier you publish through decides whether per-file ACLs apply.**
+The snapshot tier enforces the `files`-row ACL live, at
+`(app_tid, 'release', path)`, on both stages — it reads the ACL at request
+time rather than freezing it into the snapshot, so revoking access takes
+effect without republishing, and rolling back to an older snapshot still
+honours today's ACL. The **bundle** tier is the one that is public by
+contract: the bundle *is* the FE the tenant shipped. See
+[security-model.md §8](security-model.md).
 
 ## What the platform does NOT give you (today)
 
