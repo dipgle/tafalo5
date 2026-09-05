@@ -3987,7 +3987,8 @@ the client sends is refused with `read_only_stream`.
                  "price_cents": 1000, "currency": "USD",
                  "vat_rate_bps": 1000, "vat_cents": 100,
                  "total_cents": 1100,
-                 "billing_period": "month", "features": {},
+                 "billing_period": "month",
+                 "features": ["50 apps", "custom_domain"],
                  "limits": {}, "display_order": 1,
                  "self_service": true, "is_default": false } ] } ],
   "money": { "currency": "USD", "minor_units": 2,
@@ -3995,6 +3996,17 @@ the client sends is refused with `read_only_stream`.
   "payment_providers": [ { "id": "binance", "settles": true,
                            "hosted_checkout": true } ] }
 ```
+
+**`features` is an ARRAY of strings, not an object.** The column is
+`JSONB NOT NULL DEFAULT '[]'` (`migrations/0087_service_plan_catalog.sql:32`)
+and the handler falls back to `[]` when the row cannot be read as JSON
+(`billing.rs:164`) — indexing it by key gets you `undefined` on every plan.
+It is also not all display copy: the shipped `pro` row is
+`["50 apps", "50GB storage", "custom_domain", "email_send",
+"f3_top_secret"]` (`migrations/0033_licenses_self_service.sql:60`), i.e.
+two human labels followed by three internal flag names. Map the entries you
+recognise to your own wording and drop the rest; printing the array raw puts
+platform-internal identifiers on your pricing page.
 
 **Two traps in the money block, and both produce a wrong price on screen
 if you miss them.**

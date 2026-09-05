@@ -580,8 +580,13 @@ Be honest with yourself about these before you design:
   same pattern as payment below: an unconfigured operator fails the
   send (logged, not silent) rather than working out of the box.
 - **Payment checkout** — `GET /billing/catalog` is public and live (one
-  price per plan, no feature matrix, no sign-in required) and doubles as
-  your pricing-page data source. Actually charging a card runs through
+  price per plan, a `features` array per plan, no sign-in required) and
+  doubles as your pricing-page data source. That array is seeded from the
+  tier licences and mixes display copy with internal flag names
+  (`custom_domain`, `email_send`, `f3_top_secret`) — map it to your own
+  wording instead of rendering it, see
+  [`/billing/catalog`](api-reference.md#get-billingcatalog).
+  Actually charging a card runs through
   a provider (`POST /billing/webhook/:provider` settles it), and a
   provider only exists once its webhook secret is configured in the
   server's environment — an unconfigured/unknown provider name is
