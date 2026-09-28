@@ -1,103 +1,49 @@
-// DurableClient — durable stateful actors: send messages to durable
-// operator instances, read their metering counters, subscribe to their
-// reactive projections, and administer cross-app mail consent.
+// DurableClient — send messages to durable operator instances, and subscribe
+// to their reactive projections.
 //
-// ⚠ DEFAULT-OFF: the entire durable-operator subsystem is gated behind the
-// server env var `TFL5_DURABLE_ENABLED` (default FALSE — see
-// crates/system/src/state.rs, `durable_enabled_from_env`). On a
-// deployment where it isn't set, every method below (send/stats/subscribe/
-// mail grants) responds BEFORE any auth/DB work with a `durable_disabled`
-// code — `durable_msg`, `durable_stats` and the three mail-grant handlers
-// in crates/routes/src/durable.rs, `subscribe` in
-// crates/routes/src/durable_proj.rs. It's NOT a
-// 404 and NOT a generic 500 — if you're seeing `durable_disabled`, check the
-// deployment's env, not your code. `subscribe` has a second, independent
-// gate: `TFL5_DURABLE_PROJECTIONS` (code `projections_disabled`, same
-// handler).
-//
-// Send contract: crates/routes/src/durable.rs `durable_msg`
+// Send contract:
 //   POST /durable/:op_id/:instance_key/msg
 //   Request JSON: { app_tid: string, msg?: any, idem_key?: string }
+//   Success (HTTP 200, result:true):
+//     { result: true, data: any, instance_tid: string, timestamp: number,
+//       deduplicated?: true }
+//   Not delivered (HTTP 200, result:false):
+//     { result: false, code: "instance_busy" | "wrong_cell" | …,
+//       msg: string, timestamp: number }
 //   Auth: require_app_perm(Editor)
 //
-// Stats contract: crates/routes/src/durable.rs `durable_stats`
-//   POST /durable/:op_id/:instance_key/stats
-//   Auth: require_app_perm(Reader)
-//
-// Mail-grant contract: crates/routes/src/durable.rs
-//   POST /app/durable/mail-grant{,/revoke,/list}
-//   Auth: require_app_perm(Manager) on the RECIPIENT app (body.app_tid)
-//
-// Subscribe contract: crates/routes/src/durable_proj.rs
-//   GET /ws/durable/subscribe?app_tid=&resource=&key=k1&key=k2   (single-resource)
-//   GET /ws/durable/subscribe?app_tid=&rk=board%1Fk1&rk=scores%1Fk1 (multi-resource)
+// Subscribe contract:
+//   Single-resource (legacy):
+//     GET /ws/durable/subscribe?app_tid=&resource=&key=k1&key=k2
+//   Multi-resource (new):
+//     GET /ws/durable/subscribe?app_tid=&rk=board%1Fk1&rk=scores%1Fk1
+//     (%1F = ASCII Unit Separator; separator is unambiguous as it cannot appear
+//      in valid resource/key strings — tfl5 only accepts printable UTF-8).
 //   Frames: welcome | snapshot | delta | heartbeat | error — see
 //   DurableSubscription below. Auth: cookie session, require_app_perm(Reader).
 //
-// op_id and instance_key are validated server-side to [A-Za-z0-9_-]{1..=64}
-// (durable.rs, `validate_durable_ident`).
-//
-// --- How the send envelope reaches you --------------------------------------
-//
-// `durable_msg`'s response places `instance_tid`/`timestamp`/`deduplicated`
-// as SIBLINGS of `data`, not nested inside it:
-//   { result: true, data: <operator's return value>, instance_tid, timestamp, deduplicated? }
-// `HttpCore.post()` returns only the unwrapped `data`, which drops all
-// three, so `send()` uses `HttpCore.postFull()` (http.ts) — the
-// whole-envelope variant whose own doc comment names this endpoint as the
-// reason it exists — and returns a {@link DurableSendResult} carrying the
-// operator's `data` alongside `instanceTid`, `timestamp` and
-// `deduplicated`. Sibling clients do the same where the envelope matters
-// (`billing.invoiceIssue`, `files`' upload pair).
-//
-// REFUSALS STILL THROW, and that is not a choice this file can make:
-// `postFull` shares `unwrap()` with `post()`, and `unwrap()` treats ANY
-// `result:false` — with or without a `code` — as an error. So every
-// placement/capacity/rollout condition (`instance_busy`, `wrong_cell`,
-// `wrong_cell_needs_idem`, `cell_forward_failed`, `instance_quota`,
-// `tick_deadline`, `durable_disabled`) arrives as HTTP 200 + `result:false`
-// and surfaces as a thrown `Tfl5Error`, never as a soft result field. The
-// internal reference SDK returns those as `{result:false, busy/wrongCell}`
-// booleans because ITS `postFull` deliberately does not throw on
-// `result:false`; this package's does, and http.ts is not ours to change.
-// Check `err.code`, and use the helpers below: {@link isDurableRetryable},
-// {@link durablePlacement}, {@link durableQuota}, {@link
-// durableTickDeadline}. A refusal's own `data` payload (the quota numbers,
-// the tick budget) is preserved on `err.body.data`.
-//
-// One more `result:false` shape has no `code` at all: the envelope mirrors
-// the operator's own verdict (`"result": outcome.ok`), so a guest that
-// answered not-ok yields a thrown `BadRequestError` with `code` defaulted
-// to `"bad_request"` and the guest's value on `err.body.data`. It is not a
-// transport failure and {@link isDurableRetryable} correctly returns false
-// for it.
+// op_id and instance_key are validated server-side to [A-Za-z0-9_-]{1..=64}.
 
-import { Tfl5Error } from "./errors.js";
 import type { HttpCore } from "./http.js";
+import { makeError } from "./errors.js";
 
 // ---------------------------------------------------------------------------
-// send()
+// Public types
 // ---------------------------------------------------------------------------
 
 /** Input for {@link DurableClient.send}. */
 export interface DurableSendInput {
-  /**
-   * Target app tid. REQUIRED here, unlike most inputs in this SDK: the
-   * transport would inject `useApp()`'s value for an absent `app_tid`, but
-   * this type does not let the field be absent. A durable send addresses a
-   * specific instance's persistent state, so the app that owns it is named
-   * at the call site rather than inherited from ambient config.
-   */
+  /** Target app tid (injected automatically when `tfl5.useApp(...)` is set). */
   appTid: string;
   /**
-   * Durable operator id — must match `[A-Za-z0-9_-]{1..=64}`. Identifies the
-   * WASM operator that owns this instance.
+   * Durable operator id — must match [A-Za-z0-9_-]{1..=64}.
+   * Identifies the WASM operator that owns this instance.
    */
   opId: string;
   /**
-   * Instance key — must match `[A-Za-z0-9_-]{1..=64}`. Together with
-   * `opId` and the app, uniquely names a single durable instance (its
-   * oplog, lease, and state).
+   * Instance key — must match [A-Za-z0-9_-]{1..=64}.
+   * Together with `opId` and the app, uniquely names a single durable
+   * instance (its oplog, lease, and state).
    */
   instanceKey: string;
   /** Arbitrary JSON message forwarded verbatim to the WASM operator. */
@@ -105,259 +51,117 @@ export interface DurableSendInput {
   /**
    * Client-chosen deduplication token. A retry using the same `idemKey`
    * (same app + instance) does not re-deliver — the server returns the
-   * original message's journaled result, flagged
-   * {@link DurableSendResult.deduplicated}. Supply one on any send you
-   * might retry: it is also what makes a cross-cell forward exactly-once
-   * (`wrong_cell_needs_idem` refuses the hop without it).
+   * original message's result with `deduplicated: true`.
    */
   idemKey?: string;
 }
 
 /**
- * Result of {@link DurableClient.send} — the whole success envelope, not
- * just the operator's return value.
+ * Result of {@link DurableClient.send}.
  *
- * Only ACCEPTED deliveries produce this shape. Every refusal throws (see
- * the module header), so `result` is always `true` here; it is kept on the
- * type because it is what the wire says and because a caller logging the
- * envelope should log what it received.
+ * When the message was accepted (`result: true`), `data` carries the WASM
+ * operator's return value and `instanceTid` identifies the persistent
+ * instance row.
+ *
+ * When the message was not delivered, `result` is `false` and `code` says
+ * why. These are **not thrown** — the server answers them HTTP 200:
+ * - `instance_busy` (`busy: true`) — another owner holds the instance; retry
+ *   with back-off.
+ * - `wrong_cell` (`wrongCell: true`) — the instance lives on another cell and
+ *   this deployment could not forward the message; retry at
+ *   {@link targetCell}. (Multi-cell deployments forward server-side.)
+ * - `wrong_cell_needs_idem` — forwarding needs an `idemKey`; resend with one.
+ * - `cell_forward_failed` — the server-side forward failed; retry with the
+ *   same `idemKey` (exactly-once is preserved).
+ * - `instance_quota`, `tick_deadline` — capacity or time limit; retry later
+ *   (`data` carries the counts / deadline).
+ * - `durable_disabled` — the feature is off on this server.
+ * Other refusals (access denied, not found, validation) are thrown.
  */
-export interface DurableSendResult<T = unknown> {
-  /** Always `true` — a `result:false` envelope is thrown, not returned. */
-  result: true;
-  /** The WASM operator's own return value. */
-  data: T;
-  /**
-   * Persistent instance identifier — the row the oplog, lease and
-   * snapshots hang off. This is the only place the SDK can hand it to you:
-   * it is an envelope sibling, so a plain `post()` would drop it.
-   */
-  instanceTid: string;
-  /** Server clock, epoch-ms. */
+export interface DurableSendResult {
+  /** `true` = message accepted and executed; `false` = not delivered (retry). */
+  result: boolean;
+  /** WASM operator return value. Present when `result: true`. */
+  data: unknown;
+  /** Persistent instance identifier. Present when `result: true`. */
+  instanceTid?: string;
+  /** Epoch-ms timestamp from the server. */
   timestamp: number;
   /**
-   * `true` when this was a duplicate `idemKey` retry: nothing re-executed
-   * and `data` is the ORIGINAL message's journaled result. Normalized to a
-   * boolean — the server omits the field entirely when it is false.
+   * `true` when this was a duplicate `idemKey` retry. The server did not
+   * re-deliver; `data` is the original message's journaled result.
    */
-  deduplicated: boolean;
+  deduplicated?: boolean;
+  /**
+   * `true` when delivery failed because the instance's lease is held by
+   * another owner. Retry with exponential back-off.
+   * Maps `code: "instance_busy"` from the server.
+   */
+  busy?: boolean;
+  /**
+   * `true` when the instance is placed on a different cell than the one that
+   * received this request. The client should retry against the owning cell —
+   * see {@link targetCell} for where. Maps `code: "wrong_cell"` from the server.
+   */
+  wrongCell?: boolean;
+  /**
+   * The owning cell to retry against, present on a `wrongCell` response. Use
+   * `baseUrl` to re-issue the request at the correct cell (empty when the
+   * server could not resolve the cell's `base_url`). Maps the server's
+   * `cell_id` / `base_url` fields.
+   */
+  targetCell?: { cellId: string; baseUrl: string };
+  /** `true` when retrying later can succeed (see `DURABLE_RETRYABLE_CODES`). */
+  retryable?: boolean;
+  /** Server code when `result` is `false` (see above). */
+  code?: string;
+  /** Human-readable server message (placement/busy cases). */
+  msg?: string;
 }
 
-/**
- * Stable `code` values a `send`/`stats`/`subscribe` call can raise as a
- * thrown {@link Tfl5Error} — never a distinct non-throwing shape (see the
- * module header). Check `err.code` against these to decide
- * whether a retry makes sense; `"wrong_cell"` / `"wrong_cell_needs_idem"`
- * additionally carry the owning cell — see {@link durablePlacement}.
- */
-export const DURABLE_RETRYABLE_CODES = [
-  /** Deployment-wide gate is off (`TFL5_DURABLE_ENABLED`). Not retryable
-   *  until the operator flips it. */
-  "durable_disabled",
-  /** Deployment-wide projections gate is off (`TFL5_DURABLE_PROJECTIONS`).
-   *  `subscribe` only. */
-  "projections_disabled",
-  /** Instance's lease is held by another owner. Retry with back-off. */
-  "instance_busy",
-  /** Instance lives on a different cell; no forwarding path was available —
-   *  retry against {@link durablePlacement}'s `baseUrl`. */
-  "wrong_cell",
-  /** Cross-cell delivery needs `idemKey` for exactly-once; retry WITH one
-   *  against the owning cell. */
-  "wrong_cell_needs_idem",
-  /** Server attempted the cross-cell forward and the hop itself failed
-   *  (timeout/network); retry — the propagated `idemKey` makes it exactly-
-   *  once. */
-  "cell_forward_failed",
-  /** App is at its concurrent-instance ceiling (license tier). Gates NEW
-   *  activations only — live instances keep serving. Retry once one idles
-   *  out, or raise the tier; the two numbers behind the decision are on
-   *  the error — see {@link durableQuota}. */
-  "instance_quota",
-  /** The guest stalled past its per-message wall-clock budget and was
-   *  trapped; nothing was journaled (the message transaction rolls back by
-   *  default — see {@link DurableClient.send}). Retry: a fresh delivery
-   *  cold-recovers cleanly. The budget itself is on the error — see
-   *  {@link durableTickDeadline}. */
-  "tick_deadline",
-  /** `subscribe` only: per-app distinct live projection-key quota reached
-   *  (HTTP 402, code `proj_keys_quota`). */
-  "proj_keys_quota",
-] as const;
-
-export type DurableRetryableCode = (typeof DURABLE_RETRYABLE_CODES)[number];
-
-/** True when `err` is a {@link Tfl5Error} whose `.code` is one of {@link
- *  DURABLE_RETRYABLE_CODES} — i.e. a transient/placement condition rather
- *  than a hard failure. */
-export function isDurableRetryable(
-  err: unknown,
-): err is Tfl5Error & { code: DurableRetryableCode } {
-  return (
-    err instanceof Tfl5Error &&
-    (DURABLE_RETRYABLE_CODES as readonly string[]).includes(err.code)
-  );
-}
-
-/** The owning cell to retry against, extracted from a `wrong_cell` /
- *  `wrong_cell_needs_idem` error (the server resolves these best-effort —
- *  empty strings when it couldn't look them up). */
-export interface DurableCellTarget {
-  cellId: string;
-  baseUrl: string;
-}
-
-/**
- * The two numbers behind an `instance_quota` refusal, from the error's
- * `data` payload. Without them "retry or upgrade the tier" is a decision
- * no caller can actually make — one instance over the line and a hundred
- * over it look identical.
- */
-export interface DurableQuotaInfo {
-  /** Instances currently live for this app. */
-  liveInstances: number;
-  /** The app's ceiling, from its license tier. */
-  maxConcurrentInstances: number;
-}
-
-/** The per-message wall-clock budget behind a `tick_deadline` refusal,
- *  from the error's `data` payload. How far past the budget the guest
- *  would have run is NOT reported — the trap fires AT the deadline rather
- *  than letting the tick finish, so that number does not exist. */
-export interface DurableTickDeadlineInfo {
-  tickDeadlineMs: number;
-}
-
-/** Refusals whose `data` payload this module knows how to read. */
-interface DurableRefusalBody {
-  data?: {
-    live_instances?: number;
-    max_concurrent_instances?: number;
-    tick_deadline_ms?: number;
-  };
-}
-
-/**
- * Extract the live/max instance counts from an `instance_quota` error.
- * Returns `undefined` for any other error, and for an `instance_quota`
- * whose payload is missing or non-numeric — a back-off that invented
- * numbers would be worse than one that admits it has none.
- *
- * @example
- * catch (err) {
- *   const q = durableQuota(err);
- *   if (q) {
- *     // e.g. surface "12 of 12 instances busy" instead of a bare code,
- *     // and back off proportionally to the overshoot.
- *   }
- * }
- */
-export function durableQuota(err: unknown): DurableQuotaInfo | undefined {
-  if (!(err instanceof Tfl5Error) || err.code !== "instance_quota") return undefined;
-  const data = (err.body as DurableRefusalBody).data;
-  const live = data?.live_instances;
-  const max = data?.max_concurrent_instances;
-  if (typeof live !== "number" || typeof max !== "number") return undefined;
-  return { liveInstances: live, maxConcurrentInstances: max };
-}
-
-/**
- * Extract the per-message wall-clock budget from a `tick_deadline` error.
- * Returns `undefined` for any other error, or when the payload is absent
- * — see {@link durableQuota} on why it does not guess.
- */
-export function durableTickDeadline(err: unknown): DurableTickDeadlineInfo | undefined {
-  if (!(err instanceof Tfl5Error) || err.code !== "tick_deadline") return undefined;
-  const ms = (err.body as DurableRefusalBody).data?.tick_deadline_ms;
-  if (typeof ms !== "number") return undefined;
-  return { tickDeadlineMs: ms };
-}
-
-/**
- * Extract the owning cell from a cross-cell placement error. Returns
- * `undefined` for any other error (including other durable codes).
- *
- * @example
- * try {
- *   await tfl5.durable.send({ appTid, opId, instanceKey, msg, idemKey });
- * } catch (err) {
- *   const target = durablePlacement(err);
- *   if (target?.baseUrl) {
- *     // retry against `${target.baseUrl}/durable/${opId}/${instanceKey}/msg`
- *   }
- * }
- */
-export function durablePlacement(err: unknown): DurableCellTarget | undefined {
-  if (!(err instanceof Tfl5Error)) return undefined;
-  if (err.code !== "wrong_cell" && err.code !== "wrong_cell_needs_idem") return undefined;
-  const body = err.body as { cell_id?: string; base_url?: string };
-  return { cellId: body.cell_id ?? "", baseUrl: body.base_url ?? "" };
-}
-
-// ---------------------------------------------------------------------------
-// stats()
-// ---------------------------------------------------------------------------
-
-/** Result of {@link DurableClient.stats} (durable.rs, `durable_stats`). */
-export interface DurableStatsResult {
-  fuel_used_total: number;
-  busy_ms_total: number;
-  msgs_total: number;
-  /** Oplog seq cursor (`next_seq - 1`); `-1` if the instance was never
-   *  activated (no row yet — this is a pure read, it never activates the
-   *  instance). */
+export interface DurableStats {
+  fuelUsedTotal: number;
+  busyMsTotal: number;
+  msgsTotal: number;
+  /** Last applied sequence number; -1 when the instance was never activated. */
   seq: number;
 }
 
-// ---------------------------------------------------------------------------
-// Cross-app mail consent grants
-// ---------------------------------------------------------------------------
-
-/** Input shared by {@link DurableClient.mailGrantCreate} and {@link
- *  DurableClient.mailGrantRevoke}. `appTid` is the RECIPIENT app (the
- *  grantor) — the caller must Manage it. `senderAppTid` is the app being
- *  granted (or revoked) permission to mail it. `opId` optionally scopes the
- *  grant to one recipient operator; omit for an app-wide grant. */
-export interface DurableMailGrantInput {
-  appTid: string;
+export interface DurableMailGrant {
   senderAppTid: string;
-  opId?: string;
+  /** `null` = the grant covers every operator of the app. */
+  opId: string | null;
+  createdBy: string;
+  createdAt: number;
 }
 
-/** Result of {@link DurableClient.mailGrantCreate} (durable.rs,
- *  `durable_mail_grant`). */
-export interface DurableMailGrantCreateResult {
-  /** `false` when the exact (recipient, sender, op-scope) grant already
-   *  existed — idempotent, not an error. */
-  created: boolean;
-  recipient_app_tid: string;
-  sender_app_tid: string;
-  op_id?: string | null;
-  timestamp?: number;
-}
+/** `send()` outcomes that resolve with `result: false` instead of throwing. */
+const DURABLE_SOFT_CODES = new Set([
+  "instance_busy",
+  "wrong_cell",
+  "wrong_cell_needs_idem",
+  "cell_forward_failed",
+  "instance_quota",
+  "tick_deadline",
+  "durable_disabled",
+]);
+/** Codes that carry the owning cell (`targetCell`). */
+const CELL_CODES = new Set(["wrong_cell", "wrong_cell_needs_idem", "cell_forward_failed"]);
+/** Codes worth retrying (with back-off, and the same `idemKey`). */
+export const DURABLE_RETRYABLE_CODES: ReadonlySet<string> = new Set([
+  "instance_busy",
+  "wrong_cell",
+  "cell_forward_failed",
+  "instance_quota",
+  "tick_deadline",
+]);
 
-/** Result of {@link DurableClient.mailGrantRevoke} (durable.rs,
- *  `durable_mail_grant_revoke`). */
-export interface DurableMailGrantRevokeResult {
-  /** Rows deleted — `0` (no matching grant) or `1`. */
-  revoked: number;
-  timestamp?: number;
-}
-
-/** One row from {@link DurableClient.mailGrantList} (durable.rs,
- *  `durable_mail_grant_list`). */
-export interface DurableMailGrantRow {
-  sender_app_tid: string;
-  /** `null`/absent = app-wide grant (all recipient operators). */
-  op_id?: string | null;
-  created_by: string;
-  created_at: number;
-}
-
-/** Result of {@link DurableClient.mailGrantList}. */
-export interface DurableMailGrantListResult {
-  grants: DurableMailGrantRow[];
-  timestamp?: number;
+function mailGrantBody(input: { senderAppTid: string; opId?: string; appTid?: string }): Record<string, unknown> {
+  return {
+    sender_app_tid: input.senderAppTid,
+    ...(input.opId !== undefined ? { op_id: input.opId } : {}),
+    ...(input.appTid !== undefined ? { app_tid: input.appTid } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -365,14 +169,20 @@ export interface DurableMailGrantListResult {
 // ---------------------------------------------------------------------------
 
 /**
- * DurableClient — send messages to durable operator instances, read their
- * metering counters, subscribe to their reactive projections, and
- * administer cross-app mail consent.
+ * DurableClient — send messages to durable operator instances.
  *
  * A durable instance is a long-lived, replayed WASM actor identified by
  * `(app_tid, op_id, instance_key)`. The server activates it on first
  * delivery, persists its oplog, and guarantees exactly-once execution when
  * an `idemKey` is supplied.
+ *
+ * Endpoints: `POST /durable/:op_id/:instance_key/msg` (send),
+ * `POST /durable/:op_id/:instance_key/stats`, `GET /ws/durable/subscribe`
+ * (live projections, one key, many keys, or many resources per socket),
+ * and `/app/durable/mail-grant*` (which other apps may message yours).
+ *
+ * Access level: **Editor** on the target app for `send`; **Reader** for
+ * `stats` and `subscribe`; **Manager** for mail grants.
  */
 export class DurableClient {
   constructor(private readonly http: HttpCore) {}
@@ -383,132 +193,132 @@ export class DurableClient {
    * Posts to `POST /durable/${opId}/${instanceKey}/msg` with
    * `{ app_tid, msg, idem_key }`. The server creates the instance on first
    * delivery, or reuses the warm instance when one is already running.
-   * Resolves with a {@link DurableSendResult}: the operator's return value
-   * on `.data`, plus the envelope metadata (`instanceTid`, `timestamp`,
-   * `deduplicated`) that a plain `post()` would have discarded.
    *
-   * Every placement/capacity/rollout condition — busy instance, wrong cell,
-   * quota, tick deadline, subsystem disabled — throws a {@link Tfl5Error}
-   * (see the module header for why this package cannot return them as a
-   * "soft" non-throwing result). Use {@link isDurableRetryable} to check
-   * whether it's worth retrying, {@link durablePlacement} to find the
-   * owning cell on a `wrong_cell*` error, and {@link durableQuota} /
-   * {@link durableTickDeadline} to read the numbers a sensible back-off
-   * needs.
-   *
-   * Retry safety of `tick_deadline` is now structural, not a promise: the
-   * message transaction is owned by a guard that ROLLS BACK in `Drop`
-   * unless a successful `COMMIT` marked it committed, so a trapped tick
-   * journals nothing and cannot leak an open transaction back into the
-   * connection pool (durable.rs, `TxGuard`).
+   * Refusals (not signed in, access denied, unknown instance, bad request,
+   * 5xx) are thrown as {@link Tfl5Error} subclasses, like every other SDK
+   * method. Delivery outcomes — busy, wrong cell, quota, deadline, disabled —
+   * resolve `{ result: false, code, retryable }` instead (see
+   * {@link DurableSendResult}).
    *
    * @example
-   * try {
-   *   const res = await tfl5.durable.send<{ count: number }>({
-   *     appTid: "app-xxx",
-   *     opId: "counter",
-   *     instanceKey: "user-42",
-   *     msg: { action: "increment", by: 1 },
-   *     idemKey: "req-abc-001",
-   *   });
-   *   console.log(res.data.count, res.instanceTid);
-   *   if (res.deduplicated) {
-   *     // Nothing re-executed: this is the original delivery's result.
-   *   }
-   * } catch (err) {
-   *   const q = durableQuota(err);
-   *   if (q) console.warn(`${q.liveInstances}/${q.maxConcurrentInstances} instances live`);
-   *   if (isDurableRetryable(err)) {
-   *     // back off and retry (or redirect via durablePlacement(err))
-   *   } else {
-   *     throw err;
-   *   }
-   * }
+   * const res = await tfl5.durable.send({
+   *   appTid: "app-xxx",
+   *   opId: "counter",
+   *   instanceKey: "user-42",
+   *   msg: { action: "increment", by: 1 },
+   *   idemKey: "req-abc-001",
+   * });
+   * if (!res.result && res.retryable) { // retry after back-off, same idemKey }
+   * if (res.result) console.log(res.data);
    */
-  async send<T = unknown>(input: DurableSendInput): Promise<DurableSendResult<T>> {
-    const body: Record<string, unknown> = { app_tid: input.appTid, msg: input.msg };
+  async send(input: DurableSendInput): Promise<DurableSendResult> {
+    const body: Record<string, unknown> = {
+      app_tid: input.appTid,
+      msg: input.msg,
+    };
     if (input.idemKey !== undefined) body["idem_key"] = input.idemKey;
-    // `postFull`, not `post`: `instance_tid` / `timestamp` / `deduplicated`
-    // are envelope SIBLINGS of `data`, and `post` returns `data` alone.
-    // Refusals still throw — `postFull` shares `unwrap()` (see header).
-    const env = await this.http.postFull<{
-      result?: boolean;
-      data?: T;
+
+    // Metadata (`instance_tid`, `deduplicated`, placement fields) sits beside
+    // `data`, so read the whole body. `postFull` throws for non-2xx only; the
+    // rest is classified here.
+    interface RawEnvelope {
+      result: boolean;
+      data?: unknown;
       instance_tid?: string;
-      timestamp?: number;
+      timestamp: number;
       deduplicated?: boolean;
-    }>(`/durable/${input.opId}/${input.instanceKey}/msg`, body);
-    // A 2xx `result:true` envelope without `instance_tid`/`timestamp` is
-    // not a shape this endpoint produces; say so rather than handing back
-    // a result whose `instanceTid` is silently `""` or whose clock is 0.
-    if (
-      typeof env.instance_tid !== "string" ||
-      env.instance_tid === "" ||
-      typeof env.timestamp !== "number"
-    ) {
-      throw new Error(
-        "@tfl5/sdk: durable.send() got an accepted envelope without `instance_tid` + " +
-          "`timestamp` — the response did not come from " +
-          "/durable/:op_id/:instance_key/msg.",
-      );
+      code?: string;
+      msg?: string;
+      cell_id?: string;
+      base_url?: string;
+      retryable?: boolean;
+      isSignout?: boolean;
     }
+
+    const raw = await this.http.postFull<RawEnvelope>(
+      `/durable/${input.opId}/${input.instanceKey}/msg`,
+      body,
+    );
+
+    // A signed-out caller can be answered `{isSignout:true, result:true}`.
+    if (raw.isSignout === true) throw makeError(401, { ...raw, code: raw.code ?? "unauthorized" });
+
+    if (raw.result === true) {
+      return {
+        result: true,
+        data: raw.data,
+        instanceTid: raw.instance_tid,
+        timestamp: raw.timestamp,
+        deduplicated: raw.deduplicated,
+      };
+    }
+
+    // result:false. Delivery outcomes resolve; any other refusal (access
+    // denied, not found, validation) is an error like everywhere else.
+    if (raw.code !== undefined && !DURABLE_SOFT_CODES.has(raw.code)) throw makeError(200, raw);
+
+    const placed = raw.code !== undefined && CELL_CODES.has(raw.code);
     return {
-      result: true,
-      data: env.data as T,
-      instanceTid: env.instance_tid,
-      timestamp: env.timestamp,
-      deduplicated: env.deduplicated === true,
+      result: false,
+      data: raw.data,
+      instanceTid: raw.instance_tid,
+      timestamp: raw.timestamp,
+      busy: raw.code === "instance_busy",
+      wrongCell: raw.code === "wrong_cell",
+      targetCell: placed ? { cellId: raw.cell_id ?? "", baseUrl: raw.base_url ?? "" } : undefined,
+      retryable: raw.code !== undefined && DURABLE_RETRYABLE_CODES.has(raw.code),
+      code: raw.code,
+      msg: raw.msg,
     };
   }
 
   /**
-   * Read an instance's metering counters (fuel/busy-time/message-count) and
-   * its current oplog seq. Requires Reader on the app. Pure DB read — it
-   * never activates the instance, so a cold (never-activated) instance
-   * reports all-zero counters with `seq: -1` rather than erroring.
+   * Metering counters of one instance (Reader). A never-activated instance
+   * reads as all zeros with `seq: -1`. Throws with code `durable_disabled`
+   * when the durable subsystem is off on this deployment.
    */
-  stats(opId: string, instanceKey: string, appTid?: string): Promise<DurableStatsResult> {
-    const body: Record<string, unknown> = {};
-    if (appTid !== undefined) body["app_tid"] = appTid;
-    return this.http.post<DurableStatsResult>(`/durable/${opId}/${instanceKey}/stats`, body);
+  async stats(input: { appTid?: string; opId: string; instanceKey: string }): Promise<DurableStats> {
+    const r = await this.http.post<{
+      fuel_used_total: number;
+      busy_ms_total: number;
+      msgs_total: number;
+      seq: number;
+    }>(`/durable/${input.opId}/${input.instanceKey}/stats`, input.appTid ? { app_tid: input.appTid } : {});
+    return {
+      fuelUsedTotal: r.fuel_used_total,
+      busyMsTotal: r.busy_ms_total,
+      msgsTotal: r.msgs_total,
+      seq: r.seq,
+    };
   }
 
   /**
-   * Grant `senderAppTid` permission to send cross-app durable mail to
-   * `appTid` (optionally scoped to one recipient `opId`). Requires Manager
-   * on `appTid` (the recipient — deciding who may mail you is an
-   * administrative capability). Idempotent: re-granting the same
-   * (recipient, sender, op-scope) is a no-op (`created: false`).
+   * Allow another app (`senderAppTid`) to message this app's durable
+   * operators — all of them, or only `opId` (Manager on this app).
+   * Idempotent: `created` is false when the grant already existed.
    */
-  mailGrantCreate(input: DurableMailGrantInput): Promise<DurableMailGrantCreateResult> {
-    return this.http.post<DurableMailGrantCreateResult>("/app/durable/mail-grant", {
-      app_tid: input.appTid,
-      sender_app_tid: input.senderAppTid,
-      op_id: input.opId,
-    });
+  async grantMail(input: { senderAppTid: string; opId?: string; appTid?: string }): Promise<{ created: boolean }> {
+    const r = await this.http.post<{ created: boolean }>("/app/durable/mail-grant", mailGrantBody(input));
+    return { created: r.created };
   }
 
-  /**
-   * Revoke a previously-granted sender app (+ op-scope). Requires Manager
-   * on `appTid`. Live: blocks any not-yet-delivered cross-app mail
-   * immediately (the grant is checked at delivery time).
-   */
-  mailGrantRevoke(input: DurableMailGrantInput): Promise<DurableMailGrantRevokeResult> {
-    return this.http.post<DurableMailGrantRevokeResult>("/app/durable/mail-grant/revoke", {
-      app_tid: input.appTid,
-      sender_app_tid: input.senderAppTid,
-      op_id: input.opId,
-    });
+  /** Remove a mail grant; undelivered messages from that sender are refused at once. */
+  async revokeMail(input: { senderAppTid: string; opId?: string; appTid?: string }): Promise<{ revoked: number }> {
+    const r = await this.http.post<{ revoked: number }>("/app/durable/mail-grant/revoke", mailGrantBody(input));
+    return { revoked: r.revoked };
   }
 
-  /**
-   * List the sender apps (+ op-scopes) `appTid` currently accepts cross-app
-   * mail from. Requires Manager on `appTid`.
-   */
-  mailGrantList(appTid: string): Promise<DurableMailGrantListResult> {
-    return this.http.post<DurableMailGrantListResult>("/app/durable/mail-grant/list", {
-      app_tid: appTid,
-    });
+  /** Apps allowed to message this app's durable operators. */
+  async listMailGrants(appTid?: string): Promise<DurableMailGrant[]> {
+    const r = await this.http.post<{
+      grants: Array<{ sender_app_tid: string; op_id: string | null; created_by: string; created_at: number }>;
+    }>("/app/durable/mail-grant/list", appTid ? { app_tid: appTid } : {});
+    return r.grants.map((g) => ({
+      senderAppTid: g.sender_app_tid,
+      opId: g.op_id,
+      createdBy: g.created_by,
+      createdAt: g.created_at,
+    }));
   }
 
   /**
@@ -517,35 +327,37 @@ export class DurableClient {
    * `GET /ws/durable/subscribe` (WebSocket). One socket carries either a
    * single `key` or up to {@link SUBSCRIBE_KEYS_MAX} `keys` of the SAME
    * resource (single-resource form), OR up to {@link SUBSCRIBE_KEYS_MAX}
-   * `{resource, key}` pairs across MULTIPLE resources (multi-resource form
-   * via `subs`). Frames are (resource,key)-attributed; the row set (and
-   * each `onUpdate`) spans all pairs, with per-pair reads via
+   * `{resource, key}` pairs across MULTIPLE resources (multi-resource form via
+   * `subs`). Frames are (resource,key)-attributed; the row set (and each
+   * `onUpdate`) spans all pairs, with per-pair reads via
    * `sub.rows(resource, key)`.
    *
    * The subscription keeps a **latest-wins** local copy: a `snapshot` frame
-   * replaces it, each `delta` upserts one row (stale/duplicate seq
-   * dropped), and the server's seq-only `heartbeat` is compared against the
-   * local rows — a newer seq on the wire than held locally means a delta
-   * was missed (NOTIFY is at-most-once), and the subscription **resyncs**
-   * by reconnecting (a fresh socket always begins with a full snapshot).
-   * Resync waits a 1s grace first: the server commits a row before pushing
-   * its delta, so the "missing" delta is often already in flight —
-   * catching up cancels the reconnect.
+   * replaces it, each `delta` upserts one row (stale/duplicate seq dropped),
+   * and the server's seq-only `heartbeat` is compared against the local rows —
+   * a newer seq on the wire than held locally means a delta was missed
+   * (NOTIFY is at-most-once), and the subscription **resyncs** by reconnecting
+   * (a fresh socket always begins with a full snapshot). Resync waits a 1s
+   * grace first: the server commits a row before pushing its delta, so the
+   * "missing" delta is often already in flight — catching up cancels the
+   * reconnect.
    *
    * Rows are ACL- and PII-filtered SERVER-side under the caller's scope —
    * what you receive is exactly what `/app/doc/list` would show you.
    *
-   * Auth is the cookie session: in a browser on the app's origin it just
-   * works. The browser `WebSocket` API cannot attach an `Authorization`
-   * header, so bearer-mode Node callers must pass a {@link
-   * DurableSubscribeOptions.webSocket} factory that injects their own auth
-   * (e.g. the `ws` package with a `Cookie: _token=...` header).
+   * Auth is the cookie session (same as `/ws/chat`): in a browser on the
+   * app's origin it just works. The browser `WebSocket` API cannot attach
+   * an `Authorization` header, so bearer-mode Node callers must pass a
+   * {@link DurableSubscribeOptions.webSocket} factory that injects their own
+   * auth (e.g. the `ws` package with a `Cookie: _token=...` header).
    *
-   * Pre-upgrade refusals (`durable_disabled` / `projections_disabled` /
-   * missing Reader permission → 401 / key quota → 402 `proj_keys_quota`)
+   * Pre-upgrade refusals (`durable_disabled` / `projections_disabled` flags,
+   * missing Reader permission → 401, key quota → 402 `proj_keys_quota`)
    * happen BEFORE the 101 handshake — a browser surfaces them only as a
    * failed connection, so the client retries with back-off and reports
    * `onStatus("connecting")`; check the server if it never goes `"live"`.
+   *
+   * Access level: **Reader** on the app.
    *
    * @example
    * const sub = tfl5.durable.subscribe(
@@ -586,7 +398,7 @@ export class DurableClient {
 
 /**
  * Max distinct (resource, key) pairs one subscribe socket may carry — mirror
- * of the server's `SUBSCRIBE_KEYS_MAX` in `crates/routes/src/durable_proj.rs`
+ * of the server's per-socket limit
  * (a socket over the cap is refused 400 pre-upgrade, which a browser only
  * surfaces as a failed connection — so the SDK throws the clear error
  * client-side).
@@ -611,7 +423,7 @@ export interface ResourceKeyPair {
  *   (1..={@link SUBSCRIBE_KEYS_MAX} keys, duplicates collapse first-wins).
  *   Uses the `?resource=&key=` wire encoding.
  *
- * **Multi-resource form**:
+ * **Multi-resource form** (new):
  *   Pass `subs: ResourceKeyPair[]` — an array of `{resource, key}` pairs
  *   (1..={@link SUBSCRIBE_KEYS_MAX} pairs, duplicates collapse first-wins).
  *   Uses the `?rk=resource%1Fkey` wire encoding (U+001F separator).
@@ -628,8 +440,8 @@ export interface DurableSubscribeInput {
   key?: string;
   /**
    * Multiple projection keys on one socket (max {@link SUBSCRIBE_KEYS_MAX};
-   * duplicates collapse first-wins, mirroring the server). Mutually
-   * exclusive with `key`.
+   * duplicates collapse first-wins, mirroring the server). Mutually exclusive
+   * with `key`.
    */
   keys?: string[];
 
@@ -973,7 +785,7 @@ export class DurableSubscription {
       }
       return `${ws}/ws/durable/subscribe?${q.toString()}`;
     } else {
-      // Single-resource form: resource= + repeated key= params.
+      // Single-resource form (legacy): resource= + repeated key= params.
       // keys may contain commas, so the server rejected comma-separation;
       // it hand-parses RawQuery with form-urlencoded semantics, which
       // URLSearchParams emits (space as `+` decodes the same).

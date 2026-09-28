@@ -1,6 +1,6 @@
 # JS/TS SDK — `@tfl5/sdk`
 
-> **Status: 0.1.0 — implemented, not yet published to npm.** Core transport,
+> **Status: 0.2.0 — implemented, not yet published to npm.** Core transport,
 > auth, and the full client surface documented below are real, typecheck
 > clean, and end-to-end smoked against a live dev server (see
 > `sdk/README.md` for the smoke-test notes). This file is the API
@@ -21,11 +21,10 @@
 | `npm install @tfl5/sdk` | Node/CLI or a bundler pipeline (Vite/webpack/Next.js) | ESM + `.d.ts` — **not published yet**; build from `sdk/` in this repo meanwhile |
 
 Every tfl5 server serves its own SDK bundle: `/sdk.js`, `/sdk.mjs`,
-`/sdk-ui.js`, `/sdk-ui.mjs` are baked into the server binary from the
-committed `sdk/` source, so the bundle a server serves always matches the
-version it was built from — there's no drift between "the SDK docs" and
-"what `<script src="/sdk.js">` actually gives you." There is no separate
-`@tfl5/cli` codegen tool today.
+`/sdk-ui.js`, `/sdk-ui.mjs` are committed build outputs of `sdk/`, compiled
+into the server binary. A server serves whatever was regenerated before it
+was built — so an older server can serve an older bundle than this
+document describes. There is no separate `@tfl5/cli` codegen tool today.
 
 ## 2. Browser usage (no build step)
 
@@ -64,12 +63,15 @@ const tfl5 = new TFL5({
   appId: "a_xxx", // no `window` in Node, so set it explicitly
 });
 
-await tfl5.auth.login("dev_demo", process.env.DEMO_PASSWORD!); // captures the bearer token
+await tfl5.auth.login("dev_demo", process.env.DEMO_PASSWORD!); // sets the session cookie
 const me = await tfl5.auth.me();
 ```
 
-Node mode defaults to `auth: "bearer"` (no `window` present) and sends
-`Authorization: Bearer <token>`. You can also mint/pass a token directly:
+`/login` sets the `_token` session cookie and never returns a bearer token.
+Outside a browser the SDK keeps that cookie in an in-memory cookie jar, so
+the calls after `login()` are signed in. For a service token, pass it at
+construction — the client then runs in bearer mode and sends
+`Authorization: Bearer <token>`:
 
 ```ts
 const tfl5 = new TFL5({ host: "...", appId: "a_xxx", token: myServiceToken });
@@ -107,9 +109,16 @@ surrounding primitives:
 | per-doc encrypted file vault (record-bound, distinct from `tfl5.files`) | `/app/f3/*` | `tfl5.f3` |
 | per-app outbound mail + DKIM + inbox | `/app/email/*` | `tfl5.email` |
 | per-app chat (REST scrollback + live socket + room config) | `/app/chat/history` `/ws/chat` `/admin/chat/*-room-config` | `tfl5.chat` |
-| billing: catalog, checkout, plan changes, prepaid credits, invoices, legacy per-tier licenses | `/billing/*` `/license*` | `tfl5.billing` |
+| billing: catalog, checkout, plan changes, prepaid credits, invoices | `/billing/*` | `tfl5.billing` |
+| legacy per-tier licenses + upgrade requests | `/license` `/licenses/*` `/app/upgrade-license/*` | `tfl5.license` |
 | the signed-in user's own account (profile, password, 2FA, multi-email) | `/user/*` `/user/2fa/*` | `tfl5.account` |
 | durable stateful actors (**default-OFF** — see §7) | `/durable/*` `/ws/durable/subscribe` | `tfl5.durable` |
+| resource schema admin across the app | `/app/resource/*` | `tfl5.resources` |
+| identity facets (who may see your avatar / display name) | `/user/identity/*` | `tfl5.identity` |
+| public sign-in settings + server version | `/platform/info` `/platform/version` | `tfl5.platform` |
+
+`tfl5.bundles`, `tfl5.domains` and `tfl5.publicForms` are aliases of
+`tfl5.bundle`, `tfl5.domain` and `tfl5.publicForm`.
 
 Anything not yet covered by a typed client: `tfl5.raw(path, body)` — a
 raw POST that still unwraps the `{result, data}` envelope and throws the
@@ -118,8 +127,8 @@ same typed errors.
 `site`, `bundles` and `stages` are three publish tiers on the SAME app,
 resolved in that priority order at serve time: a live `site` snapshot
 shadows `bundles`, which shadows `stages`' legacy `public/` tree — and once
-an app has ever called `site.publish()`, the switch onto the snapshot tier
-is one-way for that app. See the module notes in `sdk/src/site.ts` and
+an app has ever called `site.publish()` or `site.importCurrent()`, the
+switch onto the snapshot tier is one-way for that app. See the module notes in `sdk/src/site.ts` and
 `sdk/src/deploy.ts` before wiring a publish flow onto more than one of
 these three.
 
@@ -133,10 +142,9 @@ client as of this write-up:
 
 | Area | Endpoints | What it's for |
 |---|---|---|
-| Telegram / VNeID sign-in | `/auth/telegram/*`, `/auth/vneid/*` | Alternative login providers alongside the magic-link/phone/QR/Google/Microsoft methods `tfl5.auth` already wraps — real and callable, just not typed yet. |
 | Chat moderation console | `/admin/chat/delete-message`, `/admin/chat/list-messages` | Per-message Manager operator actions. Deliberately left unwrapped (no shape trap worth a client for these two) — the room-*config* pair (`tfl5.chat.getRoomConfig`/`setRoomConfig`/`removeRoomConfig`) IS wrapped, because that write is destructive by omission. |
 
-Reach either with `tfl5.raw(path, body)` under a session with the right
+Reach it with `tfl5.raw(path, body)` under a session with the right
 permission level. (A few other endpoint groups — `/billing/webhook/*`,
 `/billing/refund`, `/admin/license/*` — are deliberately **never**
 self-service; they're platform-admin/operator-only and stay reachable only
@@ -147,14 +155,20 @@ via `raw()` under an operator session, not a roadmap gap.)
 ```ts
 const task = tfl5.resource<{ title: string; status: string }>("task");
 
-const created = await task.create({ title: "Write SDK docs", status: "todo" });
+const input = { title: "Write SDK docs", status: "todo" };
+const created = await task.create(input);                            // → { tid, resource_tid }
 const open = await task.list({ where: { status: "todo" }, limit: 50 });
-await task.update(created.tid, { ...created.data, status: "done" }); // full replace
+await task.update(created.tid, { ...input, status: "done" });        // full replace
 await task.patch(created.tid, { status: "done" });                  // get → merge → update
-await task.upsert({ match_on: { title: "Write SDK docs" }, data: created.data });
-await task.setAcl(created.tid, { readers: ["[r_team]"] });
+await task.upsert({ match_on: { title: "Write SDK docs" }, data: input });
+await task.setAcl(created.tid, { editors: [`[${teamRoleTid}]`] });  // role token = [r-…]
 await task.del(created.tid);
 ```
+
+`create()` answers `{ tid, resource_tid }`, not the stored row — keep your
+input object if you need it again. A doc's own ACL arrays govern **writes**
+only; to restrict who can *read* rows, use the resource ACL or scope
+([acl-model.md](acl-model.md)).
 
 `update()` **replaces** `data` wholesale — any field you don't send is
 dropped server-side. `patch()` is a convenience read-modify-write (not
@@ -181,7 +195,7 @@ for what each level means.
 ## 6. Auth — `tfl5.auth`
 
 ```ts
-await tfl5.auth.login(username, password);   // captures the bearer token in Node mode
+await tfl5.auth.login(username, password);   // sets the session cookie (jar in Node)
 await tfl5.auth.register({ username, password, re_password, email });
 const me = await tfl5.auth.me();             // throws UnauthorizedError if not signed in
 await tfl5.auth.logout();
@@ -213,7 +227,7 @@ for (;;) {
 }
 ```
 
-The field is `session_id`, not `qr_id` — the server (`auth_qr.rs`) has
+The field is `session_id`, not `qr_id` — the server has
 never had a `qr_id` field, so code built against the old `{ qr_id }` shape
 sent `qrPoll` a request missing its one required field on every call. The
 phone side can also back out of a session it scanned before approving it,
@@ -250,11 +264,11 @@ is stricter than Google's (a Microsoft v2 ID token doesn't always carry a
 trustworthy verified-email claim), so more matches fall through to the
 password-proof gate than with `google()`.
 
-Telegram and VNeID sign-in are real platform endpoints
-(`/auth/telegram/*`, `/auth/vneid/*`) that `tfl5.auth` doesn't wrap yet —
-reach them with `tfl5.raw(path, body)` in the meantime.
+Telegram and VNeID are wrapped too: `tfl5.auth.telegramLogin()`,
+`telegramLink()`, `telegramUnlink()`, `telegramStatus()`, and
+`tfl5.auth.vneidStart()`.
 
-### 6.1 PDPD data-subject rights (NĐ 13/2023)
+### 6.1 PDPD data-subject rights (Decree 13/2023/ND-CP)
 
 Self-scoped only — there is no admin-override form; these act on the
 caller's own account.
@@ -278,6 +292,8 @@ try {
   } else throw e; // password_required / totp_required / other
 }
 
+// Erasure signs you out everywhere, so cancelling needs a fresh sign-in first:
+await tfl5.auth.login(username, password);
 await tfl5.auth.cancelErase(); // throws code:"no_pending_erasure" if nothing's pending
 ```
 
@@ -297,33 +313,43 @@ await tfl5.wasm.activate("price-engine", "1.0.0");
 const quote = await tfl5.operator("price-engine").invoke("quote", { items });
 ```
 
-WASM is tfl5's one sandboxed server-side code lane (no JS/Lua `eval`): a
-module runs fuel/memory/time-bounded and reaches data through host calls
-that execute **as the calling user** — it can never exceed the caller's
-ACL. Full limits and the guest ABI: api-reference.md §Operators →
-"WASM operators".
+WASM operators are one of two sandboxed server-side code lanes; resources
+can also carry QuickJS code hooks (`*_code` fields — time-bounded, no
+network or files). A module runs fuel/memory-bounded and reaches data
+through host calls that execute **as the calling user**: reads go through
+the same gates as `/app/doc/list`; writes check app-level Editor (create)
+or the doc's own ACL (update) plus scope, but **not** the resource ACL —
+don't rely on a resource ACL to fence what an operator writes. Limits:
+api-reference.md § "WASM operators"; byte-level guest ABI:
+[wasm-operator-abi.md](wasm-operator-abi.md).
 
-Catalog operators that call out to a real external service (email, Zalo
-ZNS, Viettel SMS, VietQR, VNeID, payment) only work once the app has
-configured its own credentials via `tfl5.integrations.setConfig(...)` —
-see [app-builder-guide.md §7](app-builder-guide.md#7-what-tfl5-does-not-give-you)
-for exactly what each one needs.
+The catalog operators (Zalo ZNS, Viettel SMS, VietQR, VNeID) take per-app
+config via `tfl5.integrations.setConfig(...)` — see
+[app-builder-guide.md §7](app-builder-guide.md#7-what-tfl5-does-not-give-you)
+for exactly what each one needs. Email is configured through `tfl5.email`,
+and payment providers by the platform operator.
 
 ## 8. Files — `tfl5.files`
 
 ```ts
-const { files, warnings } = await tfl5.files.upload({ path: "/avatars", file: someBlob, filename: "a.png" });
+// `path` is the file's full path. Writes default to the "test" stage and
+// reads to "release", so name the stage when you mean the live tree.
+const { files, warnings } = await tfl5.files.upload(
+  { path: "avatars/a.png", file: someBlob },
+  { stage: "release" },
+);
 if (warnings?.length) {
   // The bytes were written, but a live site-engine snapshot is shadowing
   // this app's file tier — see the paragraph below.
   console.warn(warnings[0]!.msg);
 }
-const list = await tfl5.files.list("/avatars");
-const { signed_url } = await tfl5.files.signUrl(files[0]!.path, { expires_in_sec: 300 });
-await tfl5.files.rename(fileId, "new-name.png");
-await tfl5.files.del(fileId);      // soft-delete → trash
-await tfl5.files.restore(fileId);  // undo, while still in trash
-await tfl5.files.createFolder("/avatars/thumbs");
+const list = await tfl5.files.list({ prefix: "avatars/" });
+const { signed_url } = await tfl5.files.signUrl("avatars/a.png", { expires_in_sec: 300 });
+await tfl5.files.rename("avatars/a.png", "avatars/b.png");
+await tfl5.files.del("avatars/b.png");                // soft-delete → trash
+const [trashed] = await tfl5.files.trashList("release");
+await tfl5.files.restore(trashed!.tid);                // undo, while still in trash
+await tfl5.files.createFolder("avatars/thumbs");
 ```
 
 `upload()` resolves to `{files, warnings?}`, not a bare array — `files`
@@ -340,7 +366,8 @@ across reword); see the `FileWriteWarning` doc block in
 (`TFL5_REFUSE_SHADOWED_FILE_WRITE=1`) that turns the same condition into a
 thrown error instead of a warning.
 
-Uploads are multipart only — never base64-in-JSON. `signUrl` mints a
+`upload()` is multipart; `save()` is the base64-in-JSON alternative for
+runtimes that cannot build `FormData` (same limits). `signUrl` mints a
 short-lived link (default 5 min, server-capped at 1 hour); mint it
 on-demand at view time rather than persisting it. This client wraps the
 app-wide `/app/file/*` tier described in
@@ -353,13 +380,14 @@ semantics), see the site engine in §4 above.
 ```ts
 const share = await tfl5.shares.create({
   doc_tid: "d_xxx",
-  target: "anonymous",              // or a user_tid / "[r_role]" / "G_group"
+  target: "anonymous",              // only "anonymous" grants anything today
   fields: ["full_name", "diagnosis_code"],
   expires_at: Date.now() + 86_400_000,
 });
-// share.token is only returned for target:"anonymous" — that's the link token
+// share.token is non-empty only for target:"anonymous" — that's the link token
 
-const claimed = await tfl5.shares.claim(token); // exchange a token for the projected doc
+// Exchange a token for the projected doc. Needs the app tid unless useApp() was called.
+const claimed = await tfl5.shares.claim(share.token, appTid);
 await tfl5.shares.revoke(share.tid);
 ```
 
@@ -382,8 +410,10 @@ designer-configured and env + per-app opt-in — see
 
 ```ts
 const cfg = await tfl5.scope.get();          // field_map + the CALLER's own bindings only
-await tfl5.scope.setFieldMap({ student: { O: "created_by_user_tid" } });
-await tfl5.scope.patchBindings({ [userTid]: [{ scope: "O" }] }); // null clears a user's bindings
+await tfl5.scope.setFieldMap({ student: { O: "created_by_user_tid", own_param: "owner_ids" } });
+await tfl5.scope.patchBindings({
+  [userTid]: [{ scope: "O", params: { owner_ids: [userTid] } }], // null clears a user's bindings
+});
 ```
 
 ## 12. Signed sources — `tfl5.sources`
@@ -407,13 +437,15 @@ The external system signs its push with HMAC-SHA256 over
 
 ## 13. Errors
 
-Every rejection is a `Tfl5Error` subclass keyed on the server's stable
-`code` — never on the (possibly localized) `msg`:
+Every **server** rejection is a `Tfl5Error` subclass keyed on the server's
+stable `code` — never on the (possibly localized) `msg`. A network failure
+surfaces as the runtime's own `fetch` error (for example a `TypeError`), and
+a few client-side guards throw a plain `Error`:
 
 ```ts
 export class Tfl5Error extends Error {
   readonly code: string;      // e.g. "access_denied"
-  readonly status: number;    // HTTP status (0 if the request never completed)
+  readonly status: number;    // HTTP status
   readonly body: ErrorEnvelope;
 }
 ```
@@ -451,9 +483,11 @@ try {
 
 Some legacy error shapes ship on HTTP 200 with a `code` (e.g.
 `not_found`, `access_denied`) rather than the matching HTTP status — the
-SDK normalizes this: any response that isn't `{result: true}` throws,
-regardless of the HTTP status code, so you never have to special-case
-200-with-an-error yourself.
+SDK normalizes this: any error envelope (a `code` present, or
+`result: false`) throws regardless of the HTTP status code, so you never
+have to special-case 200-with-an-error yourself. One exception:
+`durable.send()` resolves delivery outcomes as `result: false` instead of
+throwing (see its own section).
 
 ## 14. Config reference
 
@@ -461,7 +495,7 @@ regardless of the HTTP status code, so you never have to special-case
 interface Tfl5Config {
   host?: string;              // defaults to window.location.origin in a browser
   appId?: string;             // default app_tid auto-injected into request bodies
-  auth?: "cookie" | "bearer"; // defaults to "cookie" in a browser, "bearer" in Node
+  auth?: "cookie" | "bearer"; // "bearer" when `token` is set, otherwise "cookie"
   token?: string;             // bearer token; also settable via setToken()
   fetch?: typeof fetch;       // custom fetch — tests, non-standard runtimes
 }
@@ -469,14 +503,15 @@ interface Tfl5Config {
 
 - **cookie** mode sends `credentials: "include"`; the server's `_token`
   cookie round-trips automatically.
-- **bearer** mode sends `Authorization: Bearer <token>`; in Node (no
-  cookie jar available to the platform) the SDK keeps an in-memory
-  cookie jar internally so a `/login` cookie still persists across calls
-  if you're in cookie mode outside a browser.
+- **bearer** mode sends `Authorization: Bearer <token>`.
+- Outside a browser, **cookie** mode keeps an in-memory cookie jar, so a
+  `/login` cookie persists across calls.
 - `tfl5.useApp(appTid)` — scope subsequent calls; a per-call `app_tid` in
   the request body always overrides it.
 - `tfl5.setToken(token)` — set/replace the bearer token manually (e.g.
-  one minted out-of-band by a service).
+  one minted out-of-band by a service). It only takes effect on a
+  bearer-mode client — construct it with `auth: "bearer"` or an initial
+  `token`.
 
 ## 15. Build & publish
 

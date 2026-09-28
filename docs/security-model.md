@@ -66,8 +66,8 @@ Fields are tiered by a `level` you set in the resource schema
   plaintext — tag sensitive fields deliberately.
 
 ⚠ **Level 1 vs level 2 are NOT an access tier.** Both are encrypted identically,
-and **any caller who passes the doc's Reader ACL + scope gets the decrypted value
-back in the response JSON.** "Level 2" does not mean "fewer people can read it" —
+and **any caller who passes app-Reader, the resource ACL and scope gets the
+decrypted value back in the response JSON.** "Level 2" does not mean "fewer people can read it" —
 that's what ACL, scope, and the scope **PII level** (§4) are for. Encryption-at-rest
 protects against the *storage/DB*, not against an *authorized reader*.
 
@@ -82,7 +82,8 @@ and returns plaintext in the response.** That means:
 |-----|-----------------------------------------|
 | An outsider with **only** a stolen DB dump | **No** — `data_secret` is ciphertext; keys aren't in the DB |
 | The **platform operator** (holds the master key + server access) | **Yes** |
-| Your app's code / a WASM operator running on the server | Yes (server-side, under the caller's ACL) |
+| Your app's code | Yes |
+| A WASM operator running on the server | Through `host_call`: level-0 fields only — the bridge never decrypts `data_secret`. Run as a doc-lifecycle hook it receives the write's plaintext payload, level 1–2 fields included (`before_*` as `data`, `after_create` as `doc.data`) |
 | A **user**, via the API | Only what their ACL + scope allow (decrypted for them) |
 
 So tfl5 gives you: **encryption at rest against DB theft and external attackers**,
@@ -116,9 +117,14 @@ For "content only specific users can decrypt", tfl5 has **F3** (see
 
 - Each user has an **X25519 keypair** (public key plaintext, used to seal; private
   key **wrapped by the master key**).
-- A file's DEK is **sealed per-grantee** to their public key
-  (`f3_grants.sealed_dek`); to read, the grantee opens the grant with their private
-  key. Granting = re-sealing the DEK to another user's public key.
+- **Only attachments uploaded at `level: 3` are sealed per grantee.** Their DEK is
+  random and sealed to each grantee's public key (`f3_grants.sealed_dek`); to read,
+  the grantee opens the grant with their private key, and granting = re-sealing the
+  DEK to another user's public key.
+- **Levels 1–2 — and the default upload level is 1 — are not sealed per grantee.**
+  Their file key is derived from the app key and the doc, so anyone who passes the
+  doc's ACL can read them; no grant is involved. Pass `level: 3` when you mean
+  "only the people I grant".
 - This is the closest tfl5 gets to "you need a key to read it." **But it is still
   custodial:** the private keys are master-key-wrapped, so the operator can open any
   grant. It protects against a DB-only attacker, not against the operator.
@@ -129,7 +135,8 @@ For "content only specific users can decrypt", tfl5 has **F3** (see
 
 When [scope](scope.md) is enforced, a caller's binding can carry a **PII level** so
 that even an *in-scope* row comes back with sensitive fields **masked**. Three
-levels, wire codes `F` / `M` / `A`:
+levels, wire codes `F` / `M` / `A` (the long forms `Full` / `Masked` / `Aggregate`
+are accepted too):
 
 | Level | Code | Effect on a row the caller is otherwise allowed to read |
 |---|---|---|
@@ -137,20 +144,27 @@ levels, wire codes `F` / `M` / `A`:
 | Masked | `M` | fields listed in `pii_fields` are rewritten before the response |
 | Aggregate | `A` | row-level reads are refused; the caller may only count/aggregate |
 
+⚠ **Any other `pii_level` value — a typo, or lowercase `"m"` — is read as Full.**
+A mistyped level silently grants unmasked rows, so validate bindings before you
+write them.
+
 Which fields get masked, and how, is per-resource **data**, declared at
 `apps.acls.scope.field_map.<resource>.pii_fields` as `{field: kind}`:
 
-- `name` → initials joined with `.` (`"Nguyễn Văn An"` → `"N.V.A"`)
-- `cccd` / `phone` → all but the last 4 characters (`"****1234"`)
+- `name` → initials joined with `.` (`"Nguyen Van An"` → `"N.V.A"`)
+- `cccd` / `phone` → the literal `"****"` followed by the last 4 non-space
+  characters (`"****1234"`); a value of 4 characters or fewer becomes `"****"`
 - `email` → first character of the local part (`"a***@xyz.com"`)
-- any **unrecognised** kind → `"***"` (a typo in `pii_fields` fails closed rather
-  than leaking the field)
+- any **unrecognised** kind *string* → `"***"` (a misspelt kind fails closed)
+- ⚠ a kind that is **not a string at all** (a number, an object, `null`) is
+  skipped and the field comes back **unmasked** — make sure every value in
+  `pii_fields` is a string
 
 Multiple matching bindings resolve to the **least-strict** level. Without scope
 enforced, no masking is applied.
 
 **Aggregate drill-down is possible, and it is logged.** An `A`-level caller hitting
-`/app/doc/get` is refused with `pii_aggregate_only` — *unless* they supply an
+`/app/doc/get` or `/app/file/get` is refused with `pii_aggregate_only` — *unless* they supply an
 `X-Audit-Reason` header, in which case the read is escalated to Full and recorded
 with `drill_down=true` plus the reason text. That is a deliberate break-glass path,
 not a leak: design your roles knowing an `A`-level user can reach Full data by
@@ -169,8 +183,9 @@ they never appear in the tenant feed below. The coverage table is in
 [acl-model.md §13](acl-model.md); read it before you write an audit claim into a
 contract.
 
-**Refusals are recorded, not just successes.** A permission check that turns an
-identified caller away writes its own row — `result: "failure"`, and a detail
+**Refusals are recorded, not just successes.** A refusal by the app-level gate or
+the per-doc gate writes its own row (refusals by the resource ACL or by scope do
+not) — `result: "failure"`, and a detail
 field naming the level the caller *lacked*. So an app owner can see who probed
 them, which is a capability worth telling your customers about. It applies only
 to callers who are somebody (valid session, live non-banned user, existing app):
@@ -197,9 +212,10 @@ Two read surfaces:
 
 Three more tables complete the picture:
 
-- **The PII access log.** Reads on `/app/doc/{list,get}` write a row when scope is
-  enforced — one row per *request*, carrying `row_count`, **not** one row per
-  record returned. Ordinary `/app/file/*` downloads do **not** write one.
+- **The PII access log.** With scope enforced, reads on `/app/doc/{list,get}`,
+  `/app/file/{list,get,sign-url}` and `/admin/public-form/list` write a row — one
+  row per *request*, carrying `row_count`, **not** one row per record returned.
+  The byte download itself (public path or signed URL) writes none.
 - **The F3 attachment access log.** Attachment opens write their own row, readable
   via `/app/f3/access-log` (Manager).
 - **The identity access log**, and this one is **not success-only.** When somebody
@@ -219,19 +235,22 @@ Three more tables complete the picture:
     rows.
   - A facet the subject simply never **set** is not a denial — an absent avatar is
     not an access decision.
-  - **Nothing at all is written about a subject who has requested erasure.**
-    Erasure means no new personal data about them, and a row naming who looked
-    them up is exactly that. (A banned-but-present subject *is* still logged — they
+  - **Nothing at all is written about a subject whose erasure has been carried
+    out.** Erasure means no new personal data about them, and a row naming who
+    looked them up is exactly that. During the cancellable grace window after the
+    request (24 hours by default) lookups are still logged. (A banned-but-present subject *is* still logged — they
     exist, and the refusal is a fact about their account.) A viewer who looks
     themselves up is not logged either.
 
-  Unlike the permission-refusal rows above, these carry a client IP and user
-  agent — this layer has an actual socket peer, not a caller-supplied header. Read
+  Unlike the permission-refusal rows above, these store a client IP and user
+  agent — this layer has an actual socket peer, not a caller-supplied header.
+  (`/user/identity/access-log` does not return those two fields to the subject.) Read
   it as the connecting address: behind a reverse proxy that is the proxy, so
   confirm your edge setup before treating it as the end user's IP.
 
-All of these writes are **best-effort**: a failure is logged and warned about, and
-the request still succeeds, so an access log is evidence rather than a hard gate.
+All of these writes are **best-effort**: a failure is logged and warned about —
+except the F3 attachment access log, whose write failures are currently dropped
+without a log line — and the request still succeeds, so an access log is evidence rather than a hard gate.
 An identity disclosure has already happened by the time its log write runs —
 failing the request would only make the caller retry and disclose again — so a
 failed write is surfaced as a warning naming the viewer, never swallowed.
@@ -239,7 +258,8 @@ failed write is surfaced as a warning naming the viewer, never swallowed.
 ### Tamper-evidence: a signed hash-chain (and exactly what it proves)
 
 Audit rows are written unsealed (the hot path takes no extra latency), and a
-background sealer chains them a few seconds later, per cell, single-writer. Each
+background sealer chains them about every 5 seconds, serialised per cell by an
+advisory lock. Each
 sealed row carries:
 
 - **`entry_hash`** — SHA-256 over the row's canonical content *including* its
@@ -251,9 +271,14 @@ sealed row carries:
   a row breaks verification.
 
 `POST /admin/audit/verify` (platform-admin) walks a cell's chain and returns
-`signature_failures`, `linkage_breaks`, `gaps`. Signature failures and linkage
-breaks are hard tamper verdicts; **gaps are informational only**, because a
-legitimate retention prune or an erasure exemption also leaves a gap.
+`checked`, `ok`, `signature_failures`, `linkage_breaks`, `gaps`, `first_bad_seq`
+and `epoch_seq`. Signature failures and linkage breaks are hard tamper verdicts;
+**gaps are informational only**, because a legitimate retention prune or an
+erasure exemption also leaves a gap — which also means a **deleted** row shows up
+only as a gap, and removing the newest rows leaves no trace at all. Read `ok`
+together with `checked` and `epoch_seq`: verification may start mid-chain (at an
+epoch), is capped at the oldest 100,000 rows by default, and a failed database
+read comes back as `ok: true, checked: 0`.
 
 ⚠ **Say this precisely, because it is easy to oversell.** The signing key is held
 by the **platform operator** — signing is **custodial**, exactly like the encryption
@@ -274,9 +299,11 @@ market the built-in chain as an immutable ledger.
 
 A published page is only as trustworthy as the code it loads. The platform's
 `Content-Security-Policy` on HTML responses allows scripts from `'self'` plus
-**exactly two** third-party origins — Google Identity Services and the Telegram
-login widget. Those two stay because a provider widget only functions when loaded
-from the provider's own origin; everything else is gone.
+**three provider widgets on four hosts** — Google Identity Services
+(`accounts.google.com`), the Telegram login widget (`telegram.org`,
+`oauth.telegram.org`) and Cloudflare Turnstile (`challenges.cloudflare.com`,
+listed unconditionally). They stay because a provider widget only functions when
+loaded from the provider's own origin; everything else is gone.
 
 Every other third-party browser library the platform ships (charts, QR rendering,
 the Microsoft sign-in library, the code-editor library) is served **from the
@@ -289,11 +316,11 @@ binary. That matters for three concrete reasons:
    allowlist.
 2. **Provenance is pinned, not assumed.** Each vendored file is extracted from the
    publisher's own npm registry tarball and recorded in a lock file with package,
-   version, the exact path inside the tarball, and a SHA-256. A build-time test
-   re-hashes the bytes compiled into the binary against that lock, so a hand-edited
-   vendor file fails the build rather than shipping inside a minified blob. A second
-   test scans the shipped browser assets and fails the build if any of them reaches
-   for a host outside the CSP allowlist.
+   version, the exact path inside the tarball, and a SHA-256. A test re-hashes the
+   bytes compiled into the binary against that lock, so a hand-edited vendor file
+   fails the test suite (`cargo test`) rather than shipping unnoticed inside a
+   minified blob. A second test scans a fixed list of shipped browser assets and
+   fails if any of them reaches for a host outside the CSP allowlist.
 3. **No third-party availability or privacy dependency.** A CDN outage cannot break
    charts on published pages, and your visitors' IP addresses are not disclosed to a
    CDN.
@@ -306,16 +333,19 @@ The remaining honest caveat: the policy still includes `'unsafe-inline'` for
 `script-src` and `style-src`, so CSP is not currently a defence against an injected
 inline script. Treat output escaping in your own app as the primary XSS control;
 CSP here is defence-in-depth against *third-party host* compromise, not against
-your own template bugs.
+your own template bugs. An operator can also switch the policy to Report-Only
+(`TFL5_CSP_REPORT_ONLY=1`), in which case nothing is enforced — ask whether your
+cell enforces it. API paths (`/app/`, `/auth/`, `/admin/`, …) carry no CSP.
 
 ---
 
 ## 8. Published site content — public by DEFAULT, and the two tiers differ
 
 The `/app/site/*` authoring endpoints are Manager-gated, and the in-editor
-`/app/site/preview` of an unpublished draft is Manager-gated. What happens once a
-snapshot is **live** depends on which serve tier answers, and the two are not the
-same contract:
+`/app/site/preview` of an unpublished draft is Manager-gated. Do not treat an
+unpublished draft as confidential on that basis — the per-file ACL below is the
+fence, not draft status. What happens once a snapshot is **live** depends on which
+serve tier answers, and the two are not the same contract:
 
 | Serve tier | Per-file ACL on the serve path? |
 |---|---|
@@ -329,7 +359,8 @@ would be an ACL that publishing silently removed. Three properties are worth
 knowing:
 
 - **The ACL is read LIVE, not frozen into the snapshot.** Revoking access takes
-  effect without republishing, and rolling back to an older snapshot still honours
+  effect without republishing (within the 30-second ACL cache window when the cell
+  runs several processes), and rolling back to an older snapshot still honours
   today's ACL. The snapshot stores bytes; the `files` row keyed
   `(app_tid, stage, path)` stores who may read them.
 - **The Release row is always consulted, on either stage.** On the sandbox/test
@@ -370,6 +401,10 @@ adds them reads as though snapshots carry their own ACL; they do not. The live
 > behaviour as read-from-code, not as test-pinned**, and verify it on your own cell
 > before you rely on it for a compliance claim.
 
+⚠ **Do not put a shared cache or CDN in front of ACL'd snapshot files.** The gate
+runs at the origin; a cache in between is outside it. For a file that must stay
+private, hand out a signed URL (`/app/file/sign-url`) instead.
+
 Practical rule, unchanged in spirit: **do not put a secret in a published site
 file.** The snapshot tier will fence a file you explicitly ACL, but the default is
 open, the orphaned-row gap is real, and the bundle tier does not fence at all.
@@ -382,12 +417,13 @@ layers), a file with per-row ACL (`/app/file/*`), or an F3 attachment (§4).
 
 [WASM operators](api-reference.md) run in a strict sandbox: **no network, no
 filesystem, no clock, no ambient capability** — the only imports linked into the
-guest are the two audited host calls (`host_log`, `host_call`), and `host_call`
-runs under the **caller's** ACL + scope (`create`/`update` re-run the same
-app-level Editor gate as the HTTP write paths, and the write is scope-checked).
-A buggy or malicious operator is bounded on CPU (fuel-metered), memory (a
-resource limiter), wall clock, host-call count, and host-call payload size — and
-has **no channel to send your data out**. It is a safe place to run
+guest are the two audited host calls (`host_log`, `host_call`). `host_call` runs
+as the **caller**: reads go through app-Reader, the resource ACL and scope; writes
+check app-level Editor (`create`) or the doc's per-doc Editor (`update`) plus write
+scope — not the resource ACL (see [wasm-operator-abi.md §8](wasm-operator-abi.md)).
+A buggy or malicious operator is bounded on CPU (fuel-metered), memory (a resource
+limiter), host-call count and host-call payload size; the 5-second wall clock
+bounds how long the *caller* waits. It has **no channel to send your data out**. It is a safe place to run
 tenant-authored server logic; it is **not** a confidentiality boundary against the
 operator (§3).
 
@@ -400,9 +436,9 @@ reference. Four defaults worth knowing when you scope a project:
 
 | Subsystem | Default | Turned on by |
 |---|---|---|
-| Row-level [scope](scope.md) enforcement | **off** | `TFL5_ENFORCE_SCOPE` on the cell, *and* a per-app `field_map` |
+| Row-level [scope](scope.md) enforcement | **off** | `TFL5_ENFORCE_SCOPE` set to exactly `1`, `true`, `TRUE` or `yes` on the cell (any other value, including `on`, leaves scope off), *and* a per-app `field_map` |
 | Durable operator subsystem | **off** | `TFL5_DURABLE_ENABLED`; every durable endpoint returns "not enabled on this deployment" until then |
-| Payment providers | **off** | a provider is registered only if its webhook secret is in the environment; an unconfigured provider is indistinguishable from a 404 |
+| Payment providers | **off** | a provider is registered only if its secret is in the environment; on the webhook path an unconfigured provider is indistinguishable from a 404, while `GET /billing/catalog` reports which providers can settle (`payment_providers[].settles`) |
 | **Doc-write audit rows** | **off** | `audit_writes` on the resource, set through `/app/resource/{create,update}`. Nothing warns you it is off; the writes simply leave no trace (§6) |
 
 The pattern is deliberate — a new subsystem is opt-in, never on by default. Ask
@@ -417,12 +453,15 @@ security control around scope until you've confirmed it enforces (see
 - ✅ "Encrypted at rest, safe if the database is stolen" — **true** for level ≥ 1
   fields and F3.
 - ✅ "Access is enforced by the server, not the client" — **true**.
-- ✅ "Only granted users can open this file" — **true** with F3 (custodially).
+- ⚠ "Only granted users can open this file" — **true only for F3 attachments
+  uploaded at level 3** (custodially). Levels 1–2, the default, follow the doc's
+  ACL (§4).
 - ✅ "Third-party JavaScript can't be swapped under us" — **true** for what the
-  platform serves: self-hosted, provenance-locked, build-gated (§7). Two provider
+  platform serves: self-hosted, provenance-locked, test-gated (§7). Three provider
   widgets are the documented exception.
 - ⚠ "Tamper-proof audit trail" — it is **signed and tamper-evident** (§6), which
-  detects edits by anyone without the operator's key. It is **not** operator-proof
+  detects edits by anyone without the operator's key. Deleting rows is not a hard
+  verdict (a gap, or no trace for the newest rows). It is **not** operator-proof
   and not yet anchored off-box; don't market it as an immutable ledger.
 - ⚠ "Every change is logged" — **partial**, and the gaps are in the places people
   assume are covered: role CRUD writes no row, doc writes are opt-in per resource,

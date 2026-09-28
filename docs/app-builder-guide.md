@@ -182,9 +182,12 @@ See [Authentication](api-reference.md#authentication).
 
 ```
 POST /app/update      (no tid → create mode)
-{ "name": "School Manager", "description": "..." }
-→ { result: true, data: { tid: "a-example" } }
+{ "data": { "name": "School Manager", "description": "..." } }
+→ { result: true, data: { tid: "a-example", name, ... } }
 ```
+
+The fields go **inside `data`**. Sent flat, the call is refused
+(`code: "validation_invalid"`, "Name invalid") and no app is created.
 
 You become the app's `author` (immutable owner) and Manager. Your
 license tier defaults to `demo` (1 app, **52,428,800 B (50 MiB) per
@@ -259,8 +262,7 @@ here, that's almost always why.
 Allowlist (both paths): `html htm css js mjs map json png jpg jpeg gif
 webp avif svg ico woff woff2 ttf otf txt xml md` (plus `csv xlsx docx`
 and a small set of binary types for downloadable assets: `sqlite db bin
-wasm zip tar gz`). Hard caps: **52,428,800 B (50 MiB) per file**
-(`file/mod.rs:84` `MAX_UPLOAD_BYTES`), **license-tier dependent total
+wasm zip tar gz`). Hard caps: **52,428,800 B (50 MiB) per file**, **license-tier dependent total
 quota**.
 
 ### Step 4 — bind a domain
@@ -268,23 +270,41 @@ quota**.
 ```
 POST /app/domain/preview      ← preview returns DNS records you must set
 { "app_tid": "a-example", "domain": "myapp.example.com" }
-→ {
-    verify_token,
-    records: [
-      { type: "A",   host: "myapp.example.com",        value: "<server-ip>" },
-      { type: "TXT", host: "_tfl5.myapp.example.com",  value: "..." }
-    ]
-  }
+→ { result: true, data: {
+      domain, app_tid,
+      verify: {
+        verify_token,
+        records: [
+          { type: "A",   host: "myapp.example.com",        value: "<server-ip>" },
+          { type: "TXT", host: "_tfl5.myapp.example.com",  value: "<verify_token>" }
+        ],
+        a_record_configured: true,
+        note
+      }
+  } }
 
 [user sets DNS records out-of-band]
 
 POST /app/domain/add          ← verify + persist
-{ "app_tid": "a-example", "domain": "myapp.example.com", "verify_token": "..." }
-→ { result: true }
+{ "app_tid": "a-example", "domain": "myapp.example.com" }
+→ { result: true,
+    data: { tid, domain, app_tid, active: true, method },
+    warnings: [ ... ] }
 ```
 
-tfl5 verifies DNS A + TXT match, then activates. Caddy on-demand TLS
-issues a Let's Encrypt cert next time `https://myapp.example.com` is hit.
+`/app/domain/add` looks the DNS up itself and accepts **either** proof: an
+A record pointing at this server, **or** the TXT record carrying the
+token. There is no `verify_token` field in the request; one sent by an
+older client is ignored. Once the domain is active, Caddy on-demand TLS
+issues a Let's Encrypt cert the next time `https://myapp.example.com` is
+hit. A TXT-only proof binds the domain but does not route traffic — the
+`warnings` array says so when that is the case.
+
+`/app/domain/preview` can also answer without `verify`: when the domain
+is already yours (`already_owned`), when it qualifies for a platform
+shortcut or delegation, or when its DNS already carries a proof
+(`auto_active: true` with `proof_already_in_dns`). See
+[api-reference.md § Domains](api-reference.md#domains) for every branch.
 
 For dev, `localhost:<port>` and `<tid>.test.<base>` (if
 `TFL5_TEST_SUBDOMAIN_BASE` is configured) bypass the DNS check.
@@ -382,7 +402,9 @@ with empty `fields: []` accepts any JSON — but nothing is encrypted.
 ### 5.2 `hooks` (JSONB array — declarative)
 
 Hooks let you attach behavior to resource events **without writing
-code**. The platform supports exactly 3 hook `type`s:
+code**. The platform supports 4 hook `type`s — three declarative ones
+(`require_fields`, `set_fields`, `webhook`) and `wasm`, which hands the
+event to a WASM operator you uploaded:
 
 ```json
 [
@@ -427,9 +449,11 @@ code**. The platform supports exactly 3 hook `type`s:
 | `require_fields` | `before_*` only | If any listed field is missing/empty, reject with `hook_validation_failed`. Other phases silently ignored. |
 | `set_fields` | `after_*` only | Patches `data_indexed` via `jsonb_set`. Failures logged, doc write already committed. |
 | `webhook` | `after_*` only | Async HTTP POST to `params.url`. Optional `when` predicate to filter. Audit row written either way. |
+| `wasm` | `before_*` and `after_*` | Calls the operator `params.op_id` (action `params.action`, default = the event name). A `before_*` hook may return a replacement object or reject the write (`wasm_rejected`); an `after_*` hook cannot block. See [wasm-operator-abi.md](wasm-operator-abi.md). |
 
 **Required entry fields:** `id` (non-empty), `on` (non-empty array of
-strings), `type` (one of the three). Anything else → 400
+strings), `type` (one of the four), and for `wasm` a non-empty
+`params.op_id`. Anything else → 400
 `hook_invalid_shape` at resource create/update.
 
 **Token substitution** in `set_fields.params.set` and `webhook.params.fields`:
@@ -439,9 +463,10 @@ forward-compatible hook authors aren't blocked.
 
 **What hooks CANNOT do** (deliberate scope):
 - Run arbitrary code *in a declarative hook* (no JS eval, no Lua). For
-  server-side custom logic, add a **`wasm` hook** or a **WASM operator**
-  instead (see api-reference.md §Operators → "WASM operators"). Declarative
-  hooks deliberately stay code-free.
+  server-side custom logic, use a **`wasm` hook**, a **WASM operator**
+  (see api-reference.md § "WASM operators"), or the resource's
+  **JavaScript code hooks** (§7). The three declarative types stay
+  code-free.
 - Block on external HTTP — `webhook` is fire-and-forget
 - Sync over to another resource — use the webhook to call a service that calls `/app/doc/create` back
 - Read other docs as part of validation — `require_fields` is local
@@ -517,16 +542,18 @@ Be honest with yourself about these before you design:
   (2026-06-16, deployed). Upload a compiled `.wasm` module per app; it
   runs in a fuel/memory/time-bounded sandbox, either as a doc-lifecycle
   hook (`"type":"wasm"`) or an HTTP `/op/<id>/<action>` endpoint. Data
-  access runs **as the calling user's ACL** — a module can never exceed
-  what the caller may see/edit, and a denied read comes back as an EMPTY
-  ARRAY rather than an error, so "empty" never proves "no such rows".
+  access runs **as the calling user**: reads go through the same gates
+  as `/app/doc/list`; a resource-ACL denial comes back as an EMPTY ARRAY
+  rather than an error (so "empty" never proves "no such rows"), while an
+  app-level or scope-config refusal is a `host_query_failed` error. Writes
+  check app-level Editor (create) or the doc's own ACL (update), plus
+  scope — the exact list is in wasm-operator-abi.md §8.
   Full reference: wasm-operator-abi.md (the guest↔host contract).
 - **Per-resource JavaScript hooks** (QuickJS) — **SHIPPED**, and a second
   sandboxed code lane alongside WASM. Code lives in the resource's own
   `before_create_code` / `after_create_code` / `before_update_code` /
   `after_update_code` columns and runs bounded to **100 ms** wall time and
-  a **16 MiB** heap (`crates/operators/src/js_hooks/mod.rs`,
-  `MAX_WALL_MS` / `MAX_HEAP_BYTES`). A *before* hook may rewrite the
+  a **16 MiB** heap. A *before* hook may rewrite the
   payload or reject the write — the refusal arrives as the static
   `code: "hook_reject"` with your own tag folded into `msg` as
   `[<tag>] …`, so branch on the code and display the tag. An *after* hook
@@ -541,7 +568,7 @@ Be honest with yourself about these before you design:
   pre-compute snapshots via your own nightly cron + store in a
   `<...>_snapshot` resource.
 - **Filtering on `data_indexed` content from the API** — `/app/doc/list`
-  supports a `where` DSL for level-0 fields (Batch 85). You can ask
+  supports a `where` DSL for level-0 fields. You can ask
   "list docs where `data.grade = 7A`". Encrypted fields are not
   filterable; client-side narrowing or a hook-maintained mirror is the
   workaround for those.

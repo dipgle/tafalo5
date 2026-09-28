@@ -14,10 +14,14 @@ declarative hooks, and sandboxed operators.
 | Path | What |
 |---|---|
 | [`sdk/`](sdk/) | `@tfl5/sdk` — the typed client (`TFL5`, resources, auth, files, shares, operators). See [sdk/README.md](sdk/README.md). |
+| [`sdk/docs/`](sdk/docs/) | SDK guides (getting started, auth, data, files and sites, realtime, billing, errors) and the generated method reference. |
 | [`docs/README.md`](docs/README.md) | Documentation index — start here. |
 | [`docs/app-builder-guide.md`](docs/app-builder-guide.md) | Build your first app end-to-end. |
 | [`docs/api-reference.md`](docs/api-reference.md) | Full REST endpoint reference. |
 | [`docs/acl-model.md`](docs/acl-model.md) | Authorization: ACL arrays, roles, groups, sharing. |
+| [`docs/scope.md`](docs/scope.md) | Row-level scope and PII levels. |
+| [`docs/security-model.md`](docs/security-model.md) | What the platform protects, and what it leaves to your app. |
+| [`docs/wasm-operator-abi.md`](docs/wasm-operator-abi.md) | The contract for your own sandboxed WASM operators. |
 | [`docs/recipes.md`](docs/recipes.md) | Task-oriented how-tos. |
 | [`docs/sdk.md`](docs/sdk.md) | Full SDK reference — every client module, the auth/error model, and what's landing next. |
 
@@ -40,8 +44,10 @@ Every tafalo5 server serves the SDK directly — no build step, no npm install:
 </script>
 ```
 
-See [sdk/README.md](sdk/README.md#no-build--script-usage--served-by-the-platform)
-for the ESM (`/sdk.mjs`) form and more detail.
+See [sdk/README.md](sdk/README.md#install) for the ESM (`/sdk.mjs`) form. A
+server not updated since SDK 0.2.0 serves a copy that fails every call in the
+browser with `TypeError: Illegal invocation`; if you see that, load a build of
+this SDK instead (see below).
 
 `@tfl5/sdk` isn't published to npm yet (see [sdk/README.md](sdk/README.md) for
 current status) — for a Node/CLI build pipeline, build it from source today:
@@ -75,7 +81,7 @@ The SDK is a client — it needs a tafalo5 server to talk to:
 cd sdk
 npm install
 npm run build          # dist/ (ESM + .d.ts)
-npm run build:browser  # dist/browser/sdk.{js,mjs}
+npm run bundle         # dist/browser/sdk.{js,mjs}
 ```
 
 ## License

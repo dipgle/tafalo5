@@ -1,238 +1,251 @@
 // FilesClient — `/app/file/*` + `/app/folder/*`.
 //
-// Uploads are multipart only (the server persists binaries straight from
-// the multipart stream; never base64-in-JSON). Each part is a (`path`,
-// `file`) pair and the request is repeatable for batch upload.
+// Two ways to write bytes:
+//   - `upload()` — multipart (binary-safe, the server streams it straight to
+//     storage). Prefer this for anything a user picks from disk.
+//   - `save()`   — base64-in-JSON, for runtimes that cannot build FormData.
 //
-// ── Size limits — four DIFFERENT numbers, don't merge them ───────────────
-// Constants named below are anchors: grep the symbol, not the line.
+// Stages. Every file row lives in one of two stages, `"test"` (draft) or
+// `"release"` (live). The server's defaults differ by operation ON PURPOSE,
+// so a forgotten field never overwrites the live site:
+//   - writes (`upload`, `save`)                 → default `"test"`
+//   - reads  (`list`, `get`, `signUrl`)         → default `"release"`
+//   - mutations (`rename`, `del`, `createFolder`, `aclSet`) → default `"release"`
+// This client always sends an explicit stage on mutations, and lets you pass
+// one everywhere else. Pass `{ stage: "release" }` to write to the live tree.
 //
-//   1. Per-file upload cap — 52,428,800 B (50 MiB).
-//      `crates/routes/src/file/mod.rs` `MAX_UPLOAD_BYTES` (:84). Checked on
-//      the DECODED bytes of each multipart part. Refusal code
-//      `file_too_large`. (Raised 10 MiB → 50 MiB on 2026-08-26; any SDK doc
-//      still saying "10 MB" for an upload is stale.)
-//   2. Whole-REQUEST body cap — 104,857,600 B (100 MiB).
-//      `file/mod.rs` `UPLOAD_REQ_CAP` (:327), applied as an axum
-//      `DefaultBodyLimit` layer on `/app/file/upload`. The arithmetic a
-//      caller actually meets: ONE 50 MiB file per request fits (with room
-//      for the multipart envelope); TWO do not; hundreds of ordinary assets
-//      are unaffected. The refusal for the "two" case is a size refusal
-//      naming this cap — code `upload_request_too_large`, produced by
-//      `multipart_read_error` (`file/mod.rs:372-380`) — NOT a parse error.
-//      That distinction is load-bearing: the layer cuts the stream before
-//      the per-file check can run, and the raw `MultipartError` reads as
-//      "malformed multipart" for every cause it has, which historically had
-//      people rebuilding archives that were never broken.
-//   3. `/app/file/save` (the JSON/base64 write alternative to multipart)
-//      body cap — 74,099,368 B. `file/mod.rs` `SAVE_JSON_REQ_CAP` (:346),
-//      derived as `MAX_UPLOAD_BYTES / 3 * 4 + 4 MiB` because base64 costs
-//      4/3. The handler still refuses on the DECODED length against the
-//      50 MiB per-file cap. Base64-in-JSON keeps the encoded body, the
-//      parsed string and the decoded bytes live at once — multipart is the
-//      cheap path and the one to prefer at this size. Not wrapped by this
-//      client; reach it with `tfl5.raw("/app/file/save", …)` if you must.
-//   4. `/app/file/get` READ refusal — over 10,485,760 B (10 MiB).
-//      `crates/routes/src/file/json_store.rs` `MAX_JSON_GET_BYTES` (:55).
-//      This is a SEPARATE number from the 50 MiB upload cap and it did not
-//      move with it: a file this client can upload can be too large to read
-//      back through the JSON get route. Fetch those as bytes (public serve
-//      or `signUrl()`), not through `/app/file/get`.
-//
-// ── The `stage` field on mutating ops ────────────────────────────────────
-// `rename` / `del` / `folder/create` (and `file/acl-set`) resolve their
-// target stage through `parse_mutating_stage`
-// (`crates/routes/src/file/storage.rs:55`), which is NOT symmetric with the
-// write path's `parse_write_stage`:
-//   * default (no env override): an omitted `stage` runs on the LIVE
-//     (release) stage;
-//   * with `TFL5_STRICT_WRITE_STAGE=1`: an omitted `stage` silently
-//     RETARGETS to the draft/test stage — the live file stays put and
-//     nothing errors ("delete did nothing").
-// Every method below therefore sends `stage: "release"` EXPLICITLY, so this
-// client behaves identically whichever way the operator has set that flag.
-// Do not remove those literals to "clean up" the bodies.
-//
-// ── `warnings` on release-stage writes ───────────────────────────────────
-// Four mutating file routes — `/app/file/upload`, `/app/file/save`,
-// `/app/file/del`, `/app/file/rename` — now answer with an ADDITIVE
-// top-level `warnings` array (a sibling of `data`, omitted when empty) when
-// `stage=release` and the app has a live site-engine snapshot. See
-// `FileWriteWarning`. Source: `file/storage.rs` `snapshot_shadow_warning`
-// (:134-177).
+// Paths are the file's full relative path inside the app (`"img/logo.png"`),
+// not a folder. No leading slash is needed; `..`, empty and `.`-leading
+// segments are rejected, and depth is capped at 16 segments.
 
 import type { HttpCore } from "./http.js";
 
-export interface FileEntry {
-  id?: string;
-  path?: string;
-  name?: string;
-  size?: number;
-  [k: string]: unknown;
-}
+export type FileStage = "test" | "release";
 
-/** One row as `upload()` reports it back (`file/mod.rs:792-800`). */
-export interface UploadedFile {
+/** A row from `/app/file/list`. */
+export interface FileEntry {
   tid: string;
   path: string;
-  /** Always `"release"` for this client — see the module note on `stage`. */
-  stage: string;
+  is_dir: boolean;
+  parent_tid: string | null;
   size: number;
   mime: string | null;
-  parent_tid: string | null;
-  /** The original multipart filename, when the part carried one. */
-  original?: string | null;
-  [k: string]: unknown;
+  managers: string[];
+  editors: string[];
+  readers: string[];
+  deletable: string[];
+  noaccess: string[];
+  author: string;
+  updated_at: number;
 }
 
-export interface UploadPart {
-  /** Logical destination path/folder within the app's file tree. */
+/** One row written by `upload()` / `save()`. */
+export interface WrittenFile {
+  tid: string;
   path: string;
-  /** The binary. In the browser a File/Blob; in Node a Blob/Uint8Array. */
-  file: Blob | Uint8Array;
-  /** Optional filename override (defaults to the File's name or "file"). */
-  filename?: string;
+  stage: FileStage;
+  size: number;
+  mime: string;
+  parent_tid: string | null;
+  /** Upload only: the filename the part was sent with. */
+  original?: string;
 }
 
 /**
- * A write that SUCCEEDED but will not be SERVED.
- *
- * Emitted when a release-stage file write lands on an app that serves a
- * published site-engine snapshot. Serve order is snapshot → bundle → file
- * stage (`crates/routes/src/public.rs:646-654`, and the snapshot branch
- * returns unconditionally), so once `apps.live_snapshot` is set — which is
- * exactly what "Import existing site" / `site.backfill()` does — the legacy
- * `public/` tree stops being consulted at all. The row is written, the bytes
- * are written, the envelope says `result:true`, and the visitor keeps seeing
- * the snapshot. That is a silent failure with a very long fuse: a CI job
- * publishing a customer's site can report success for weeks.
- *
- * DO NOT DROP THIS. If you see it, the change reached storage but not
- * visitors — republish through the site engine (`site.put()` then
- * `site.publish()`), or stop writing to the file tier for this app.
- *
- * Under `TFL5_REFUSE_SHADOWED_FILE_WRITE=1` the same condition is not a
- * warning but an HTTP 409 refusal carrying this same `code`, which the
- * transport raises as a `Tfl5Error` — so a caller that handles both the
- * warning and the error code is correct on either setting.
+ * Returned beside a write when it lands in the release stage of an app whose
+ * front-end is served by the site engine: the bytes were stored but visitors
+ * will not see them (the live snapshot wins). Publish through `tfl5.site`
+ * instead. Servers in strict mode refuse such writes with this same `code`.
  */
 export interface FileWriteWarning {
-  code: "file_write_shadowed_by_snapshot";
-  /** Human-readable explanation, naming the snapshot id. Reword-unstable —
-   *  branch on `code`, never on this. */
+  code: "file_write_shadowed_by_snapshot" | (string & {});
+  /** Human-readable; branch on `code`. */
   msg: string;
-  /** The `apps.live_snapshot` id that is winning at serve time. */
-  live_snapshot: string;
+  /** The live snapshot that is served instead. */
+  live_snapshot?: string;
 }
 
-/** Envelope siblings every mutating file op may carry. */
-export interface FileWriteEnvelope {
-  /** Present ONLY when non-empty. See {@link FileWriteWarning}. */
+export interface UploadResult {
+  /** The rows written, in request order. */
+  files: WrittenFile[];
+  /** Present only when a write is shadowed; see {@link FileWriteWarning}. */
   warnings?: FileWriteWarning[];
 }
 
-/** `del()` result — `file/mod.rs:1635-1642` plus the envelope's `warnings`. */
-export interface FileDeleteResult extends FileWriteEnvelope {
-  /** Bytes returned to the app's storage quota. */
-  freed: number;
-  is_dir: boolean;
-  /** Tid of the row that was trashed. */
-  tid: string;
-  /** Epoch-ms the soft-delete was recorded. */
-  trashed_at: number;
-}
-
-/**
- * `upload()` result.
- *
- * `data` on this route is a bare ARRAY of rows, so — unlike `del()` and
- * `rename()`, whose payloads are objects that spread into the result — the
- * rows live under `files` and `warnings` sits beside them.
- */
-export interface FileUploadResult extends FileWriteEnvelope {
-  /** The rows the server actually wrote, in request order. */
-  files: UploadedFile[];
-}
-
-/** `rename()` result — `file/mod.rs:2253-2259` plus `warnings`. */
-export interface FileRenameResult extends FileWriteEnvelope {
+export interface FileRenameResult {
   tid: string;
   old_path: string;
   path: string;
-  stage: string;
+  stage: FileStage;
   parent_tid: string | null;
+  warnings?: FileWriteWarning[];
+}
+
+export interface FileDeleteResult {
+  tid: string;
+  /** Bytes returned to the app's storage allowance. */
+  freed: number;
+  is_dir: boolean;
+  trashed_at: number;
+  warnings?: FileWriteWarning[];
+}
+
+export interface UploadPart {
+  /**
+   * Destination path of the file inside the app, e.g. `"img/logo.png"`.
+   * When omitted the part's filename is used.
+   */
+  path?: string;
+  /** The binary. In the browser a File/Blob; in Node a Blob/Uint8Array. */
+  file: Blob | Uint8Array;
+  /** Filename sent with the part (defaults to the File's name or "file"). */
+  filename?: string;
+}
+
+export interface UploadOptions {
+  /** Target stage. Server default when omitted: `"test"`. */
+  stage?: FileStage;
+  /** Tenancy attributes stored on every written row (scope-filtered apps). */
+  scopeAttrs?: Record<string, unknown>;
+}
+
+export interface SaveInput {
+  path: string;
+  /** File content, base64 (standard or URL-safe). Max 50 MiB decoded. */
+  contentBase64: string;
+  /** Defaults to a MIME derived from the extension. */
+  mime?: string;
+  /** Target stage. Server default when omitted: `"test"`. */
+  stage?: FileStage;
+  scopeAttrs?: Record<string, unknown>;
+}
+
+export interface FileContent {
+  tid: string;
+  path: string;
+  stage: FileStage;
+  size: number;
+  mime: string;
+  content_base64: string;
+}
+
+export interface FileAclInput {
+  path: string;
+  /** Defaults to `"release"`. */
+  stage?: FileStage;
+  /**
+   * ACL arrays. Send raw ids (`"u-…"`, `"r-…"`, `"g-…"`); the server
+   * normalises role tokens itself, so do not pre-wrap them in brackets.
+   * Omitted arrays are stored empty.
+   */
+  managers?: string[];
+  editors?: string[];
+  readers?: string[];
+  deletable?: string[];
+  noaccess?: string[];
+}
+
+export interface FileAcl {
+  path: string;
+  managers: string[];
+  editors: string[];
+  readers: string[];
+  deletable: string[];
+  noaccess: string[];
+}
+
+export interface TrashEntry {
+  tid: string;
+  path: string;
+  stage: FileStage;
+  is_dir: boolean;
+  size: number | null;
+  mime: string | null;
+  deleted_at: number | null;
+  deleted_by: string | null;
+  author: string;
 }
 
 export class FilesClient {
   constructor(private readonly http: HttpCore) {}
 
   /**
-   * Upload one or more files in a single multipart request.
-   *
-   * Size limits: one file ≤ 52,428,800 B (50 MiB) and the whole request
-   * ≤ 104,857,600 B (100 MiB) — so a single max-size file fits and two do
-   * not. See the module header for all four caps and for which refusal you
-   * get from which layer.
-   *
-   * Returns `{files, warnings?}`. NOTE — the wire shape of `data` here is a
-   * bare ARRAY: the handler answers `{result:true, data:[…]}` (`file/mod.rs`,
-   * anchor `"data": uploaded,`), which this method exposes as `files`. It
-   * previously declared `{file: FileEntry[]}`, a shape the server has never
-   * sent — `res.file` was always `undefined`.
-   *
-   * ⚠ The `warnings` sibling IS surfaced here, and that is why the return is
-   * an object rather than the bare array. The handler puts `warnings` at the
-   * ENVELOPE top level beside `data` (`file/mod.rs`, anchor
-   * `out["warnings"] = json!([w]);`), so `HttpCore.postForm()` — which
-   * unwraps `data` — would drop it, and a write that stored bytes nobody will
-   * ever be served would look like a clean success. This method reads the
-   * whole envelope through `postFormFull()` instead, matching `del()` and
-   * `rename()`. See {@link FileWriteWarning} for what to do when you get one.
+   * Upload one or more files in a single multipart request (Editor).
+   * Max 50 MiB per file and 100 MiB per request; allowed extensions:
+   * html/css/js/json, images, fonts, text, sqlite/db/bin, wasm, zip/tar/gz.
    */
-  async upload(parts: UploadPart | UploadPart[]): Promise<FileUploadResult> {
+  async upload(parts: UploadPart | UploadPart[], opts: UploadOptions = {}): Promise<UploadResult> {
     const list = Array.isArray(parts) ? parts : [parts];
     const form = new FormData();
+    if (opts.stage) form.append("stage", opts.stage);
+    if (opts.scopeAttrs) form.append("scope_attrs", JSON.stringify(opts.scopeAttrs));
     for (const p of list) {
-      form.append("path", p.path);
+      // `path` must precede its `file` part: the server pairs each file with
+      // the most recent path field.
+      if (p.path) form.append("path", p.path);
       // `as BlobPart`: TS 5.7+ types `Uint8Array<ArrayBufferLike>` as
       // incompatible with `BlobPart` over the `SharedArrayBuffer` edge, but a
       // plain Uint8Array is a valid Blob part at runtime.
-      const blob =
-        p.file instanceof Blob ? p.file : new Blob([p.file as BlobPart]);
-      const name = p.filename ?? (p.file instanceof File ? p.file.name : "file");
+      const blob = p.file instanceof Blob ? p.file : new Blob([p.file as BlobPart]);
+      const name =
+        p.filename ?? (typeof File !== "undefined" && p.file instanceof File ? p.file.name : "file");
       form.append("file", blob, name);
     }
-    const env = await this.http.postFormFull<{
-      data?: UploadedFile[];
-      warnings?: FileWriteWarning[];
-    }>("/app/file/upload", form);
-    return {
-      files: env.data ?? [],
-      ...(env.warnings ? { warnings: env.warnings } : {}),
-    };
-  }
-
-  list(path?: string): Promise<FileEntry[]> {
-    return this.http.post<FileEntry[]>("/app/file/list", path ? { path } : {});
+    const env = await this.http.postFormEnvelope<{ data: WrittenFile[]; warnings?: FileWriteWarning[] }>(
+      "/app/file/upload",
+      form,
+    );
+    return env.warnings ? { files: env.data, warnings: env.warnings } : { files: env.data };
   }
 
   /**
-   * Mint a short-lived signed URL for a file, keyed by its logical `path`
-   * (the same `path` used at upload). Returns a relative `signed_url`
-   * (`/_signed/<token>`) plus its expiry. The token defaults to a 5-minute
-   * TTL (server cap: 1 hour), so mint on-demand at view time rather than
-   * persisting the URL.
-   *
-   * Caller must pass the file's row ACL at mint time; Aggregate-binding
-   * callers are rejected (`pii_aggregate_only`).
-   *
-   * This is also the way to hand out a file too large for
-   * `/app/file/get`'s 10 MiB read cap — a signed URL streams through the
-   * public serve path instead.
+   * List the app's files in one stage (Reader; rows you cannot see are
+   * filtered out). Pass `prefix` to keep only paths under it — filtering
+   * is client-side, the server always returns the whole stage.
+   */
+  async list(opts: { stage?: FileStage; prefix?: string } = {}): Promise<FileEntry[]> {
+    const rows = await this.http.post<FileEntry[]>(
+      "/app/file/list",
+      opts.stage ? { stage: opts.stage } : {},
+    );
+    const prefix = opts.prefix?.replace(/^\/+/, "");
+    return prefix ? rows.filter((r) => r.path.startsWith(prefix)) : rows;
+  }
+
+  /** Write one file from base64 (Editor). Same limits as `upload()`. */
+  async save(input: SaveInput): Promise<WrittenFile & { warnings?: FileWriteWarning[] }> {
+    const env = await this.http.postEnvelope<{ data: WrittenFile; warnings?: FileWriteWarning[] }>("/app/file/save", {
+      path: input.path,
+      content_base64: input.contentBase64,
+      ...(input.mime !== undefined ? { mime: input.mime } : {}),
+      ...(input.stage !== undefined ? { stage: input.stage } : {}),
+      ...(input.scopeAttrs !== undefined ? { scope_attrs: input.scopeAttrs } : {}),
+    });
+    return env.warnings ? { ...env.data, warnings: env.warnings } : env.data;
+  }
+
+  /**
+   * Read one file's content as base64 (Reader + the row's own ACL).
+   * Files over 10 MiB are refused with code `file_too_large` — use
+   * `signUrl()` for those.
+   */
+  get(path: string, opts: { stage?: FileStage } = {}): Promise<FileContent> {
+    return this.http.post<FileContent>("/app/file/get", {
+      path,
+      ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
+    });
+  }
+
+  /**
+   * Mint a short-lived signed URL for a file. Returns a relative
+   * `signed_url` (`/_signed/<token>`) plus its expiry. Default TTL is
+   * 5 minutes (server cap: 1 hour), so mint at view time rather than
+   * persisting the URL. Aggregate-binding callers are rejected
+   * (`pii_aggregate_only`).
    */
   signUrl(
     path: string,
-    opts: { expires_in_sec?: number } = {},
+    opts: { expires_in_sec?: number; stage?: FileStage } = {},
   ): Promise<{ signed_url: string; expires_at: number; cache_seconds: number }> {
     return this.http.post<{ signed_url: string; expires_at: number; cache_seconds: number }>(
       "/app/file/sign-url",
@@ -240,63 +253,65 @@ export class FilesClient {
     );
   }
 
-  /**
-   * Rename / move a file row on the LIVE (release) stage.
-   *
-   * `stage: "release"` is sent explicitly — see the module header. Without
-   * it, an operator running `TFL5_STRICT_WRITE_STAGE=1` would have this
-   * rename silently retarget the draft stage and the live file would stay
-   * where it was, with no error.
-   *
-   * May return `warnings` — a rename that succeeded but is shadowed by a
-   * live snapshot. See {@link FileWriteWarning}.
-   */
-  async rename(id: string, name: string): Promise<FileRenameResult> {
-    const env = await this.http.postFull<{
-      data?: Partial<FileRenameResult>;
-      warnings?: FileWriteWarning[];
-    }>("/app/file/rename", { id, name, stage: "release" });
-    return { ...(env.data as FileRenameResult), ...(env.warnings ? { warnings: env.warnings } : {}) };
+  /** Move/rename a file or folder (Editor). */
+  async rename(path: string, newPath: string, opts: { stage?: FileStage } = {}): Promise<FileRenameResult> {
+    const env = await this.http.postEnvelope<{ data: FileRenameResult; warnings?: FileWriteWarning[] }>(
+      "/app/file/rename",
+      { path, new_path: newPath, stage: opts.stage ?? "release" },
+    );
+    return env.warnings ? { ...env.data, warnings: env.warnings } : env.data;
   }
 
   /**
-   * Soft-delete (moves to trash) on the LIVE (release) stage.
-   *
-   * `stage: "release"` is sent explicitly — see the module header and
-   * {@link rename}: an omitted `stage` is the difference between deleting
-   * the live file and silently deleting nothing.
-   *
-   * May return `warnings`. See {@link FileWriteWarning}.
+   * Soft-delete a file (moves it to the trash; see `trashList` / `restore`).
+   * Folders need `recursive: true`.
    */
-  async del(id: string): Promise<FileDeleteResult> {
-    const env = await this.http.postFull<{
-      data?: Partial<FileDeleteResult>;
-      warnings?: FileWriteWarning[];
-    }>("/app/file/del", { id, stage: "release" });
-    return { ...(env.data as FileDeleteResult), ...(env.warnings ? { warnings: env.warnings } : {}) };
+  async del(path: string, opts: { stage?: FileStage; recursive?: boolean } = {}): Promise<FileDeleteResult> {
+    const env = await this.http.postEnvelope<{ data: FileDeleteResult; warnings?: FileWriteWarning[] }>(
+      "/app/file/del",
+      { path, stage: opts.stage ?? "release", ...(opts.recursive ? { recursive: true } : {}) },
+    );
+    return env.warnings ? { ...env.data, warnings: env.warnings } : env.data;
+  }
+
+  /** List trashed rows (Editor). Omit `stage` to list both stages. */
+  trashList(stage?: FileStage): Promise<TrashEntry[]> {
+    return this.http.post<TrashEntry[]>("/app/file/trash-list", stage ? { stage } : {});
   }
 
   /**
-   * Restore a trashed row.
-   *
-   * Deliberately sends NO `stage`: `/app/file/restore` does not route
-   * through `parse_mutating_stage` — it restores the row to the stage the
-   * row was trashed from — so a `stage` literal here would be noise
-   * pretending to be a guarantee.
+   * Restore a trashed row by its `tid` (from `trashList`). Pass `newPath`
+   * when the original path has since been reused (files only).
    */
-  restore(id: string): Promise<void> {
-    return this.http.post("/app/file/restore", { id }).then(() => undefined);
+  restore(
+    fileTid: string,
+    opts: { newPath?: string } = {},
+  ): Promise<{ tid: string; path: string; original_path: string; renamed: boolean; stage: FileStage; is_dir: boolean }> {
+    return this.http.post("/app/file/restore", {
+      file_tid: fileTid,
+      ...(opts.newPath !== undefined ? { new_path: opts.newPath } : {}),
+    });
   }
 
   /**
-   * Create a folder row on the LIVE (release) stage.
-   *
-   * `stage: "release"` is sent explicitly — see the module header.
-   * `/app/folder/create` is one of the four `parse_mutating_stage` routes
-   * (`file/mod.rs:1059`), but it is NOT one of the four that emit
-   * `warnings`, so there is nothing extra to surface here.
+   * Permanently delete a trashed row and its bytes (Manager). Irreversible —
+   * there is no confirmation step on the server.
    */
-  createFolder(path: string): Promise<FileEntry> {
-    return this.http.post<FileEntry>("/app/folder/create", { path, stage: "release" });
+  purge(fileTid: string): Promise<{ tid: string; purged_size: number; is_dir: boolean }> {
+    return this.http.post("/app/file/purge", { file_tid: fileTid });
+  }
+
+  /** Replace a file's row-level ACL (Manager). Returns the stored arrays. */
+  aclSet(input: FileAclInput): Promise<FileAcl> {
+    const { stage, ...rest } = input;
+    return this.http.post<FileAcl>("/app/file/acl-set", { ...rest, stage: stage ?? "release" });
+  }
+
+  /** Create a folder (Editor). Defaults to the release stage. */
+  createFolder(
+    path: string,
+    opts: { stage?: FileStage } = {},
+  ): Promise<{ tid: string; path: string; stage: FileStage; parent_tid: string | null; is_dir: true }> {
+    return this.http.post("/app/folder/create", { path, stage: opts.stage ?? "release" });
   }
 }

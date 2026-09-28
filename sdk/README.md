@@ -1,170 +1,135 @@
-# `@tfl5/sdk`
+# Tafalo SDK (`@tfl5/sdk`)
 
-Official JS/TS client for the **tfl5** platform. Wraps the fixed REST
-contract — you don't hand-roll `fetch`, envelopes, or error parsing.
+JavaScript/TypeScript client for **Tafalo** (codename **tfl5**), a multi-tenant
+platform for building apps without running your own backend. The SDK wraps the
+platform's REST and WebSocket API so you don't hand-roll `fetch` calls,
+response envelopes or error parsing.
 
-> Status: **0.1.0.** Core transport + auth + the full client surface are
-> implemented, typecheck clean, and e2e-smoked against a real dev server.
-> Served by the platform at `GET /sdk.js` / `GET /sdk.mjs` (below); not yet
-> published to npm. See `docs/sdk.md` for the design spec this realizes and
-> `docs/api-reference.md` for the full REST contract.
-
-## Architecture → SDK map
-
-The platform spine is immutable: **`apps` → (`groups`, `roles`,
-`resources`, `docs`)**. Everything else composes from it. The SDK mirrors
-that shape one-to-one:
-
-| Platform primitive | Endpoints | SDK surface |
-|---|---|---|
-| `apps` (spine root) + 7-array ACL + members | `/app/update` `/app/get` `/app/list` `/app/acl-set` `/app/member/*` | `tfl5.apps` |
-| `roles` (per-app) | `/app/role/*` `/app/roles/list` | `tfl5.roles` |
-| `groups` (global) | `/admin/group/*` | `tfl5.groups` |
-| `resources` + `docs` | `/app/resource/*` `/app/doc/*` | `tfl5.resource(ma)` |
-| declarative hooks | `resources.hooks` | `tfl5.resource(ma).hooks` |
-| field-level encryption (lvl 0/1/2) | transparent (server splits `data_indexed`/`data_secret`) | — (you read/write plain fields) |
-| operators (catalog + WASM) | `/op/<id>/<action>` | `tfl5.operator(id).invoke()` |
-| operator admin / config | `/app/integrations/*` | `tfl5.integrations` |
-| tenant WASM lifecycle | `/app/wasm/*` | `tfl5.wasm` |
-| files + folders | `/app/file/*` `/app/folder/*` | `tfl5.files` |
-| per-doc shares + link claim | `/app/share/*` | `tfl5.shares` |
-| signed sources | `/app/source/*` | `tfl5.sources` |
-| auth (cookie + bearer) | `/login` `/logout` `/reg` `/user` `/auth/*` | `tfl5.auth` |
-| PDPD data-subject rights | `/user/data/export` `/user/data/erase` `/user/data/erase/cancel` | `tfl5.auth` (`exportData` / `eraseAccount` / `cancelErase`) |
-
-Anything not yet covered by a typed client: `tfl5.raw(path, body)`.
-
-## Auth modes
-
-- **cookie** (browser SPA) — `/login` sets the `_token` cookie; the SDK
-  sends `credentials: "include"`. Default when a `window` exists.
-- **bearer** (Node/CLI) — `/login` or a minted service token returns a
-  `token` the SDK captures and sends as `Authorization: Bearer`. Default
-  in Node.
-
-## Quick start
+- Works in the browser and in Node 18+ (ESM, no runtime dependencies).
+- Fully typed; every method maps to one documented endpoint.
+- Also served by every Tafalo server at `/sdk.js` and `/sdk.mjs`, so a page can
+  use it with no build step.
 
 ```ts
 import { TFL5 } from "@tfl5/sdk";
 
-const tfl5 = new TFL5({ host: "https://acme.example.com" }); // bearer in Node
-await tfl5.auth.login("dev_demo", "demo_pass_123");          // captures token
-tfl5.useApp("a-xxxx");                                        // scope app_tid
+const tfl5 = new TFL5({ host: "https://your-app.example.com" });
+await tfl5.auth.login("alice", "correct horse battery staple");
+tfl5.useApp("a-1234…");                           // scope calls to one app
 
-// Docs
-const task = tfl5.resource<{ title: string; status: string }>("task");
-const created = await task.create({ title: "Write SDK", status: "todo" });
-const open = await task.list({ where: { status: "todo" }, limit: 50 });
-await task.update(created.tid, { status: "done" });
-
-// Operators (catalog)
-const qr = await tfl5.operator("vietqr").invoke("generate", { amount: 50000 });
-
-// WASM operator — your own sandboxed server-side code (ACL-scoped to the
-// caller; limits in docs/api-reference.md §Operators). Manager-gated lifecycle:
-await tfl5.wasm.upload({ op_id: "price-engine", version: "1.0.0", bytecode: wasmBytes });
-await tfl5.wasm.activate("price-engine", "1.0.0");
-const quote = await tfl5.operator("price-engine").invoke("quote", { items });
-
-// Signed sources — register an inbound data channel (Manager-gated).
-// The secret is returned ONCE; store it securely before discarding the response.
-// Hand `ingest_url` to the external system; it signs pushes with HMAC-SHA256.
-// Full push-side protocol: docs/api-reference.md §Signed sources.
-const src = await tfl5.sources.register({ name: "stripe-events", target_resource_ma: "order" });
-console.log(src.ingest_url, src.secret); // secret shown once!
-const all = await tfl5.sources.list();   // secret omitted
-const rotated = await tfl5.sources.rotate(src.tid); // new secret, old invalidated
-await tfl5.sources.revoke(src.tid);
-
-// Files (multipart, never base64)
-await tfl5.files.upload({ path: "/avatars", file: someBlob, filename: "a.png" });
+const tasks = tfl5.resource<{ title: string; done: boolean }>("task");
+const t = await tasks.create({ title: "Write docs", done: false });
+await tasks.patch(t.tid, { done: true });          // merge; update() replaces
+const open = await tasks.list({ where: { done: false }, limit: 50 });
 ```
 
-## Errors
+## How the platform is shaped
 
-Every rejection is a `Tfl5Error` subclass keyed on the server's stable
-`code` (never the localized `msg`):
+Everything an app stores is built from five entities. The SDK mirrors them:
 
-```ts
-import { AccessDeniedError, NotFoundError, RateLimitError } from "@tfl5/sdk";
+| STT | Entity | What it is | SDK |
+|---|---|---|---|
+| 1 | app | a tenant: its members, roles, ACL, domains, front-end | `tfl5.apps`, `tfl5.useApp()` |
+| 2 | group | a set of users, usable in ACLs | `tfl5.groups` |
+| 3 | role | a per-app label granted to members, usable in ACLs | `tfl5.roles` |
+| 4 | resource | a typed collection (like a table) with fields and hooks | `tfl5.resources`, `tfl5.resource(ma).getSchema()` |
+| 5 | doc | one record of a resource | `tfl5.resource(ma)` |
 
-try {
-  await tfl5.resource("task").get("nope");
-} catch (e) {
-  if (e instanceof NotFoundError) { /* ... */ }
-  if (e instanceof AccessDeniedError) { /* ... */ }
-  if (e instanceof RateLimitError) { await sleep((e.retryAfter ?? 1) * 1000); }
-}
-```
+Access is decided by ACL arrays on apps, resources, docs and files —
+`managers`, `designers`, `editors`, `readers`, `deletable`, `noaccess` —
+holding user ids (`u-…`), group ids (`g-…`) and role tokens (`[r-…]`; send a
+raw `r-…` and the server adds the brackets). Fields can be encrypted at rest
+one by one (level 1 or 2); the SDK always reads and writes plain values.
 
 ## Install
 
-ESM-only package (Node ≥ 18, any bundler, or native browser modules):
+The package is not on npm yet. Build it from source (this folder), then add
+it to your project by path:
 
 ```bash
-npm install @tfl5/sdk
+npm install && npm run build            # in this folder → dist/
+npm install /path/to/this/folder        # in your project
 ```
 
-```ts
-import { TFL5 } from "@tfl5/sdk";
-const tfl5 = new TFL5({ host: "https://your-app.example.com" });
-```
-
-## No-build / `<script>` usage — served by the platform
-
-Every tfl5 server serves the browser build of this SDK directly, so a page
-can use it with no npm step:
+Or load the copy your Tafalo server serves, with no build step:
 
 ```html
 <!-- classic script: defines window.TFL5 -->
 <script src="/sdk.js"></script>
 <script>
-  const tfl5 = new TFL5();           // host defaults to window.location.origin
+  const tfl5 = new TFL5();          // host defaults to the page's origin
 </script>
 
-<!-- or ESM -->
+<!-- or as a module -->
 <script type="module">
   import { TFL5 } from "/sdk.mjs";
-  const tfl5 = new TFL5();
 </script>
 ```
 
-Both bundles are baked into the server binary, so `/sdk.js` always matches
-the SDK source the running server was built from.
+The served copy is built into the server binary, so it matches the API of the
+server that serves it — but it is only as new as that server. A server that
+has not been updated since 0.2.0 serves a copy in which **every call fails in
+the browser** with `TypeError: Illegal invocation`. If you see that, load a
+build of this SDK instead (`npm run bundle` → `dist/browser/sdk.js` and
+`dist/browser/sdk.mjs`).
 
-## Build
+## Signing in
+
+- **Browser (same origin):** `await tfl5.auth.login(user, pass)` sets the
+  session cookie; nothing else to do.
+- **Node:** the same call works — the SDK keeps the session cookie in memory.
+- **Server-to-server:** pass a service token (`st_…`) issued by the platform
+  operator: `new TFL5({ host, token: "st_…" })` (bearer mode).
+
+Google, Microsoft, magic link, phone OTP, QR-code, Telegram and VNeID sign-in
+are covered in [docs/authentication.md](docs/authentication.md).
+
+## Errors
+
+Every failure is thrown as a `Tfl5Error` subclass. Branch on `err.code` (a
+stable machine code), never on the message text:
+
+```ts
+import { NotFoundError, AccessDeniedError, RateLimitError } from "@tfl5/sdk";
+
+try {
+  await tfl5.resource("task").get("d-missing");
+} catch (e) {
+  if (e instanceof NotFoundError) { /* … */ }
+  else if (e instanceof RateLimitError) await sleep((e.retryAfter ?? 1) * 1000);
+  else if (e.code === "hook_validation_failed") { /* a hook refused the write */ }
+  else throw e;
+}
+```
+
+See [docs/errors.md](docs/errors.md).
+
+## Documentation
+
+| STT | Guide | Covers |
+|---|---|---|
+| 1 | [Getting started](docs/getting-started.md) | first app, resource and docs, from zero |
+| 2 | [Authentication](docs/authentication.md) | every sign-in method, sessions, service tokens |
+| 3 | [Data](docs/data.md) | resources, fields and encryption, docs, queries, paging, hooks, CSV/XLSX import, sharing |
+| 4 | [Files and sites](docs/files-and-sites.md) | file storage and stages, site publishing, bundles, encrypted attachments |
+| 5 | [Realtime](docs/realtime.md) | durable operator instances, live projections, chat |
+| 6 | [Billing](docs/billing.md) | catalog, checkout, credits, invoices, entitlement tokens |
+| 7 | [Errors](docs/errors.md) | error classes and codes |
+| 8 | [API reference](docs/reference.md) | every method, generated from the source |
+
+## Development
 
 ```bash
 npm install
-npm run typecheck     # tsc --noEmit
-npm run build         # emits dist/ (ESM + .d.ts) — the npm package
-npm run build:browser # emits dist/browser/sdk.{js,mjs} — standalone
-                      # browser bundles (IIFE + ESM) for <script> usage
+npm run typecheck
+npm test                 # unit tests (no server needed)
+npm run docs:check       # docs/reference.md matches src/
+TFL5_SMOKE_HOST=http://localhost:8090 npm run smoke   # end-to-end, needs a server
 ```
 
-## Publish
+The end-to-end smoke registers two users against a running server and drives
+every client through real requests (see the header of `smoke/smoke.mjs`).
 
-ESM-only; ships `dist/` + `README.md`. Before `npm publish`: bump `version`,
-`npm run build`, confirm `npm pack --dry-run` lists only `dist` + README. The
-`/sdk.js` server route is independent of npm publish (it reads the committed
-browser bundle) — re-run `npm run build:browser` + redeploy to update it.
+## License
 
-## End-to-end smoke test
-
-`smoke/smoke.mjs` drives the whole client surface against a **real** dev
-server (register → login → app → resource with a level-2 secret field →
-doc CRUD → list/where → a `set_fields` hook stamping a secret field → shares
-→ error mapping). It needs a running dev server (a local tfl5 server on :8090) and the dev Postgres container reachable
-(one fixture marks the smoke user's email verified — data writes are gated
-on it).
-
-```bash
-sdk/smoke/run.sh                      # host=http://localhost:8090, pg=tfl5_pg
-TFL5_SMOKE_HOST=… PG_CONTAINER=… sdk/smoke/run.sh
-```
-
-> The smoke run is what verified the request/response contract end-to-end:
-> it caught `update` being a full-replace (not a partial patch),
-> `shares.create` requiring `target`, and a `where` on an encrypted field
-> being rejected (not silently empty). Node cookie-mode uses an in-memory
-> cookie jar so `/login`'s `_token` persists across calls.
+[MIT](LICENSE)

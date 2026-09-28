@@ -145,8 +145,12 @@ documented here. Ask your operator.
 - **Rate limits** (per cell, operator-tunable):
   `/login`, `/reg`, `/auth/*`, `/user/2fa/*` → 10 req/min per IP
   (`TFL5_RATE_AUTH_PER_MIN`); `/app/doc/*`, `/app/file/upload`,
-  `/app/file/save` → 500 req/min **per tenant**
-  (`TFL5_RATE_WRITE_PER_MIN`); everything else → 600 req/min per IP
+  `/app/file/save` → 500 req/min **per tenant** by default — the tenant is
+  the one named by the `id_app` header, and the cap actually applied comes
+  from a live `rate` service entitlement if the tenant has one, else from its
+  license tier (`rate_writes_per_min`); `TFL5_RATE_WRITE_PER_MIN` is the
+  fallback when neither can be read, and a request without `id_app` falls
+  into the per-IP general bucket; everything else → 600 req/min per IP
   (`TFL5_RATE_GENERAL_PER_MIN`). `/healthz` and `/metrics` bypass the
   limiter. Rejection is 429 + `Retry-After`.
 - **Permission tags:** Anonymous / Authenticated / Reader / Editor /
@@ -161,10 +165,18 @@ documented here. Ask your operator.
   owner/managers and for a doc's own author.
 - **Signout envelope — three shapes, and `result` lies in two of
   them.** Most handlers answer **401** +
-  `{"isSignout": true, "result": true, "code": "unauthorized"}`. A few
-  wire-compat handlers — `/user`, `/app/list`, and `/app/update`'s create
-  branch — instead answer **HTTP 200** with a bare
-  `{"isSignout": true, "result": true}` and no `code`. The
+  `{"isSignout": true, "result": true, "code": "unauthorized"}`. The
+  older handlers answer **HTTP 200** with a bare
+  `{"isSignout": true, "result": true}` and no `code` instead. In this
+  build that is: `/app/list`, `/app/update`'s create branch, `/user`, and
+  the signed-in `/user/*` account routes (`profile`, `profile/update`,
+  `change-password`, `set-password`, `username/change`, `link`,
+  `send-verification`, `data/export`, `data/erase`, `data/erase/cancel`,
+  `email/list`, `email/add`, `email/remove`, `email/promote-primary`,
+  `email/send-verification`), plus `/license`, `/license/redeem`,
+  `/license/my-tokens`, `/licenses/usage`, `/licenses/preview-upgrade` and
+  `/licenses/setup-tenant`. Treat `isSignout: true` as "signed out" on
+  any status. The
   [`/service/*`](#service-entitlements) pair answers **HTTP 200** with
   `{"isSignout": true, "result": false}`.
 
@@ -363,9 +375,12 @@ last_used_at}` — the plaintext token never appears again.
 
 **Response (failure):** opaque (no user enumeration).
 ```json
-{ "result": false, "msg": "Invalid username or password.",
+{ "result": false, "msg": "<localised message>",
   "code": "auth_invalid_credentials", "timestamp": ... }
 ```
+
+`msg` is a fixed server string (in this build, Vietnamese; there is no
+locale negotiation) — branch on `code`.
 
 **Username matching folds case and Vietnamese diacritics.** `/reg`
 stores the *folded* form of whatever username was typed, so someone who
@@ -376,7 +391,7 @@ folding existed may hold usernames that no longer round-trip).
 
 The folding is Vietnamese-specific, not general Unicode normalisation:
 it maps the precomposed Vietnamese vowel families to their base letters
-and `đ`/`Đ` to `d`/`D`, strips a fixed set of punctuation
+and `đ`/`Đ` to `d`/`D`, strips a fixed set of punctuation <!-- hygiene-ok: documents the folding of these two letters -->
 (`! % ^ * ( ) + = < > ? / , : ; ' " & # [ ] ~ $` — `@`, `.`, `_` and
 `-` survive), turns whitespace runs and edge dashes into `_`, then
 lower-cases. Accents outside that table (`ü`, `ñ`, Cyrillic, …) pass
@@ -470,7 +485,8 @@ Link-required replies carry `requires_password: true` and
 Note: `/user/link` with `provider: "microsoft"` is stricter — it refuses
 an untrusted email outright instead of offering the password fallback.
 
-**Notes:** verifies via cached Google JWKS (6-hour cache).
+**Notes:** verifies via cached Microsoft JWKS (6-hour cache, separate
+from the Google one).
 
 ### POST /auth/qr/start
 
@@ -1447,8 +1463,9 @@ whose config is encrypted at rest and Manager-gated.
 then `{key,value}` is applied on top. The merge is a **shallow,
 top-level** merge — a patched key replaces its whole subtree.
 
-Codes: `config_patch_empty` (neither form supplied), `config_too_large`
-(a single patch may not exceed 256 KB serialised).
+Codes: `config_patch_empty` (neither form supplied, HTTP 400),
+`config_too_large` (a single patch may not exceed 256 KB serialised,
+HTTP 413).
 
 ---
 
@@ -1619,7 +1636,7 @@ semantics — omitted = preserve.
 }
 ```
 
-**Per-resource ACL (REQ-TFL5-015):** `readers / editors / noaccess /
+**Per-resource ACL:** `readers / editors / noaccess /
 deletable` set the resource's own ACL arrays (the same seven arrays
 `/app/resource/get` returns). `/app/resource/update` is the endpoint
 that WRITES them — there is no separate resource-ACL route. Omitted =
@@ -2025,7 +2042,7 @@ spreadsheet.
 `mapping_invalid`, `file_too_large`, `import_too_large`,
 `resource_not_found`, plus any per-row code the create pipeline raises.
 
-### Row-level scope (REQ-TFL5-006)
+### Row-level scope
 
 On top of the per-doc/per-resource ACL arrays, `/app/doc/*` supports a
 tenant-configured **row-level scope filter**: "the caller only sees
@@ -2920,8 +2937,11 @@ the app you named.
 - `auto_active: true` with `shortcut: {parent_app_tid, parent_domain}` —
   you own a parent domain, so no DNS step is needed.
 - `delegation: {...}` — a parent owner has granted you sub-binding.
+- `auto_active: true` with `proof_already_in_dns: "a-record" | "txt"` —
+  the domain's live DNS already carries a proof, so there is nothing to
+  publish; call `/app/domain/add` straight away.
 - otherwise DNS instructions, with the verification material nested at
-  `data.verify`.
+  `data.verify` (`{verify_token, records, a_record_configured, note}`).
 
 On a local-dev host the reply is `auto_active: true`.
 
@@ -2930,12 +2950,16 @@ On a local-dev host the reply is `auto_active: true`.
 **Auth:** Manager on `app_tid`.
 
 **Body:** `{app_tid, domain}`. There is **no** `verify_token` field —
-the A-record-only contract replaced the older TXT/token handshake. A
+the server derives the token itself and looks the DNS up live. A
 `verify_token` sent by an older client is silently ignored. (Some
 `/preview` responses still carry a legacy note telling you to send one;
 disregard it.)
 
-**Behaviour:** verifies DNS, INSERTs `domains` row with `active = TRUE`.
+**Behaviour:** accepts **either** proof — an A record pointing at this
+server, **or** the TXT record carrying the token (the same check as
+`/app/domain/verify`) — then INSERTs the `domains` row with
+`active = TRUE`. A TXT-only proof binds the domain without routing
+traffic to it; `warnings` says so.
 Idempotent on same-app re-add.
 
 **Two different quota refusals live here, with two different statuses.**
@@ -3209,7 +3233,9 @@ A module reaches its app's data via host calls (`host_query` /
   half of a row. It never decrypts `data_secret`, so field-level
   encrypted values are not reachable through a module.
 - `host_mutate` create needs app-Editor + write-scope; update needs
-  per-doc Editor + bidirectional scope (current **and** post-merge row).
+  per-doc Editor + bidirectional scope (current **and** new row). Neither
+  checks the resource's own ACL, and neither writes a doc-write audit row —
+  unlike `/app/doc/create` and `/app/doc/update`.
 
 > **`host_query` applies the same three gates as `/app/doc/list`.** A
 > module is not a way around the read path.
@@ -3228,10 +3254,15 @@ A module reaches its app's data via host calls (`host_query` /
 >
 > Gate 3 is **environment-conditional in exactly the way
 > `/app/doc/list`'s is** — it does nothing unless `TFL5_ENFORCE_SCOPE`
-> is on *and* the app populated `apps.acls.scope.field_map`. Parity with
-> the HTTP path holds either way, but the fence is only as strong as
-> that configuration. An opted-in app querying a resource missing from
-> `field_map` fails **closed** with `scope_not_configured`.
+> is on *and* the app populated `apps.acls.scope.field_map`, and the
+> fence is only as strong as that configuration. (The bridge applies
+> scope after `LIMIT`, so a page can come back shorter than `limit` —
+> see [wasm-operator-abi.md §7](./wasm-operator-abi.md).) An opted-in app querying a resource missing from
+> `field_map` fails **closed**. The guest does not see the
+> `scope_not_configured` code: every `host_query` failure (denied at
+> app level, not found, unconfigured scope) reaches it as
+> `{ok: false, code: "host_query_failed", error: "<message>"}`, told
+> apart only by the `error` text.
 >
 > ⚠ Two things to design around:
 > - **An empty result is also what a denial looks like.** Never read
@@ -3280,16 +3311,24 @@ total_bytes, uploaded_by, uploaded_at`.
 
 ### POST /app/wasm/upload  *(multipart)*
 
-**Auth:** Manager. Fields: `app_tid, op_id, version, file` (the `.wasm`,
-≤ 10 MB) plus optional `public`, `min_license` (defaults to the lowest
+**Auth:** Manager. Fields: `app_tid, op_id, version, file` (the `.wasm`)
+plus optional `public`, `min_license` (defaults to the lowest
 tier), `notes`. The module must load and export the ABI surface
 **before** it is stored, and it is stored **inactive**.
+
+**Size: keep the whole request under 2 MiB.** A larger request is refused
+while its body is read — 400 `bad_request` with the message
+`Error parsing multipart/form-data request`, or, for a much larger one, the
+connection is closed before a response arrives. That happens before the
+server's own 10 MiB module check, so today you never see `file_too_large`
+from this endpoint and the 10 MiB figure is not reachable.
 
 **Response:** `{result, tid, op_id, version, sha256, total_bytes, active,
 public, timestamp}`.
 
 **Codes:** `wasm_module_invalid`, `wasm_version_exists`,
-`wasm_op_id_invalid`, `wasm_version_invalid`, `file_too_large`.
+`wasm_op_id_invalid`, `wasm_version_invalid`, `bad_request` (request over
+2 MiB).
 
 ### POST /app/wasm/activate
 
@@ -3565,9 +3604,11 @@ Two details that change the arithmetic:
 - **You are charged in ciphertext bytes, not plaintext.** Encryption
   happens first and the encrypted length is what is billed, so budget
   slightly above the file size you uploaded.
-- **A re-upload of content the doc already holds skips the check.**
-  Likely duplicates are not charged, so an idempotent retry of a large
-  attachment will not fail on quota even when a first upload would.
+- **A re-upload of content the app already holds skips the check.**
+  The duplicate match is on `(app_tid, checksum)` — any doc in the app,
+  not only the target doc. Likely duplicates are not charged, so an
+  idempotent retry of a large attachment will not fail on quota even
+  when a first upload would.
 
 Before this was wired in, F3 bytes never touched the app's
 `used_storage` at all and an F3 upload could not fail on quota — if you
@@ -3997,13 +4038,12 @@ the client sends is refused with `read_only_stream`.
                            "hosted_checkout": true } ] }
 ```
 
-**`features` is an ARRAY of strings, not an object.** The column is
-`JSONB NOT NULL DEFAULT '[]'` (`migrations/0087_service_plan_catalog.sql:32`)
-and the handler falls back to `[]` when the row cannot be read as JSON
-(`billing.rs:164`) — indexing it by key gets you `undefined` on every plan.
-It is also not all display copy: the shipped `pro` row is
+**`features` is an ARRAY of strings, not an object.** It defaults to `[]`,
+and the server answers `[]` again when a stored value cannot be read as JSON
+— indexing it by key gets you `undefined` on every plan.
+It is also not all display copy: the shipped `pro` plan lists
 `["50 apps", "50GB storage", "custom_domain", "email_send",
-"f3_top_secret"]` (`migrations/0033_licenses_self_service.sql:60`), i.e.
+"f3_top_secret"]`, i.e.
 two human labels followed by three internal flag names. Map the entries you
 recognise to your own wording and drop the rest; printing the array raw puts
 platform-internal identifiers on your pricing page.
@@ -4623,7 +4663,7 @@ therefore **HTTP 400**; the rest are handler-authored HTTP 200 envelopes
 | `user_not_found`                | 200  | `/app/member/set-direct-grants` **granting** to a tid/username that does not exist. Revokes deliberately skip the check, so a deleted account's access can still be stripped |
 | `query_too_short`               | 200  | `/app/member/search` with fewer than 2 characters after trimming |
 | `owner_protected`               | **409** | `/app/member/remove` on the app author — a state to change (transfer ownership), not a permission to be granted |
-| `config_patch_empty` / `config_too_large` | 400 / 200 | `/app/config/patch` |
+| `config_patch_empty` / `config_too_large` | 400 / 413 | `/app/config/patch` |
 | `quota_app_max_storage`         | 400  | app or owner storage cap — `/app/file/upload` · `/save` **and `/app/f3/upload`**, which charges ciphertext bytes. One code for both caps; only `msg` says which |
 | `file_write_shadowed_by_snapshot` | 409 / — | `/app/file/upload` · `/save` · `/del` · `/rename` writing to `release` while a site snapshot is live. Normally a `warnings[]` entry on a **successful** call; a 409 refusal only under `TFL5_REFUSE_SHADOWED_FILE_WRITE=1` |
 | `file_extension_not_allowed`    | 400  | upload/save — extension not on the allowlist |

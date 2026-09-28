@@ -26,19 +26,41 @@ L3  Per-row / per-doc ACL — arrays on the doc/file row (§5)
 L4  Row-level scope      — field-based fencing (§7, opt-in)
 ```
 
-A caller edits a doc only if L1 **and** L2 **and** L3 **and** L4 all
-say yes. Emptiness is permissive: an empty L2/L3 array inherits the layer
-above; L4 is off unless the app opts in. `noaccess` and the scope filter
-never *grant* — they only subtract.
+On `/app/doc/update` and `/app/doc/del` a caller edits a doc only if L1
+**and** L2 **and** L3 **and** L4 all say yes (`/app/doc/acl-set` runs L1,
+L3 and L4 — not L2).
+Emptiness is permissive: an empty L2/L3 array inherits the layer above;
+L4 is off unless the app opts in. `noaccess` and the scope filter never
+*grant* — they only subtract.
 
 🚨 **L3 does not apply to doc reads.** `/app/doc/list` and `/app/doc/get`
 enforce **L1 → L2 → L4 only** — they never evaluate the doc row's own
-`readers` / `editors` / `noaccess` arrays. Per-doc ACL gates doc **writes**
-(`update`, `del`, `acl-set`, `share/create`) and the file/F3 paths. If you
-need to hide *rows* from someone who holds app-Reader, use **L2** (fence
-the whole resource) or **L4 scope** (fence by a field) — not per-doc
-`readers`. This is the single most important thing on this page; §5 has the
-detail.
+`readers` / `editors` / `noaccess` arrays. Per-doc ACL gates these doc
+writes: `update`, `del`, `acl-set` and `share/create`. If you need to hide
+*rows* from someone who holds app-Reader, use **L2** (fence the whole
+resource) or **L4 scope** (fence by a field) — not per-doc `readers`. This
+is the single most important thing on this page; §5 has the detail.
+
+⚠ **Not every path runs every layer.** Design with this list in hand:
+
+| Path | Layers it does **not** run |
+|---|---|
+| `/app/doc/list`, `/app/doc/get` | L3 |
+| `/app/doc/upsert` — when `match_on` finds a row and updates it | L3 |
+| `/app/doc/acl-set` | L2 |
+| `/app/file/upload`, `/app/file/save` overwriting an existing path | L3 (the file row's own arrays) |
+| WASM operator writes (`host_mutate` create / update) | L2 |
+| `/app/share/create` | L2, L4 |
+| `/app/share/claim` (anonymous link) | L1–L4 — the token is the grant |
+| `/app/f3/*` (encrypted attachments) | L2, L4 |
+| Rollup fields (aggregating resource B while reading resource A) | L2, L4 on resource B |
+| `POST /ingest/:source_tid` (signed sources) | L2, L4, validators and hooks |
+
+The practical rule: **app-level Editor is the real write boundary.** Per-doc
+and per-file arrays do stop an app Editor on `update`, `del` and `acl-set`,
+but that same Editor can still overwrite the row through `/app/doc/upsert`
+or `/app/file/upload` / `save`. Fence people you don't trust to write with
+L2 and L4, or keep them at Reader.
 
 - 5 permission levels: `Owner > Manager > Designer > Editor > Reader`
 - Each row that has ACL has 4-7 arrays of **tokens**: `managers`,
@@ -54,10 +76,13 @@ detail.
     then tested *before* the level arrays, so **a Manager listed in both
     `managers` and `noaccess` is DENIED** (§4). App-level `noaccess` *can* lock
     out a Manager — that is its job.
-  - **Row-level and resource-level `noaccess`** (on a doc/file row, or on the
+  - **Row-level and resource-level `noaccess`** (on a doc row, or on the
     `resources` row): the app author, **app Managers**, and that row's own
     `author` all bypass it — those checks run *before* the veto (§5, §6). So a
-    doc's `noaccess` cannot hide it from an app Manager.
+    doc's `noaccess` cannot hide it from an app Manager. On a **file** row, the
+    `/app/file/*` endpoints let only the app author and app Managers bypass it —
+    the file's own `author` does not — and when the file is **served** publicly,
+    nobody bypasses it, not even the app author.
   - Net: don't treat a *row's* `noaccess` as a way to hide data from an admin;
     equally, don't assume a Manager is unlockoutable — at the app level they
     are not. Only the app author is.
@@ -93,7 +118,11 @@ every endpoint that requires Reader or Editor or Designer.
 level (Manager / Designer / Editor) requires `users.email_verified = true`
 **only when the caller is the app's `author`**. The reasoning: if you are
 not the author, you reached write-class through an explicit ACL grant — the
-owner already vouched for you — so you are exempt. Three more carve-outs:
+owner already vouched for you — so you are exempt. Two places are stricter:
+F3 attachment upload, edit and delete (the doc-bound F3 routes) require a
+verified email from **any** non-Reader caller who has an email on record, and
+`/app/domain/request` plus `/app/domain/delegations/received` require one from
+any caller who has an email on record. Three more carve-outs:
 
 - **Reader is always exempt** (browse + account recovery).
 - **Users with no email on record are exempt entirely** — phone-OTP and
@@ -116,7 +145,10 @@ When the gate does fire, the failure carries `code: "email_not_verified"`.
 | The membership plane — `/app/member/{list,search,get}`, `/app/member/remove`; also `/app/scope/get`, `/app/domain/list` | **Designer** |
 | Define resource; **all role work** — `/app/roles/list`, `/app/role/{create,edit,del}`, `/app/member/set-roles`; **binding a custom domain** — `/app/domain/{preview,add,verify}` | **Manager** |
 | ACL writes — `/app/acl-set`, `/app/acl/*`, `/app/member/set-direct-grants` | **floor, raised by the bucket touched** — see §10 |
-| Delete app, **un**bind a domain (`/app/domain/del`), transfer ownership, master-key rotate; **appointing a manager** | Owner |
+| Delete app, **un**bind a domain (`/app/domain/del`), transfer ownership; **appointing a manager** | Owner |
+
+Master-key rotation is not an app operation: `/admin/master-key/*` requires
+platform admin.
 
 **Don't compute this table client-side — ask the server.** `/app/get` returns
 `my_level`, one of `"owner"`, `"manager"`, `"designer"`, `"editor"`, `"reader"`,
@@ -132,7 +164,7 @@ Domains screen that offered an Owner-only action to a Manager. Branch your UI on
 tid can itself sit in `apps.managers`, so handing out role editing hands
 out manager appointment by proxy — gated at Designer (its prior value), a
 Designer could assign a Manager-conferring role to itself. That is why
-`/app/member/set-roles` carries the same Manager bar as `roles.rs`. Roles
+`/app/member/set-roles` carries the same Manager bar as `/app/role/*`. Roles
 never confer Owner (author-only), so Manager is the correct bar and not a
 higher one. This is a rule people try to "fix" back down to Editor; don't.
 
@@ -152,7 +184,7 @@ administer"* vs *"am I handing my hostname to somebody else's app"*:
 
 | Routes | Gate |
 |---|---|
-| `/app/domain/request` — ask an owner for a sub | **Manager** (using your own app) |
+| `/app/domain/request` — ask an owner for a sub | **Manager** (using your own app), plus a verified email if you have one on record |
 | `/app/domain/{mode,label-rules,get-config,whitelist/*,subs-of-parent,requests/received,request/approve,request/deny,delegation/test-pattern}` | **Owner** of the parent app, **plus** the parent domain row must actually belong to that app |
 | `/app/domain/reclaim-sub` | **Owner of the parent DOMAIN** — see below; the `admin_app_tid` you pass is not the thing being authorised |
 | `/app/domain/delegations/received`, `/app/domain/requests/mine`, `/app/domain/request/cancel` | **no app-level permission — session identity only** |
@@ -176,13 +208,16 @@ would let the sub stand in as its own parent and compare you against the sub's
 owner instead of the parent's.)
 
 ⚠ **Read the last row correctly: those routes are not "ungated", they are
-SELF-SCOPED.** Two of them take no `app_tid` at all, because they answer "what
+SELF-SCOPED.** None of the three takes an `app_tid`, because they answer "what
 can *I* do" rather than "what is this app configured to do", so there is no app to
-gate against. Each is fenced by the caller's own identity in SQL — the listings
-match `grantee_user_tid` / `requester_tid` equal to the caller, and `cancel` only
-touches a row that is both yours and still `pending`, answering `not_found`
-otherwise (so it is not an existence oracle for other people's requests).
-`delegations/received` additionally requires a verified email. **Do not extend
+gate against. `requests/mine` and `request/cancel` are fenced by the caller's own
+identity in SQL — the listing matches `requester_tid` equal to the caller, and
+`cancel` only touches a row that is both yours and still `pending`, answering
+`not_found` otherwise (so it is not an existence oracle for other people's
+requests). `delegations/received` returns the caller's own grants **plus every
+public-mode parent domain on the platform**, with its label rules — that part is
+platform-wide by design, not fenced by identity — and it requires a verified
+email from a caller who has one on record. **Do not extend
 that pattern to a route that does take an `app_tid`** — there, session identity
 alone would be a missing gate rather than a scoped one.
 
@@ -223,12 +258,11 @@ username-vs-role-tid collision. Usernames are sanitised on the way in with
 `[` and `]` stripped, so a username can never equal `[r-…]`. Without the
 brackets, someone could register the username `r-<known role tid>` and
 match that role's grants through the username slot of their permission
-set. Group and user tids need no such protection because they are
-generated server-side and never come from user input.
+set.
 
-**You usually don't have to add the brackets yourself — and that now covers
-every ACL write surface, not just the app-level ones.** These endpoints wrap a
-raw `r-…` on the way in and drop blank entries:
+**You usually don't have to add the brackets yourself — on the dedicated ACL
+endpoints.** These endpoints wrap a raw `r-…` on the way in and drop blank
+entries:
 
 | Layer | Endpoints |
 |---|---|
@@ -243,7 +277,14 @@ role granted through it landed inert. Fixed at the server rather than in each
 client, because three write paths had already proved the convention can be
 forgotten.
 
-⚠ **Only `/app/file/acl-set` echoes the STORED arrays back.** It returns what it
+⚠ **The ACL arrays accepted inline by `/app/doc/create`, `/app/doc/create-batch`,
+`/app/doc/update` and `/app/doc/upsert` are stored verbatim** — no wrapping, no
+blank-dropping. A raw `r-…` sent there grants nobody and still answers
+`result: true`. Wrap role tids as `[r-…]` yourself on those paths, or set the ACL
+through `/app/doc/acl-set` afterwards.
+
+⚠ **Of the two per-row endpoints, only `/app/file/acl-set` echoes the STORED
+arrays back** (so do the four app-level writers above). It returns what it
 wrote — a raw `r-…` comes back wrapped, a blank entry is gone — so the response
 is a usable confirmation. `/app/doc/acl-set` returns only `{tid, acl_updated:
 true}`: it normalises just the same, but tells you nothing about what it kept.
@@ -312,8 +353,9 @@ For `require_app_perm(app_tid, level)`:
 1. Resolve the caller. NOT cookie-only: the session `_token` cookie,
    an `Authorization: Bearer <service token>`, an edge-signed header,
    or the cluster token all land here. No valid identity → Unauthorized.
-2. Cluster bypass: the `_cluster` service principal passes EVERY level
-   immediately, skipping steps 3-8 entirely (see §14).
+2. Cluster bypass: the `_cluster` service principal passes EVERY level,
+   skipping the user re-check, the ACL decision and the email gate
+   (steps 3, 6-8); the app row must still exist (step 5) (see §14).
 3. Re-check the user row live: no such user, or banned → Unauthorized.
    (This defeats the short-lived ACL cache — a ban takes effect at once.)
 4. SELECT author, managers, designers, editors, readers,
@@ -415,16 +457,22 @@ column.
 |---|---|
 | `/app/doc/list` | **No** |
 | `/app/doc/get` | **No** |
-| `/app/doc/update` | Yes (Editor) |
+| `/app/doc/update` | Yes (Editor) — and this endpoint also **accepts `editors` / `readers` / `deletable` / `noaccess` in its body**, so a doc Editor can rewrite the doc's ACL through it |
+| `/app/doc/upsert` | **No** on the update branch (a matched row is overwritten on app-level Editor) |
 | `/app/doc/del` | Yes (Editor **plus** a `deletable` cross-check) |
 | `/app/doc/acl-set` | Yes (Editor, then owner/manager-or-author) |
 | `/app/share/create` | Yes (Editor on the doc being shared) |
-| `/app/file/*`, `/app/f3/*` | Yes |
+| `/app/file/list`, `get`, `sign-url`, `del`, `rename`, `restore` | Yes |
+| `/app/file/upload`, `/app/file/save` onto an existing path | **No** — app Editor + scope only |
+| `/app/f3/{upload,download,list,delete,edit}` | Yes |
+| `/app/f3/{grant,revoke,access-log,grants}` | No — app-level only (Editor for grant/revoke, Manager for the two reads) |
 
 Read paths are gated by L1 + L2 + L4 and then return the row. **Putting a
 user in a doc's `noaccess` does not stop them reading that doc** if they
 hold app-level Reader and clear the resource ACL and scope. Design
-accordingly: fence reads with §6 (resource ACL) or §7 (scope).
+accordingly: fence reads with §6 (resource ACL) or §7 (scope). The
+owner/manager-or-author restriction on changing a doc's ACL exists only on
+`/app/doc/acl-set`.
 
 ### Decision order for per-doc / per-file (on the paths that do run it):
 
@@ -452,9 +500,11 @@ with all four arrays empty is visible to anyone with app-level Reader.
 [u_bob]` makes Bob an editor even if Bob is only an app-level Reader.
 This is the row-scoping mechanism for fine-grained delegation.
 
-**Per-row `noaccess` restricts writes, not reads.** A doc with `noaccess:
-[u_carol]` blocks Carol from updating or deleting it — but does not hide it
-from her `list`/`get`.
+**Per-row `noaccess` restricts some writes, not reads.** A doc with
+`noaccess: [u_carol]` blocks Carol from `/app/doc/update` and
+`/app/doc/del` — but does not hide it from her `list`/`get`, and if Carol
+holds app-level Editor it does not stop `/app/doc/upsert` from overwriting
+the row when `match_on` finds it.
 
 **Email gate at row level.** The row-level check has its own email gate for
 non-Reader levels, but every `/app/doc/*` endpoint uses the no-email
@@ -466,7 +516,8 @@ variant, so in practice it only fires on the F3 file paths.
 
 The per-row ACL in §5 answers *"who can touch THIS record."* The
 resource-level ACL answers the coarser question *"who can touch THIS
-KIND of record at all"* — it gates every doc op on a resource **type**
+KIND of record at all"* — it gates the `/app/doc/*` HTTP ops listed below
+(every one except `acl-set` and `import-preview`) on a resource **type**
 before the request ever reaches an individual row.
 
 The `resources` table carries the same ACL-array shape as `apps` and
@@ -504,7 +555,9 @@ require_app_perm(app, Reader|Editor)     ← L1
 ```
 
 The L2 call sits between the app-level check and the row scope filter.
-It is wired on **every** doc path:
+It is wired on the `/app/doc/*` HTTP paths below. It is **not** run by
+WASM operator writes (`host_mutate` create/update), `/app/share/*`,
+`/app/f3/*`, rollup fields, or `/ingest` — see the table in §1.
 
 | Doc op | L2 level asked |
 |---|---|
@@ -577,6 +630,13 @@ assume the whole read surface is existence-safe; only `list` is.
 Use L2 to draw the broad boundary (only HR reads any `salary` doc),
 then L3 to carve exceptions within what L2 already allows. They AND
 together — L2 can only *narrow*, never widen, what L3 also permits.
+
+⚠ **L2 does not reach aggregates or attachments.** A rollup field on
+resource A that sums resource B's rows is computed regardless of the
+caller's access to B, so don't declare a rollup over a fenced resource on a
+resource with a wider audience. F3 attachments on a doc in a fenced
+resource are gated by the doc's own ACL (L3) on upload/download/list/edit/
+delete, not by L2 — fence them with per-doc `readers` / `noaccess`.
 
 ---
 
@@ -684,8 +744,11 @@ Putting a `[r-<uuid>]` token in an ACL array is the **only** scalable
 authorization pattern at tenant scale:
 
 - ❌ **Don't** put thousands of individual `user_tid`s in `readers`
-  — array grows linearly, every membership change is N updates, and the
-  array is capped at 5000 entries.
+  — array grows linearly and every membership change is N updates.
+  The bulk app-level setters (`/app/acl-set`, `/app/acl/set`,
+  `/app/acl/bulk-import`) and role create/edit refuse more than 5000
+  entries; the one-at-a-time `/app/member/*` grants and per-doc, per-file
+  and resource arrays have no cap, which makes them easier to bloat.
 - ✅ **Do** put one `[r-<uuid>]` token in `readers` + manage role
   members via `/app/role/edit` — O(1) per ACL row, and it revokes
   everywhere at once (§8).
@@ -703,11 +766,12 @@ Protections built into tfl5 endpoints:
 **App owner can never be locked out.**
 - The author column bypasses `noaccess` at every layer.
 - `apps.author` changes only through `/app/transfer-ownership` (Owner-gated).
-  `/app/update` cannot touch it, and it explicitly rejects the six ACL
-  arrays and the `acls` blob with `app_update_no_acl_fields`. (Two internal
-  paths also normalise the column — a username change rewriting a legacy
-  username-form author to a tid, and the admin bootstrap below — but neither
-  transfers ownership to a different person.)
+  `/app/update` cannot touch it: it rejects the six ACL arrays with
+  `app_update_no_acl_fields` and the `acls` blob with
+  `app_update_no_nested_acls`. (Three internal paths also rewrite the
+  column — a username change rewriting a legacy username-form author to a
+  tid, the admin bootstrap below, and account erasure, which tombstones
+  it — but none of them hands ownership to a different live person.)
 
 **Only the app's AUTHOR appoints managers — but one route bypasses that.**
 - `apps.managers` is priced at **Owner** in the shared ladder, and every
@@ -764,9 +828,11 @@ editing when you want the guard.
 **You cannot accidentally lock the platform out of `tfl5-admin`.**
 - A bootstrap promotion fires when `tfl5-admin.managers` is NULL, empty, or
   the legacy `['system']` placeholder: the acting user is installed as
-  Manager. It runs on registration *and* on the `/user` endpoint, so an
-  existing account is promoted on its next authenticated call. The update is
-  conditional in SQL, so two concurrent registrations cannot both win.
+  Manager — and, when the author is still the `''` / `system` placeholder,
+  as author. It runs on registration, on the `/user` endpoint, and on
+  magic-link and VNeID sign-in, so an existing account is promoted on its
+  next authenticated call. The update is conditional in SQL, so two
+  concurrent registrations cannot both win.
 
 ---
 
@@ -879,6 +945,9 @@ Requires Editor on the doc, and then the caller must be app owner/manager
 applies, so a narrowly-scoped Manager can't rewrite ACL on rows outside
 their lane.
 
+⚠ That owner/manager-or-author restriction is specific to this endpoint.
+`/app/doc/update` accepts the same four arrays from any doc Editor (§5).
+
 ### Per-file
 ```
 POST /app/file/acl-set
@@ -912,8 +981,18 @@ POST /app/share/create
 ```
 
 Creating a share requires **Editor on that doc** (a per-doc check, not just
-app-level), and the resource must not have sharing switched off. Share is an
-orthogonal channel; it doesn't mutate the doc's own ACL.
+app-level), and the resource must not have sharing switched off. It does
+**not** run the resource ACL (L2) or scope (L4). Share is an orthogonal
+channel; it doesn't mutate the doc's own ACL.
+
+**Only `target: "anonymous"` grants anything today**, through the claim
+token. A share naming a user, role or group is recorded, but no read path
+consults it — it neither widens nor narrows what that principal can read.
+
+`POST /app/share/list { app_tid }` is gated at app-level Editor and returns
+the app's 200 most recent shares (revoked ones included), **with the `token`
+of each anonymous link**.
+Treat app Editor as able to read any doc that has an anonymous share.
 
 Revoke with `POST /app/share/revoke { app_tid, tid }` — note this is gated
 at app-level Editor, which is *weaker* than create, so anyone who can edit
@@ -922,7 +1001,12 @@ in the app can revoke any share. A missing share returns
 
 Anonymous link claim: `POST /app/share/claim { app_tid, token }` — **both
 fields are required**, and this is the one unauthenticated endpoint in the
-family.
+family. It returns the doc's level-0 data (narrowed by `fields`).
+
+If a resource must never leave through a link, switch sharing off on it
+**and revoke its existing links** — the switch is checked when a share is
+created, not when a link is claimed, and L2 and scope do not stop a doc Editor
+from creating one.
 
 > The `fields` whitelist above is *access* control, not *confidentiality*
 > — it narrows what a share exposes, but the tfl5 server can still read
@@ -974,17 +1058,18 @@ For an app `a-example` with school-management data:
   "managers": ["u_app_ops_admin"],
   "designers": [],
   "editors": [],                    ← per-row only; app-level open is too coarse
-  "readers": ["G_author"],          ← every authenticated user can READ a doc
-                                    ← in this app (subject to per-row gates)
+  "readers": ["G_author"],          ← every authenticated user can READ
+                                    ← every doc in this app, unless L2/L4 narrow it
   "deletable": [],
   "noaccess": []
 }
 ```
 
-Then EVERY doc carries explicit per-row arrays so visibility is gated
-correctly. The `G_author` in app.readers means "to even see this app
-exists, you need a session" — but actually seeing data requires
-matching a per-row token.
+Then every doc carries explicit per-row arrays for **writes**. Be clear
+about what `G_author` in `app.readers` does: it lets **every authenticated
+user read every doc in this app** unless a resource ACL (§6) or scope (§7)
+narrows it. The per-row `readers` below do not hide anything on
+`list`/`get`.
 
 ### Per-row ACL patterns
 
@@ -1051,7 +1136,8 @@ health officer today."
    matches nothing.
 
 3. **Don't put thousands of user_tids in an array.** Use a role.
-   (Arrays are capped at 5000 entries anyway.)
+   (The bulk app-level setters and role create/edit refuse more than 5000
+   entries; other paths are not capped.)
 
 4. **Don't use `editors` to delegate read.** Editors can WRITE.
    Use `readers` for read-only grants.
@@ -1065,10 +1151,11 @@ health officer today."
    the lockout guard.
 
 7. **Don't store the owner's actions in a separate "audit" array — but do
-   check what the platform log actually covers first.** ACL edits, ownership
-   transfer and refusals are all there; role CRUD writes nothing, doc writes
-   are opt-in per resource, and `/app/member/*` rows do not surface in the
-   tenant feed at all (§13). As a tenant you read it with
+   check what the platform log actually covers first.** App-level ACL edits,
+   ownership transfer and app-level/per-doc refusals are there; role CRUD,
+   resource/per-doc/per-file ACL edits and share create/revoke write nothing,
+   doc writes are opt-in per resource, and `/app/member/*` rows do not
+   surface in the tenant feed at all (§13). As a tenant you read it with
    `POST /app/audit/list` (Manager on your app); `/admin/audit/list` is
    platform-admin only and is not available to you.
 
@@ -1104,7 +1191,7 @@ mint and revoke, and the authentication events all write one row to the audit
 log, with a **server-resolved** actor (never a client-supplied one).
 
 ⚠ **"Every mutation" is the wrong mental model — check coverage before you rely
-on it.** Three gaps are real and none of them announce themselves:
+on it.** Four gaps are real and none of them announce themselves:
 
 | Mutation | Row written? | Visible in `/app/audit/list`? |
 |---|---|---|
@@ -1112,7 +1199,14 @@ on it.** Three gaps are real and none of them announce themselves:
 | `/app/transfer-ownership` | yes | yes |
 | `/app/member/{set-roles,set-direct-grants,remove}` | yes | **no** — see below |
 | `/app/role/{create,edit,del}` | **no row at all** | n/a |
-| `/app/doc/{create,update,del,…}` | **only if the resource opts in** | yes, when written |
+| `/app/resource/{create,update}` (incl. its ACL arrays), `/app/doc/acl-set`, `/app/file/acl-set` | **no row at all** | n/a |
+| `/app/share/{create,revoke}` | **no row at all** | n/a |
+| `/app/doc/{create,update,del}` | **only if the resource opts in** | yes, when written |
+| `/app/doc/{create-batch,import,upsert}` | yes, always (`doc.create_batch`, `doc.upsert.*`) | yes |
+
+- **Only app-level ACL edits are audited.** Changing a resource ACL, a doc's
+  or a file's own arrays, or creating/revoking a share leaves no trace in the
+  log.
 
 - **Role CRUD is unaudited.** Creating, editing or deleting a role writes
   nothing. Since a role's `members` list is what every `[r-…]` grant resolves
@@ -1129,18 +1223,23 @@ on it.** Three gaps are real and none of them announce themselves:
   not appear in the app owner's own audit feed.** Plan for that: if you need
   membership changes in a tenant-readable trail, mirror them into a doc of your
   own.
-- **Doc-write auditing is opt-in per resource.** It is off unless you set
-  `audit_writes` on the resource (`/app/resource/{create,update}`), and it is
-  off by default. When on, the row records **content hashes** before and after —
+- **Doc-write auditing is opt-in per resource** for `/app/doc/{create,update,del}`.
+  It is off unless you set `audit_writes` on the resource
+  (`/app/resource/{create,update}`), and it is off by default. (`create-batch`,
+  `import` and `upsert` write their own row either way.) When on, the row
+  records **content hashes** before and after —
   not values — plus the doc tid; enough to prove a change happened and to detect
   a later edit, not enough to reconstruct what the field said.
 
 **REFUSALS are recorded too — an app owner can see who probed them.** A
-permission check that turns somebody away writes its own row: action
+refusal by the app-level gate or the per-doc gate writes its own row: action
 `app.access.denied`, `result: "failure"`, and a `detail.required_level`
 naming the level the caller **lacked** (naming what they lack is what tells
 an owner whether to grant it), plus `detail.doc_tid` when the refusal was
 doc-level. Filter for it with `action_prefix` on `/app/audit/list`.
+Refusals by the resource ACL (L2), by scope (L4), by the owner/author check
+of `/app/doc/acl-set`, by the delete `deletable` check, and per-doc refusals of
+a WASM operator's `host_mutate` update are **not** recorded.
 
 Three properties to know before you build on it:
 
@@ -1176,7 +1275,8 @@ warned about, and the refusal is still a refusal.
   omitted unless you pass `include_payload`; the window defaults to 7 days
   and is capped at 90 per call.
   - 🚨 **On a `doc` row, `target_tid` is the RESOURCE's tid, not the doc's.**
-    The doc tid lives in the payload as `doc_tid`, so it is only visible with
+    The doc tid lives in the payload as `doc_tid` (under `docs[].tid` for a
+    `doc.create_batch` row), so it is only visible with
     `include_payload: true`. Filtering `target_tid` by a doc tid returns
     nothing — filter by the resource tid and read `doc_tid` off the payload.
   - **Why a join and not a `detail.app_tid` field:** `detail` is not always
@@ -1190,9 +1290,10 @@ warned about, and the refusal is still a refusal.
 
 Hook firings write to `hook_invocations` (one row per `after_*` execution,
 success or failure) and operator invocations write to `op_invocations` (one
-row per `/op/<id>/<action>` call). Both writes are **best-effort**: a
-failure is logged and the request still succeeds, so treat them as evidence
-rather than as a guaranteed ledger.
+row per `/op/<id>/<action>` call). Both writes are **best-effort** and the
+request still succeeds when they fail — a failed `hook_invocations` insert is
+logged, a failed `op_invocations` insert is dropped silently — so treat them
+as evidence rather than as a guaranteed ledger.
 
 Together these give you traceability without adding audit columns to your
 own resources — unless your requirement is FIELD-specific rather than
@@ -1208,10 +1309,10 @@ reach the same endpoints, and you should know they exist:
 
 | Principal | How it authenticates | Effect on the four layers |
 |---|---|---|
-| **Platform admin** | app-Manager on the fixed `tfl5-admin` app | Not a 6th level. `/admin/*` pins the app id to that constant, so no other app's Manager can reach it. `/admin/*` additionally requires a fresh 2FA verification when the account has 2FA enrolled. |
+| **Platform admin** | app-Manager on the fixed `tfl5-admin` app | Not a 6th level. Most `/admin/*` routes pin the app id to that constant, so no other app's Manager can reach them; ten are tenant routes gated on the `app_tid` you pass (`/admin/public-form/*`, `/admin/chat/*`, `/admin/bundle/sweep-legacy`, `/admin/app/storage/migrate`, `/admin/tid/decode`). `/admin/*` additionally requires a fresh 2FA verification when the account has 2FA enrolled; with mandatory admin 2FA switched on, an un-enrolled interactive caller gets 403 `twofa_enrolment_required`. |
 | **Service token** | `Authorization: Bearer st_…`, SHA-256 stored, revocable, optional TTL | Full ACL evaluation **as its bound user** — the token is that user, so its user's ACL is the *ceiling*. A `scopes` list narrows it **below** that ceiling: scopes **are enforced**, by a middleware ahead of the API surface (one documented carve-out), and a token used off-scope is refused **403 `token_scope_denied`** before the handler runs. See the scope gate below. |
-| **Signed source** (`/ingest/:source_tid`) | HMAC-SHA256 over `timestamp . body` with a replay window | **Does not bypass ACL.** The signature establishes identity; the write then runs as an auto-provisioned service principal through the ordinary app-level Editor check. |
-| **`_cluster`** | the deployment's cluster token | The widest bypass in the system: passes `require_app_perm` at every level, the resource ACL, the scope filter, and the admin 2FA gate. It exists for cross-tenant platform orchestration. Nothing in a tenant app can obtain it. |
+| **Signed source** (`/ingest/:source_tid`) | HMAC-SHA256 over `timestamp . body` with a replay window | The signature establishes identity; the write then runs as an auto-provisioned service principal through the app-level Editor check **only** — the resource ACL (L2), scope (L4), field validators and hooks are not evaluated on `/ingest`. |
+| **`_cluster`** | the deployment's cluster token | The widest bypass in the system: passes `require_app_perm` at every level, the resource ACL, the scope filter, and the admin 2FA gate. It exists for cross-tenant platform orchestration. It does **not** bypass per-doc ACL (L3): `/app/doc/{update,del,acl-set}` still evaluate the row. |
 
 ### Service-token scopes — a path-prefix gate
 
@@ -1228,13 +1329,16 @@ cell is drained) and, as a side effect, they are not scope-checked:
 `/healthz`, `/livez`, `/metrics`, `/security/csp-report`, `/ws/chat`,
 `/ws/durable/subscribe`, and the three control-plane routes
 `/admin/cell/{drain,resume}` and `/admin/version/apply`. The first four carry no
-tenant data and the two sockets authenticate separately, but **the three
-`/admin/*` ones matter**: a scoped token whose subject is a platform admin
-reaches them without its scopes being consulted. They are still gated — each one
-requires platform admin, and an operator can additionally require mTLS on them —
-but do not model a path scope as the fence there. Everything under `/app/*`,
-`/user/*`, `/admin/*` other than those three, and the rest of the API is behind
-the gate.
+tenant data. **The two sockets do**: they accept service tokens through the
+ordinary identity path, so a path-scoped token can open them regardless of its
+scopes. **The three `/admin/*` ones matter too**: a scoped token whose subject
+is a platform admin reaches them without its scopes being consulted. They are
+still gated — each one requires platform admin, and an operator can
+additionally require mTLS on them — but do not model a path scope as the fence
+there. The **public serving fallback** (tenant pages and ACL-gated assets) is
+also outside the gate: a service token presented there is authenticated, but
+its scopes are not checked. Everything under `/app/*`, `/user/*`, and
+`/admin/*` other than those three is behind the gate.
 
 **A scope is a request PATH PREFIX, matched on segment boundaries** — or the
 literal `*`, which means everything. `/app/bundle` permits `/app/bundle`,
@@ -1242,8 +1346,9 @@ literal `*`, which means everything. `/app/bundle` permits `/app/bundle`,
 `/app/bundlefoo`, which is a different route that merely starts with the
 same letters. A trailing slash on the scope is ignored (`/app/bundle/` and
 `/app/bundle` are the same scope — an operator's habit must not silently
-lock their token out), and a **blank** entry inside a non-empty list grants
-nothing.
+lock their token out), and a **blank** entry beside a path scope grants
+nothing. A list made only of blank entries cannot be evaluated and is
+therefore **unrestricted** (clause 2 below).
 
 Named capabilities (`deploy`, `data:read`) would read better and were
 **considered and rejected** — don't re-propose them as a doc fix. They need
@@ -1288,7 +1393,8 @@ expect a token labelled for one job to hold the whole account.
 | Path covered by an evaluable scope | handler runs | — |
 | Path outside every evaluable scope | **403** | `token_scope_denied` |
 | The scope lookup itself failed | **503** | `token_scope_unavailable` |
-| Unknown / revoked token | falls through to the anonymous path | — |
+| Unknown token | falls through to the anonymous path | — |
+| Revoked or expired token that carries path scopes, on an off-scope path | **403** | `token_scope_denied` |
 
 - The **403** body is `{result: false, msg, code, data: {path, scopes}}`.
   Note the asymmetry, because it will look like a bug: `msg` names only the

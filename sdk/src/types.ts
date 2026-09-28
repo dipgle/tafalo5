@@ -2,7 +2,7 @@
 //
 // The server always answers a successful call with the envelope
 // `{ result: true, data: <payload>, timestamp: <ms> }` and an error with
-// `{ code: <machine-code>, msg: <human> }` (see docs/error.rs wire table).
+// `{ code: <machine-code>, msg: <human> }` (see docs/errors.md).
 // The SDK unwraps `data` for callers and throws a typed error keyed on
 // `code` for everything else.
 
@@ -17,54 +17,17 @@ export interface SuccessEnvelope<T = unknown> {
 export interface ErrorEnvelope {
   code?: string;
   msg?: string;
-  /** Legacy 401 marker (GAP-8); kept for back-compat detection. */
+  /** Set when the session is missing or expired (some endpoints answer HTTP 200 with it). */
   isSignout?: boolean;
   result?: boolean;
   /**
-   * Machine-readable detail about the refusal, when the raising site supplied
-   * one. Present on the refusals worth acting on rather than just reporting:
-   *
-   * - `quota_exceeded` — which cap was hit, e.g.
-   *   `{cap:"app_create_rights", rights, created, remaining, refundable_on_delete}`
-   *   or `{cap:"user_max_apps", max, used, refundable_on_delete}`. Note the two
-   *   caps do not mean the same thing: one is a lifetime counter, the other a
-   *   concurrent cap.
-   * - `token_scope_denied` — `{path, scopes}`, where `scopes` is the token's
-   *   FULL stored list while the message names only the enforceable subset.
-   * - durable `instance_quota` / `tick_deadline` — the live/limit counts and
-   *   the deadline in ms, which is what a caller needs to back off sensibly.
-   *
-   * ⚠ Absent means absent. The server omits the key entirely rather than
-   * sending `"data": null`, so `"data" in env` is the test — a truthiness
-   * check cannot distinguish "no detail" from a detail of `0` or `""`.
-   *
-   * Typed `unknown` on purpose: the shape is per-refusal-site and open-ended.
-   * A union of today's shapes would go stale silently the first time a new
-   * site adds one, since every existing call site would still compile.
+   * Details some refusals attach: `quota_exceeded` → `{cap, …,
+   * refundable_on_delete}`; `token_scope_denied` → `{path, scopes}`; durable
+   * `instance_quota` / `tick_deadline` → counts and the deadline. Absent when
+   * the server sent none. A few refusals put details at the top level instead
+   * (`owns_apps` → `app_tids`), reachable through `Tfl5Error.body`.
    */
   data?: unknown;
-
-  /**
-   * ⚠ NOT EVERY PAYLOAD ARRIVES IN `data`. Some sites put their detail at the
-   * TOP LEVEL of the envelope, as a sibling of `code`/`msg`:
-   *
-   * - `owns_apps` from `/user/data/erase` carries `app_tids` there
-   *   (`crates/routes/src/user.rs`, anchor `"app_tids": owned,`).
-   * - the durable refusals `wrong_cell` / `cell_forward_failed` carry
-   *   `cell_id` / `base_url` there — see `durable.ts`'s placement helpers.
-   * - on the SUCCESS side, the file write paths put `warnings` beside `data`
-   *   (`crates/routes/src/file/mod.rs`, anchor
-   *   `out["warnings"] = json!([w]);`), which is why `files.ts` reads those
-   *   routes through `postFull` / `postFormFull` instead of `post`.
-   *
-   * `Tfl5Error.body` is the WHOLE parsed envelope, so those fields are
-   * present at runtime; reaching them needs a cast, e.g.
-   * `(err.body as { app_tids?: string[] }).app_tids`.
-   *
-   * Deliberately no `[key: string]: unknown` index signature: adding one
-   * would make every typo on a declared field compile, which trades a
-   * loud error for a silent one.
-   */
 }
 
 /** Field sensitivity level — mirrors `FieldLevel` server-side. */
@@ -89,23 +52,36 @@ export interface FieldDecl {
   type?: string;
 }
 
-/** Declarative resource hook (see docs/SDK-GAPS GAP-3 canonical schema). */
+/**
+ * Declarative resource hook, stored on the resource definition.
+ *
+ * - `require_fields` (before_*): reject the write unless `params.fields` are set.
+ * - `set_fields` (after_*): stamp `params.set` onto the committed doc
+ *   (secret fields stay encrypted).
+ * - `webhook` (after_*): POST the doc to `params.url` in the background.
+ * - `wasm` (after_*): call your WASM operator `params.op_id` with action
+ *   `params.action` (defaults to the event name).
+ *
+ * The server does not validate `on[]`: an unknown event name is stored and
+ * simply never fires, so use the {@link HookEvent} names exactly.
+ */
 export interface Hook {
   id: string;
   on: HookEvent[];
-  type: "require_fields" | "set_fields" | "webhook";
+  type: "require_fields" | "set_fields" | "webhook" | "wasm";
   params?: Record<string, unknown>;
   when?: Record<string, unknown>;
   msg?: string;
 }
 
+/** Doc lifecycle events a hook can fire on (note: `_del`, not `_delete`). */
 export type HookEvent =
   | "before_create"
   | "after_create"
   | "before_update"
   | "after_update"
-  | "before_delete"
-  | "after_delete";
+  | "before_del"
+  | "after_del";
 
 /** A stored doc as returned by `/app/doc/get` (secret fields decrypted). */
 export interface Doc<T = Record<string, unknown>> {

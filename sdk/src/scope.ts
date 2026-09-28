@@ -1,77 +1,31 @@
-// ScopeClient — row-level scope config (`/app/scope/*`). See docs/scope.md.
-//
-// Scope is the 4th authorization layer: it fences ROWS by a data field (own /
-// company / class / …) so a user only sees their lane, complementing the ACL
-// layers. Designer-level. Enforcement is env-gated on the cell
-// (TFL5_ENFORCE_SCOPE) AND per-app opt-in (a non-empty field_map), so a returned
-// config does not by itself mean rows are being filtered — check
-// `meta.scope_filter_applied` on a `/app/doc/list` response to confirm.
+// ScopeClient — row-level scope settings (`/app/scope/*`): which column of
+// each resource carries a scope attribute (the field map), and which values
+// each user may see (bindings). The same endpoints are also reachable as
+// `tfl5.access.scopeGet()` / `scopeSet()`.
 
 import type { HttpCore } from "./http.js";
-
-/** A scope tier code. G = global (all rows), N = none (no rows),
- *  W/S/C = a widest→narrowest containment hierarchy, M = multi-value at the
- *  C tier, O = own records. The letters carry NO built-in domain meaning —
- *  a CRM reads S as "company", a school reads it as "school". See docs/scope.md. */
-export type ScopeCode = "G" | "W" | "S" | "C" | "M" | "O" | "N";
-
-/** One grant in a user's bindings. `params` carries the allowed value(s) keyed
- *  by the scope code (generic form, e.g. `{ "S": "acme" }`) or the legacy alias
- *  (e.g. `{ "school_code": "acme" }`). See docs/scope.md §3. */
-export interface ScopeBinding {
-  scope: ScopeCode;
-  params?: Record<string, string | string[]>;
-  /** Optional label for auditing/debugging; not enforced. */
-  role_code?: string;
-  /**
-   * PII narrowing applied to rows THIS binding matches. `"F"`/`"Full"`
-   * (default — anything unrecognised falls back here too) leaves the row
-   * unchanged. `"M"`/`"Masked"` masks that resource's declared `pii_fields`.
-   * `"A"`/`"Aggregate"` drops the row from `/app/doc/list` (counted in
-   * `meta.pii_aggregate_dropped`) and makes `/app/doc/get` refuse it with
-   * `pii_aggregate_only` (HTTP 400) — unless the caller sends an
-   * `X-Audit-Reason` header, which escalates that read to Full and is
-   * logged with `drill_down:true`. When several bindings match the same
-   * row, the LEAST-strict level wins (F beats M beats A). See
-   * docs/scope.md §8. */
-  pii_level?: "F" | "Full" | "M" | "Masked" | "A" | "Aggregate";
-  [k: string]: unknown;
-}
-
-/** Per-resource field_map: `{ <resource_ma>: { <scope-code-or-alias>: <column> } }`.
- *  Setting a resource's entry is what opts that resource into scope. */
-export type ScopeFieldMap = Record<string, Record<string, string>>;
-
-/** Result of {@link ScopeClient.get}. `my_bindings` is only the CALLER's own
- *  bindings — you never see another user's grants. */
-export interface ScopeConfig {
-  field_map: ScopeFieldMap;
-  my_bindings: ScopeBinding[];
-  [k: string]: unknown;
-}
+import type { ScopeBinding, ScopeGetResult, ScopeFieldMap, ScopeSetResult } from "./access.js";
 
 export class ScopeClient {
   constructor(private readonly http: HttpCore) {}
 
-  /** Read the app's `field_map` + the CALLER's own bindings (never others'). */
-  get(): Promise<ScopeConfig> {
-    return this.http.post<ScopeConfig>("/app/scope/get", {});
+  /** The app's field map and the caller's own bindings (never other users'). */
+  get(): Promise<ScopeGetResult> {
+    return this.http.post<ScopeGetResult>("/app/scope/get", {});
   }
 
-  /** Replace the whole `field_map` (which column implements each tier, per
-   *  resource). Omit to keep the current one. */
-  async setFieldMap(fieldMap: ScopeFieldMap): Promise<void> {
-    await this.http.post("/app/scope/set", { field_map: fieldMap });
+  /** Replace the whole field map (Designer). `{}` clears it and turns scope off. */
+  setFieldMap(fieldMap: ScopeFieldMap): Promise<ScopeSetResult> {
+    return this.http.post<ScopeSetResult>("/app/scope/set", { field_map: fieldMap });
   }
 
-  /** Replace ALL users' bindings at once. */
-  async setBindings(bindings: Record<string, ScopeBinding[]>): Promise<void> {
-    await this.http.post("/app/scope/set", { bindings });
+  /** Replace every user's bindings at once (Designer). */
+  setBindings(bindings: Record<string, ScopeBinding[]>): Promise<ScopeSetResult> {
+    return this.http.post<ScopeSetResult>("/app/scope/set", { bindings });
   }
 
-  /** Patch specific users' bindings without touching the rest:
-   *  an array SETS that user's bindings, `null` CLEARS them. */
-  async patchBindings(patch: Record<string, ScopeBinding[] | null>): Promise<void> {
-    await this.http.post("/app/scope/set", { bindings_patch: patch });
+  /** Change some users' bindings: an array sets them, `null` clears them (Designer). */
+  patchBindings(patch: Record<string, ScopeBinding[] | null>): Promise<ScopeSetResult> {
+    return this.http.post<ScopeSetResult>("/app/scope/set", { bindings_patch: patch });
   }
 }

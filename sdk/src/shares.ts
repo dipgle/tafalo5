@@ -1,14 +1,13 @@
 // SharesClient — `/app/share/*`. Per-doc grants + anonymous link claim.
 
 import type { HttpCore } from "./http.js";
-import type { Doc } from "./types.js";
 
 export interface CreateShareInput {
   doc_tid: string;
   /**
-   * REQUIRED token recipient: a bare `user_tid`, `G_<group>`, `[r_<role>]`,
-   * `G_author`, or `anonymous` (the response then carries a random `token`
-   * to hand out as a share link).
+   * Who receives the grant: a user id (`u-…`), a group id (`g-…`), a role
+   * token (`[r-…]`), `G_author` (every signed-in user) or `anonymous` (the
+   * response then carries a random `token` to hand out as a share link).
    */
   target: string;
   /** Restrict the share to a field subset (projection). */
@@ -20,9 +19,20 @@ export interface CreateShareInput {
 
 export interface ShareGrant {
   tid: string;
-  doc_tid: string;
+  doc_tid?: string;
+  target?: string;
   token?: string;
   [k: string]: unknown;
+}
+
+export interface SharedDoc<T = Record<string, unknown>> {
+  doc_tid: string;
+  resource_ma: string;
+  resource_name: string;
+  author: string;
+  data: T;
+  created_at: number;
+  updated_at: number;
 }
 
 export class SharesClient {
@@ -38,14 +48,23 @@ export class SharesClient {
     return this.http.post<ShareGrant[]>("/app/share/list", docTid ? { doc_tid: docTid } : {});
   }
 
+  /** Revoke a share grant; its link stops working at once. */
   revoke(tid: string): Promise<void> {
     return this.http.post("/app/share/revoke", { tid }).then(() => undefined);
   }
 
-  /** Anonymous link claim — exchange a share token for the doc. */
+  /**
+   * Open an anonymous share link (no sign-in needed). Resolves the doc's
+   * searchable (level-0) fields — narrowed to the share's `fields` when it
+   * has them. Encrypted fields are never returned through a link.
+   */
   claim<T extends Record<string, unknown> = Record<string, unknown>>(
     token: string,
-  ): Promise<Doc<T>> {
-    return this.http.post<Doc<T>>("/app/share/claim", { token });
+    appTid?: string,
+  ): Promise<SharedDoc<T>> {
+    return this.http.post<SharedDoc<T>>("/app/share/claim", {
+      token,
+      ...(appTid !== undefined ? { app_tid: appTid } : {}),
+    });
   }
 }

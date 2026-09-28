@@ -1,15 +1,41 @@
-// Authentication surface. Two modes share one client:
-//   - cookie (browser): /login sets the `_token` cookie; nothing to store.
-//   - bearer (Node/CLI): /login (or a minted service token) returns a
-//     `token` the SDK stashes on the transport for subsequent calls.
+// Authentication surface.
+//
+// Every sign-in method ends in the same place: the server sets the `_token`
+// session cookie. In a browser the cookie is managed for you; in Node the
+// SDK keeps it in an in-memory jar (cookie mode is the default). Bearer mode
+// is for service tokens (`st_…`) minted for server-to-server integrations —
+// `/login` never returns a bearer token.
 
 import type { HttpCore } from "./http.js";
 
 export interface LoginResult {
-  /** Present in bearer/server responses; absent in pure cookie flows. */
+  result?: boolean;
+  /** The signed-in user (password, QR and most alternative logins). */
+  user?: { tid: string; username: string };
+  /** Only set by flows that mint a bearer token; the SDK captures it. */
   token?: string;
-  user_tid?: string;
   [k: string]: unknown;
+}
+
+/** `/user` — the signed-in user plus public platform settings. */
+export interface CurrentUser {
+  user: {
+    tid: string;
+    username: string;
+    license_tid: string | null;
+    app_count: number;
+    groups: Array<{ tid: string; name: string }>;
+    app_roles: Record<string, Array<{ tid: string; name: string }>>;
+    scope_bindings: unknown;
+    [k: string]: unknown;
+  };
+  platform: {
+    test_subdomain_base: string | null;
+    google_client_id: string | null;
+    microsoft_client_id: string | null;
+    telegram_bot_username: string | null;
+    [k: string]: unknown;
+  };
 }
 
 /** Result of {@link AuthClient.exportData} — the caller's own data (PDPD
@@ -38,44 +64,55 @@ export interface EraseResult {
   [k: string]: unknown;
 }
 
-/**
- * Every state {@link AuthClient.qrPoll} can report. The envelope's
- * `result` is `true` for ALL of these — including `"expired"` and
- * `"rejected"` — so the promise never rejects while you're merely
- * polling; check `.status` on every resolved poll instead of relying on
- * a throw to tell you when to stop.
- *
- * `"approved"` is never actually observable here: the instant a poll sees
- * it server-side, that same request atomically flips it to `"consumed"`
- * (or throws, on a lost race against a concurrent poll) — it exists only
- * as a transient DB state between the phone's approve and the next poll.
- */
-export type QrStatus = "pending" | "expired" | "rejected" | "consumed";
+export interface QrStartResult {
+  session_id: string;
+  /** URL to render as a QR code for the phone to open. */
+  approve_url: string;
+  expires_at: number;
+  ttl_ms: number;
+}
 
-/** Response from {@link AuthClient.qrPoll}. */
-export interface QrPollResult extends LoginResult {
-  status?: QrStatus;
-  /** Present only when `status === "consumed"` — the account that just
-   *  signed in via this poll. (Cookie-mode only: unlike other login
-   *  methods, QR never mints a bearer `token` here — the session cookie
-   *  is set directly on the poll response.) */
+export interface QrPollResult {
+  status: "pending" | "consumed" | "expired" | "rejected" | (string & {});
+  /** Present when `status` is "consumed". */
   user?: { tid: string; username: string };
+}
+
+/** The object the Telegram Login Widget hands its callback. */
+export interface TelegramWidgetPayload {
+  id: number;
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+  photo_url?: string;
+  auth_date: number;
+  hash: string;
+}
+
+export interface TelegramStatus {
+  configured: boolean;
+  bot_username: string | null;
+  linked: {
+    telegram_id: number;
+    telegram_username: string | null;
+    linked_at: number;
+    last_login_at: number | null;
+  } | null;
+}
+
+export interface VneidStartResult {
+  state: string;
+  authorize_url: string;
+  /** Set when the operator has not configured real VNeID endpoints yet. */
+  warning?: string;
 }
 
 export class AuthClient {
   constructor(private readonly http: HttpCore) {}
 
   /**
-   * Username/password login. In bearer mode the returned `token` is
-   * captured automatically so later calls are authenticated.
-   *
-   * `username` is folded the same way `/reg` stores it (lower-cased,
-   * diacritics stripped, spaces → underscores) if the exact string you
-   * pass doesn't match any account — so a user who registered as "Alice"
-   * signs in fine typing "Alice", "alice", or "álice". The raw string is
-   * still tried FIRST and wins any tie, so accounts from before this
-   * folding existed keep working unchanged. Stop maintaining your own
-   * case-normalization on top of this call; the server already does it.
+   * Username/password login. Sets the session cookie (kept in the SDK's
+   * cookie jar outside a browser) and resolves `{ user: { tid, username } }`.
    */
   async login(username: string, password: string): Promise<LoginResult> {
     const data = await this.http.post<LoginResult>("/login", { username, password });
@@ -94,9 +131,9 @@ export class AuthClient {
     this.http.setToken(undefined);
   }
 
-  /** Current authenticated user (`/user`). Throws Unauthorized if none. */
-  async me(): Promise<unknown> {
-    return this.http.post("/user");
+  /** The signed-in user (`/user`). Throws `UnauthorizedError` when signed out. */
+  async me(): Promise<CurrentUser> {
+    return this.http.post<CurrentUser>("/user");
   }
 
   /** Manually set a Bearer token (e.g. one minted out-of-band). */
@@ -104,7 +141,7 @@ export class AuthClient {
     this.http.setToken(token);
   }
 
-  // ---- PDPD (NĐ 13/2023) — data-subject rights ------------------------
+  // ---- Data-subject rights (Vietnam Decree 13/2023/ND-CP) ------------
 
   /**
    * Export the caller's own account: profile + email metadata + app
@@ -176,141 +213,133 @@ export class AuthClient {
    * Browsers can skip all of this and use `mountGoogleButton` from
    * `@tfl5/sdk/ui`, which renders the Google button and drives this flow
    * (including the link prompt) for you.
-   *
-   * ORIGIN TRAP — a rendered button is not a working button. `GET
-   * /platform/info` also carries `google_allowed_origins: string[]`: the
-   * operator's `TFL5_GOOGLE_ALLOWED_ORIGINS`, i.e. the Authorized
-   * JavaScript origins actually registered on the Google OAuth client.
-   * `google_client_id` only says the provider is turned on — it says
-   * nothing about whether *this page's origin* is one Google will accept.
-   * A host outside that list renders the button fine and then 403s from
-   * `accounts.google.com/gsi/button` the instant it's clicked, with no
-   * error surfaced to `google()` (the click never reaches this endpoint).
-   * The case that hurts most: the platform's own multi-tenant test
-   * subdomain `<app_tid>.test.<base>` is a fresh, unregisterable origin
-   * for every app, so it 403s by construction unless the operator has
-   * deliberately widened the allowlist for it. Check the caller's origin
-   * against `google_allowed_origins` (empty array = operator hasn't
-   * declared the list, i.e. no extra restriction) BEFORE rendering the
-   * button, not after the click fails.
    */
   google(credential: string, opts: { password?: string } = {}): Promise<LoginResult> {
     return this.capture(this.http.post<LoginResult>("/auth/google", { credential, ...opts }));
   }
 
   /**
-   * Microsoft (Azure AD / MSAL) sign-in. Pass the ID token JWT MSAL hands
-   * back from `loginPopup`/`ssoSilent` under the `common` authority (any
-   * work/school OR personal Microsoft account, incl. @outlook/@hotmail) —
-   * the body field is still named `credential`, same as {@link google}.
-   *
-   * ACCOUNT-LINK POLICY DIFFERS FROM GOOGLE. Microsoft v2 ID tokens often
-   * omit `email_verified`, and a personal account's `email` claim can be
-   * user-set, so the server won't treat "same email" as proof of identity
-   * as readily as it does for Google:
-   * - No existing account with this email → a new account is created,
-   *   marked verified only if the email itself was trusted (org-directory,
-   *   or a personal account with the token's `xms_edov === true`).
-   * - An existing VERIFIED account whose email IS trusted → auto-linked
-   *   and signed in, same as {@link google}.
-   * - Every other match — an existing UNVERIFIED account, or a verified
-   *   one whose Microsoft email ISN'T trusted — falls back to the same
-   *   password-proof gate as {@link google}: it resolves with
-   *   `requires_password: true` and `username_hint` naming the account.
-   *   Catch it and re-call with `{ password }` to prove ownership + link +
-   *   sign in:
-   *
-   * ```ts
-   * try {
-   *   await tfl5.auth.microsoft(idToken);
-   * } catch (e) {
-   *   if (e instanceof BadRequestError && e.body?.requires_password) {
-   *     const pw = await promptForPassword(e.body.username_hint);
-   *     await tfl5.auth.microsoft(idToken, { password: pw });
-   *   } else throw e;
-   * }
-   * ```
+   * Exchange a Microsoft (Azure AD) ID token for a tfl5 session. `credential`
+   * is the `idToken` from an MSAL.js `loginPopup`/`ssoSilent` result under the
+   * `common` authority. Same account-link semantics as {@link google}: if an
+   * existing account owns the email and can't be safely auto-linked, the call
+   * throws a `BadRequestError` whose `body.requires_password` is true —
+   * re-call with `{ password }` to link.
    */
   microsoft(credential: string, opts: { password?: string } = {}): Promise<LoginResult> {
     return this.capture(this.http.post<LoginResult>("/auth/microsoft", { credential, ...opts }));
   }
 
-  /** Send a magic email link (anti-enumeration: always success-shaped). */
-  magicLink(email: string): Promise<unknown> {
-    return this.http.post("/auth/email-link", { email });
+  /**
+   * Email a one-time sign-in link. Always answers success, whether or not
+   * the address has an account (so it cannot be used to probe addresses).
+   * `redirectTo` is where the browser lands after the link signs it in.
+   */
+  magicLink(email: string, opts: { redirectTo?: string } = {}): Promise<unknown> {
+    return this.http.post("/auth/email-link", {
+      email,
+      ...(opts.redirectTo !== undefined ? { redirect_to: opts.redirectTo } : {}),
+    });
   }
 
   /** Start phone OTP (Zalo ZNS). Anti-enumeration: always success-shaped. */
-  phoneStart(phone: string): Promise<unknown> {
-    return this.http.post("/auth/phone/start", { phone });
+  phoneStart(phone: string, opts: { redirectTo?: string } = {}): Promise<unknown> {
+    return this.http.post("/auth/phone/start", {
+      phone,
+      ...(opts.redirectTo !== undefined ? { redirect_to: opts.redirectTo } : {}),
+    });
   }
 
-  /** Complete phone OTP. */
-  phoneVerify(phone: string, otp: string): Promise<LoginResult> {
-    return this.capture(this.http.post<LoginResult>("/auth/phone/verify", { phone, otp }));
-  }
-
-  /**
-   * QR login: start → mints a session the desktop side polls and the
-   * mobile side scans/approves.
-   *
-   * BUG FIX: this used to type the response as `{ qr_id?: string }` and
-   * {@link qrPoll} sent `{ qr_id }` on every call — but the server's field
-   * is, and has only ever been, `session_id` (verified against
-   * `crates/routes/src/auth_qr.rs`'s `PollInput`/`ApproveInput`/
-   * `RejectInput`; there is no `qr_id` alias). The old `qrPoll` body was
-   * therefore missing its one required field on every request, so QR
-   * login could never actually complete through this method. Fixed here
-   * — the resolved `session_id` is what you pass straight into
-   * {@link qrPoll} / {@link qrReject}.
-   */
-  qrStart(): Promise<{
-    session_id?: string;
-    /** Full URL to render as the QR code; the phone opens this. */
-    approve_url?: string;
-    /** Epoch-ms when this session stops accepting `approve`/`reject`/`poll`. */
-    expires_at?: number;
-    ttl_ms?: number;
-    [k: string]: unknown;
-  }> {
-    return this.http.post("/auth/qr/start");
-  }
-
-  /**
-   * QR login: poll until the mobile side approves. Resolves on every call
-   * — see {@link QrStatus} for why a resolved promise does not by itself
-   * mean "signed in": read `.status` and keep polling while it's
-   * `"pending"`; stop on `"expired"` / `"rejected"` (retry with a fresh
-   * {@link qrStart}); `"consumed"` is the terminal success.
-   */
-  qrPoll(qrId: string): Promise<QrPollResult> {
+  /** Complete phone OTP with the code the user received. */
+  phoneVerify(phone: string, code: string, opts: { redirectTo?: string } = {}): Promise<LoginResult> {
     return this.capture(
-      this.http.post<QrPollResult>("/auth/qr/poll", { session_id: qrId }),
+      this.http.post<LoginResult>("/auth/phone/verify", {
+        phone,
+        code,
+        ...(opts.redirectTo !== undefined ? { redirect_to: opts.redirectTo } : {}),
+      }),
     );
   }
 
-  /**
-   * QR login: the phone taps "Cancel" on a `pending` session it scanned.
-   * Deliberately UNAUTHENTICATED — the phone that scans a QR code usually
-   * hasn't signed in yet, so the only proof this endpoint demands is
-   * possession of the 256-bit `qrId` itself (the same secret that already
-   * gates the strictly more powerful {@link qrPoll}, which mints a
-   * session). It is also only reachable from `"pending"`: a session the
-   * mobile side already approved is not revocable through this call, so a
-   * Cancel that races in after an Approve can never undo a session that
-   * was already handed to the desktop.
-   *
-   * Resolves `{ rejected: true }` on success. On an unknown / expired /
-   * already-approved session it throws (no `.code`, message only) rather
-   * than resolving `{ rejected: false }` — the server deliberately
-   * collapses those three outcomes into one opaque message so this
-   * endpoint can't be used to probe which `qrId`s exist.
-   */
-  qrReject(qrId: string): Promise<{ rejected: boolean }> {
-    return this.http.post<{ rejected: boolean }>("/auth/qr/reject", { session_id: qrId });
+  // ---- QR login: a signed-in phone approves a desktop sign-in ----------
+  //
+  //   desktop: qrStart() → show `approve_url` as a QR code → qrPoll() every
+  //            ~2s until `status` is "consumed" (session cookie set) or
+  //            "expired"/"rejected". Sessions live 5 minutes.
+  //   phone:   scans the QR, then qrApprove(session_id) — or qrReject().
+
+  /** Desktop side: open a QR session. */
+  qrStart(): Promise<QrStartResult> {
+    return this.http.post<QrStartResult>("/auth/qr/start");
   }
 
-  private async capture<T extends LoginResult>(p: Promise<T>): Promise<T> {
+  /**
+   * Desktop side: poll the QR session. When the phone has approved, the
+   * first poll that sees it returns `status: "consumed"` with `user` and
+   * sets the session cookie on this client.
+   */
+  qrPoll(sessionId: string): Promise<QrPollResult> {
+    return this.http.post<QrPollResult>("/auth/qr/poll", { session_id: sessionId });
+  }
+
+  /** Phone side (must be signed in): approve the desktop sign-in. */
+  qrApprove(sessionId: string): Promise<{ approved: true }> {
+    return this.http.post("/auth/qr/approve", { session_id: sessionId });
+  }
+
+  /** Phone side (no sign-in needed): decline the desktop sign-in. */
+  qrReject(sessionId: string): Promise<{ rejected: true }> {
+    return this.http.post("/auth/qr/reject", { session_id: sessionId });
+  }
+
+  // ---- Telegram (Login Widget) -----------------------------------------
+  //
+  // Telegram is a second sign-in method bound to an existing account: sign
+  // in some other way first, then `telegramLink(payload)` from settings.
+  // Afterwards `telegramLogin(payload)` signs that account in. `payload` is
+  // the object the Telegram Login Widget passes to its callback, unchanged —
+  // the server verifies its signature. The bot is configured on the server;
+  // `platform.info().telegram_bot_username` tells the page which bot to load.
+
+  /** Sign in with a Telegram account that was linked earlier. */
+  telegramLogin(payload: TelegramWidgetPayload): Promise<{ username: string }> {
+    return this.http.post("/auth/telegram/login", payload);
+  }
+
+  /** Link a Telegram account to the signed-in user. */
+  telegramLink(
+    payload: TelegramWidgetPayload,
+  ): Promise<{ linked: true; telegram_id: number; telegram_username: string | null }> {
+    return this.http.post("/auth/telegram/link", payload);
+  }
+
+  /** Remove the signed-in user's Telegram link. */
+  telegramUnlink(): Promise<{ unlinked: boolean }> {
+    return this.http.post("/auth/telegram/unlink");
+  }
+
+  /** Whether Telegram sign-in is configured, and the caller's link if any. */
+  telegramStatus(): Promise<TelegramStatus> {
+    return this.http.post<TelegramStatus>("/auth/telegram/status");
+  }
+
+  // ---- VNeID (Vietnam national e-ID) -----------------------------------
+
+  /**
+   * Begin a VNeID sign-in for an app that has the VNeID operator enabled.
+   * Navigate the browser to `authorize_url`; VNeID redirects back to the
+   * server, which sets the session cookie and sends the browser on to
+   * `redirectTo` (a same-site path starting with `/` or `#`). Do not call
+   * the callback URL yourself.
+   */
+  vneidStart(input: { appTid?: string; redirectTo?: string } = {}): Promise<VneidStartResult> {
+    return this.http.post<VneidStartResult>("/auth/vneid/start", {
+      ...(input.appTid !== undefined ? { app_tid: input.appTid } : {}),
+      ...(input.redirectTo !== undefined ? { redirect_to: input.redirectTo } : {}),
+    });
+  }
+
+  private async capture(p: Promise<LoginResult>): Promise<LoginResult> {
     const data = await p;
     if (data?.token) this.http.setToken(data.token);
     return data;

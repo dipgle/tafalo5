@@ -72,34 +72,61 @@ path is: ask per resource; the gate runs naturally.
 **Task:** "List every actor who created, updated, or deleted doc
 `d_xxx`, with timestamps."
 
-**Pattern:** every mutation writes one `audit_log` row. Query via
-the admin audit endpoint, filtered by target + action prefix:
+**Pattern:** turn on `audit_writes` for the doc's resource, then read
+the app's own audit feed. Doc-write rows are keyed by the **resource**;
+the doc tid is inside the payload, so filter on it client-side:
 
 ```json
-POST /admin/audit/list
+// Once, on the resource (Manager):
+POST /app/resource/update
+{ "app_tid": "a-example", "tid": "r_attendance", "audit_writes": true }
+
+// Then (Manager on the app):
+POST /app/audit/list
 {
-  "action_prefix": "doc.",
-  "target_tid":    "d_xxx",
-  "limit":         100
+  "app_tid":         "a-example",
+  "action_prefix":   "doc.",
+  "target_kind":     "doc",
+  "target_tid":      "r_attendance",     // the RESOURCE tid
+  "include_payload": true,
+  "limit":           500
 }
-// → data: [
-//     { "action": "doc.create",  "actor_tid": "u_teacher_ann", "at_ms": ..., ... },
-//     { "action": "doc.update",  ... },
-//     { "action": "doc.acl_set", ... }
-//   ]
+// → data: { rows: [
+//     { "action": "doc.create", "actor_user_tid": "u-…", "ts": 1717200000000,
+//       "target_tid": "r_attendance",
+//       "payload_json": { "doc_tid": "d_xxx", "before_hash": null, "after_hash": "…" } },
+//     …
+//   ], next_offset: null }
 ```
 
-**Why this works:** mutations (create/update/del/acl_set/role
-membership/ownership transfer) all write to `audit_log`. Action
-codes are stable string prefixes: `doc.*`, `role.*`, `app.*`.
+With the SDK:
+
+```ts
+const { rows } = await tfl5.audit.list({
+  action_prefix: "doc.", target_kind: "doc", target_tid: resourceTid, include_payload: true,
+});
+const history = rows.filter(
+  (r) => r.payload_json?.doc_tid === docTid ||
+         (r.payload_json?.docs as { tid: string }[] | undefined)?.some((d) => d.tid === docTid),
+);  // create-batch / import rows list their docs under docs[].tid
+```
+
+**Why this works:** with `audit_writes` on, `/app/doc/create`, `update`
+and `del` each write one row (`doc.create` / `doc.update` /
+`doc.delete`) carrying the server-side actor and before/after content
+hashes — never the values. `/app/doc/create-batch`, `import` and
+`upsert` write their own rows (`doc.create_batch`, `doc.upsert.*`)
+whether or not the switch is on.
 
 **Gotchas:**
-- `/admin/audit/list` is gated by Manager-of-`tfl5-admin`, not your
-  app's managers. For tenant-readable audit, route the mutation
-  through your own `webhook` hook and write into an audit resource
-  you own.
+- Without `audit_writes`, plain create/update/delete leave no row.
+  Turning it on is not retroactive.
+- The window defaults to the last 7 days and is at most 90 days
+  (`since_ms` / `until_ms`); page with `next_offset`.
+- Per-doc ACL edits (`/app/doc/acl-set`) are not in this feed.
 - Hook firings live in `hook_invocations` (1 row per `after_*` run).
-  Operator calls live in `op_invocations`. Query separately.
+  Operator calls live in `op_invocations`. Neither is readable through
+  this endpoint.
 
 **See also:** [acl-model.md §13 Audit + traceability](acl-model.md#13-audit--traceability),
 [app-builder-guide.md §5.2 hooks](app-builder-guide.md#52-hooks-jsonb-array--declarative).
@@ -144,9 +171,9 @@ for (let i = 0; i < list.data.length; i += CONCURRENCY) {
 ```
 
 **Why this works:** `/app/doc/update` validates + applies one row
-at a time, runs `before_update`/`after_update` hooks per row, and
-writes one audit row each. Parallelism saves wall-clock; it doesn't
-reduce work.
+at a time, runs `before_update`/`after_update` hooks per row, and —
+when the resource has `audit_writes` on (recipe #2) — writes one audit
+row each. Parallelism saves wall-clock; it doesn't reduce work.
 
 **Gotchas:**
 - **No cross-row transaction.** If row #150 fails, rows 1–149 are
@@ -609,9 +636,17 @@ POST /app/test/status
 ```json
 // Step 4 — atomic promote when happy
 POST /app/release
+{ "app_tid": "a-example", "dry_run": true }
+// → { result: true, dry_run: true, data: { test_rows, release_rows_to_replace } }
+//   (synchronous; nothing is changed)
+
+POST /app/release
 { "app_tid": "a-example", "dry_run": false }
-// → data: { promoted_rows, replaced_release_rows, backup_at }
-// (dry_run: true returns the diff without applying.)
+// → { result: true, queued: true, job_id, status: "queued" }
+//   The promote runs as a background job. Poll it:
+POST /app/release/status
+{ "job_id": "<job_id>" }
+// → { result: true, job_id, status, progress, error, attempts }
 
 // Rollback if the release looks wrong:
 POST /app/release/list
@@ -628,17 +663,18 @@ timestamped backup.
 
 **Quotas + lifecycle:**
 - Test stage cap: **52,428,800 B (50 MiB) per app** (separate from
-  the release quota) — `config.rs` `default_test_storage_cap`.
+  the release quota).
 - Test stage TTL: **14 days idle** — sweeper auto-clears
   (`auto_delete_at`).
 - File-extension allowlist + **52,428,800 B (50 MiB)** per-file cap
-  apply to both stages (`file/mod.rs:84` `MAX_UPLOAD_BYTES`).
+  apply to both stages.
 - Release stage consumes the app's licensed `app_max_storage`.
 
 **Gotchas:**
 - `/app/release` requires Manager on the app.
-- One release at a time per app (advisory lock). Concurrent →
-  `Another release is already running...`.
+- One release at a time per app (advisory lock). A second `/app/release`
+  while one is pending or running gets the same `job_id` back instead of a
+  new job.
 - Promote leaves the test stage populated so you can keep iterating.
   Use `/app/test/wipe` for a clean slate.
 - Test subdomain works only when `TFL5_TEST_SUBDOMAIN_BASE` is
@@ -683,11 +719,16 @@ POST /app/site/history
 // Does this app have an active bundle?
 POST /app/bundle/list
 { "app_tid": "a-example" }
-// → data includes "current_bundle_version" — non-null ⇒ tier 2 is live
+// → "current_bundle_version" (next to `data`, not inside it) — non-null ⇒ tier 2 is live
 
-// Does this app have a pinned release?
-POST /app/release/status
+// Has this app ever promoted a release?
+POST /app/release/list
 { "app_tid": "a-example" }
+// → data: [ { ts, has_manifest }, ... ] newest first
+// non-empty ⇒ a release was promoted at least once; tier 3 may be live
+// (empty does not prove the opposite: the first release on a fresh app
+//  may leave no backup)
+// (/app/release/status takes a job_id from /app/release, not an app_tid)
 ```
 
 **Why this works:** each tier is separate storage — writing to a lower

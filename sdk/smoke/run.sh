@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
-# Build the SDK and run the e2e smoke test against a local dev server.
+# Build the SDK and run the end-to-end smoke against a running server.
 #
-#   sdk/smoke/run.sh                      # host=http://localhost:8090, pg=tfl5_pg
-#   TFL5_SMOKE_HOST=... PG_CONTAINER=... sdk/smoke/run.sh
+#   TFL5_SMOKE_HOST=http://localhost:8090 \
+#   TFL5_SMOKE_VERIFY_CMD='<command that marks user {user} email-verified>' \
+#   smoke/run.sh
 #
-# Prereqs: dev server running (a local tfl5 instance on :8090) + the dev
-# Postgres container reachable for the email-verify test fixture.
+# New accounts must verify their email before they can create an app. The
+# smoke registers throwaway users, so it needs a way to mark them verified on
+# a test server: TFL5_SMOKE_VERIFY_CMD is run with {user} replaced by the
+# username. Without it the smoke stops at the first write.
+#
+# Exit codes are the smoke's own: 0 passed · 1 failed · 2 crashed ·
+# 3 passed but some steps could not be measured on this server.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-HOST="${TFL5_SMOKE_HOST:-http://localhost:8090}"
-PG_CONTAINER="${PG_CONTAINER:-tfl5_pg}"
+: "${TFL5_SMOKE_HOST:=http://localhost:8090}"
+export TFL5_SMOKE_HOST
 
-echo "==> build SDK"
-npx --yes -p typescript@5.4 tsc -p tsconfig.json
+echo "==> build"
+npm run build --silent
 
-echo "==> smoke against ${HOST} (pg fixture: ${PG_CONTAINER})"
-TFL5_SMOKE_HOST="$HOST" \
-TFL5_SMOKE_VERIFY_CMD="docker exec ${PG_CONTAINER} psql -U tfl5 -d tfl5 -c \"UPDATE users SET email_verified=TRUE WHERE username='{user}'\"" \
-  node smoke/smoke.mjs
+echo "==> smoke against ${TFL5_SMOKE_HOST}"
+exec node smoke/smoke.mjs

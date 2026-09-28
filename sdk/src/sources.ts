@@ -10,7 +10,7 @@
 //      the response.
 //   2. External system pushes `POST /ingest/<source_tid>` with headers
 //      `X-Tfl5-Timestamp` (unix secs) and `X-Tfl5-Signature` (HMAC-SHA256
-//      hex of `"<ts>.<raw_body>"`). See docs/api-reference.md
+//      hex of `"<ts>.<raw_body>"`). See docs/public/api-reference.md
 //      §Signed sources for the push-side protocol.
 //   3. `rotate(tid)` issues a new secret (shown once) if the old one leaks.
 //   4. `revoke(tid)` soft-deletes + strips the auto-created principal grant.
@@ -25,19 +25,10 @@ export interface RegisterSourceInput {
   /** Machine alias of the resource this source writes into. */
   target_resource_ma: string;
   /**
-   * A JSON POINTER into each pushed payload (e.g. `"/external_ref"`), not
-   * an idempotency key for this `register` call. Whatever string the
-   * pointer resolves to on an inbound `/ingest` body becomes that row's
-   * dedup key, so the external system can retry a push without creating a
-   * second doc. Omit for no per-row dedup; a pointer that resolves to
-   * nothing (or to a non-string) simply yields no key for that push.
-   *
-   * `register` itself is NOT idempotent: every call mints a NEW source
-   * tid, a NEW service principal with app-Editor, and a NEW secret,
-   * whatever you pass here. Retrying a `register` you are unsure about
-   * therefore leaves an extra live channel behind — check {@link
-   * SourcesClient.list} first, and {@link SourcesClient.revoke} anything
-   * you created twice.
+   * JSON pointer into each pushed payload (e.g. `"/external_ref"`) whose
+   * value de-duplicates pushes: a second push with the same value is not
+   * stored again. Omit for no de-duplication. (Registering a second source
+   * with the same `name` is refused.)
    */
   idempotency_pointer?: string;
   /**
@@ -77,7 +68,7 @@ export class SourcesClient {
    * The external system pushes to `ingest_url` signing
    * `"<unix_ts_secs>.<raw_body>"` with HMAC-SHA256(secret) in headers
    * `X-Tfl5-Timestamp` + `X-Tfl5-Signature` (hex).
-   * Full push-side protocol: docs/api-reference.md §Signed sources.
+   * Full push-side protocol: docs/public/api-reference.md §Signed sources.
    */
   register(input: RegisterSourceInput): Promise<SourceRecord> {
     return this.http.post<SourceRecord>("/app/source/register", input);
@@ -90,36 +81,15 @@ export class SourcesClient {
 
   /**
    * Rotate the signing secret. Returns a new `secret` (hex, shown once).
-   * The old secret dies with the call — the ingest path unseals the stored
-   * secret per request, so the very next push signed with the old one
-   * fails its HMAC check. Swap the external system over first.
-   *
-   * ⚠ The response carries ONLY `tid` and `secret`. The other {@link
-   * SourceRecord} fields (`name`, `target_resource_ma`,
-   * `replay_window_secs`, `ingest_url`, `principal_user_tid`) are NOT
-   * echoed here even though the shared record type declares them —
-   * re-read {@link list} if you need them. An unknown, revoked, or
-   * other-app `tid` raises `not_found` rather than rotating anything.
+   * The old secret is immediately invalidated.
    */
-  rotate(tid: string): Promise<SourceRecord> {
-    return this.http.post<SourceRecord>("/app/source/rotate", { tid });
+  rotate(tid: string): Promise<{ tid: string; secret: string }> {
+    return this.http.post("/app/source/rotate", { tid });
   }
 
   /**
-   * Revoke a source: soft-deletes the channel (`revoked_at`) and strips
-   * the auto-created service principal's app-Editor grant.
-   *
-   * A later push to that `ingest_url` is then answered as MISSING, not as
-   * forbidden: the ingest handler loads the source with `revoked_at IS
-   * NULL`, so it answers the platform's not-found shape — HTTP **200**
-   * with `{result:false, code:"not_found"}` (this SDK turns that into a
-   * `NotFoundError`). Do not have the external system branch on a 403, and
-   * do not read the 200 as success. The stripped grant is the second line
-   * of defence behind that filter, not the thing the pusher observes.
-   *
-   * Revoking a `tid` that is already revoked (or belongs to another app)
-   * raises the same `not_found` — the call is not idempotent-with-a-flag,
-   * it simply fails the second time.
+   * Revoke a source: soft-deletes the channel and strips the auto-created
+   * service-principal grant. Later pushes are answered `not_found`.
    */
   revoke(tid: string): Promise<void> {
     return this.http.post("/app/source/revoke", { tid }).then(() => undefined);

@@ -19,9 +19,16 @@ export interface Tfl5Config {
    */
   appId?: string;
   /**
-   * "cookie" (browser SPA — relies on the `_token` cookie, sends
-   * credentials) or "bearer" (Node/CLI — sends `Authorization: Bearer`).
-   * Defaults to "cookie" in a browser, "bearer" in Node.
+   * "cookie" — the session lives in the `_token` cookie that `/login` sets.
+   * In a browser the SDK sends `credentials: "include"`; outside a browser
+   * it keeps an in-memory cookie jar so a Node process can log in with a
+   * username and password.
+   *
+   * "bearer" — sends `Authorization: Bearer <token>`. Use it with a
+   * service token (`st_…`) minted for a server-to-server integration;
+   * `/login` does not return a bearer token.
+   *
+   * Default: "bearer" when `token` is set, otherwise "cookie".
    */
   auth?: AuthMode;
   /** Bearer token for `auth:"bearer"`. Also settable via `setToken()`. */
@@ -49,7 +56,7 @@ export class HttpCore {
   constructor(cfg: Tfl5Config = {}) {
     this.host = (cfg.host ?? (hasWindow ? window.location.origin : "")).replace(/\/$/, "");
     this.appId = cfg.appId;
-    this.auth = cfg.auth ?? (hasWindow ? "cookie" : "bearer");
+    this.auth = cfg.auth ?? (cfg.token ? "bearer" : "cookie");
     this.token = cfg.token;
     if (this.auth === "cookie" && !hasWindow) this.jar = new Map();
     const f = cfg.fetch ?? (globalThis.fetch as typeof fetch | undefined);
@@ -58,11 +65,23 @@ export class HttpCore {
         "@tfl5/sdk: no global fetch found — pass `fetch` in the config (Node <18).",
       );
     }
-    this.fetchImpl = f;
+    // Call through a plain function: browsers refuse `fetch` invoked as a
+    // method of another object ("Illegal invocation"), which is what
+    // `this.fetchImpl(...)` would otherwise do.
+    this.fetchImpl = (input, init) => f(input, init);
   }
 
   setToken(token: string | undefined): void {
     this.token = token;
+  }
+
+  /**
+   * The session credentials this client would send (Cookie from the Node
+   * cookie jar, or the bearer Authorization header). For transports the SDK
+   * does not issue through `fetch`, such as a WebSocket handshake in Node.
+   */
+  authHeaders(): Record<string, string> {
+    return this.headers();
   }
 
   /**
@@ -85,6 +104,78 @@ export class HttpCore {
   }
 
   /**
+   * Like `post`, but on success return the whole envelope instead of `data`.
+   * For endpoints that put useful fields beside `data` (`next_cursor`,
+   * `warnings`, `limit`). Errors are thrown exactly as `post` throws them.
+   */
+  async postEnvelope<E = Record<string, unknown>>(path: string, body: object = {}): Promise<E> {
+    const b = body as Record<string, unknown>;
+    const payload: Record<string, unknown> =
+      this.appId && b["app_tid"] === undefined ? { app_tid: this.appId, ...b } : b;
+    const res = await this.fetchImpl(this.url(path), {
+      method: "POST",
+      headers: this.headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload),
+      credentials: this.auth === "cookie" ? "include" : "same-origin",
+    });
+    this.captureCookies(res);
+    return this.unwrap<E>(res, true);
+  }
+
+  /**
+   * POST a JSON body and return the **full parsed response body** without
+   * unwrapping the `{result, data}` envelope. Use only when the caller needs
+   * fields at the envelope level (e.g. `instance_tid`, `timestamp`) that
+   * `post<T>` discards during unwrap. Auth injection + cookie handling are
+   * identical to `post`. Throws `Tfl5Error` on network or parse failures but
+   * does NOT throw on `result:false` — the caller is responsible for
+   * interpreting the body.
+   */
+  async postFull<T = unknown>(path: string, body: object = {}): Promise<T> {
+    const b = body as Record<string, unknown>;
+    const payload: Record<string, unknown> =
+      this.appId && b["app_tid"] === undefined ? { app_tid: this.appId, ...b } : b;
+    const res = await this.fetchImpl(this.url(path), {
+      method: "POST",
+      headers: this.headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload),
+      credentials: this.auth === "cookie" ? "include" : "same-origin",
+    });
+    this.captureCookies(res);
+    // For non-2xx we still want typed errors (gateway errors, 5xx, etc.).
+    if (!res.ok) {
+      const retryAfter = Number(res.headers.get("retry-after")) || undefined;
+      let errBody: unknown;
+      try {
+        errBody = await res.json();
+      } catch {
+        throw makeError(res.status, { msg: res.statusText }, retryAfter);
+      }
+      throw makeError(res.status, errBody as { code?: string; msg?: string }, retryAfter);
+    }
+    let parsed: unknown;
+    try {
+      parsed = await res.json();
+    } catch {
+      return undefined as T;
+    }
+    return parsed as T;
+  }
+
+  /** `postForm`, but resolves the whole envelope (for `warnings` beside `data`). */
+  async postFormEnvelope<E = Record<string, unknown>>(path: string, form: FormData): Promise<E> {
+    if (this.appId && !form.has("app_tid")) form.append("app_tid", this.appId);
+    const res = await this.fetchImpl(this.url(path), {
+      method: "POST",
+      headers: this.headers(),
+      body: form,
+      credentials: this.auth === "cookie" ? "include" : "same-origin",
+    });
+    this.captureCookies(res);
+    return this.unwrap<E>(res, true);
+  }
+
+  /**
    * POST `multipart/form-data`. Used by the file upload path (the server's
    * `/upload-files`-style middleware persists binaries from the multipart
    * stream — never base64-in-JSON).
@@ -102,109 +193,68 @@ export class HttpCore {
   }
 
   /**
-   * POST `multipart/form-data` and return the WHOLE envelope, not just
-   * `data` — the multipart counterpart of {@link postFull}.
-   *
-   * The file write paths put `warnings` at the top level, beside `data`:
-   * writing to a tier that a live snapshot shadows succeeds and is invisible,
-   * and `warnings[{code:"file_write_shadowed_by_snapshot", msg,
-   * live_snapshot}]` is how the server says so. {@link postForm} unwraps
-   * `data` and drops it, which turns a deliberate warning back into the
-   * silent failure it was added to end. Errors are thrown exactly as
-   * {@link postForm} throws them.
+   * GET `path` with optional query parameters. Unwraps the `{result,data}`
+   * envelope when the server sends one; endpoints that answer a bare JSON
+   * object (e.g. `/platform/info`) are returned as-is.
    */
-  async postFormFull<T = unknown>(path: string, form: FormData): Promise<T> {
-    if (this.appId && !form.has("app_tid")) form.append("app_tid", this.appId);
-    const res = await this.fetchImpl(this.url(path), {
-      method: "POST",
-      headers: this.headers(), // let fetch set the multipart boundary
-      body: form,
-      credentials: this.auth === "cookie" ? "include" : "same-origin",
-    });
-    this.captureCookies(res);
-    return this.unwrap<T>(res, { envelope: true });
-  }
-
-  /**
-   * POST and return the WHOLE envelope, not just `data`.
-   *
-   * Several handlers put meaningful fields as siblings of `data` rather than
-   * inside it — `/billing/invoice/issue` returns `receipt_email` and
-   * `e_invoice` that way, and the durable send path returns `instance_tid` /
-   * `deduplicated`. {@link post} would drop them on the floor. Errors are
-   * still thrown exactly as {@link post} throws them.
-   */
-  async postFull<T = unknown>(path: string, body: object = {}): Promise<T> {
-    const b = body as Record<string, unknown>;
-    const payload: Record<string, unknown> =
-      this.appId && b["app_tid"] === undefined ? { app_tid: this.appId, ...b } : b;
-    const res = await this.fetchImpl(this.url(path), {
-      method: "POST",
-      headers: this.headers({ "Content-Type": "application/json" }),
-      body: JSON.stringify(payload),
-      credentials: this.auth === "cookie" ? "include" : "same-origin",
-    });
-    this.captureCookies(res);
-    return this.unwrap<T>(res, { envelope: true });
-  }
-
-  /**
-   * POST and return raw bytes.
-   *
-   * A few endpoints answer with a binary body and a `Content-Disposition`
-   * header instead of JSON — `/app/f3/download` and `/billing/invoice/pdf`.
-   * {@link post} calls `res.json()` unconditionally, which on those routes
-   * throws, gets swallowed, and resolves `undefined`: the file vanishes with
-   * no error. Use this instead.
-   *
-   * An error response is still JSON, so failures throw the usual typed error.
-   */
-  async postRaw(
-    path: string,
-    body: object = {}
-  ): Promise<{ bytes: ArrayBuffer; filename?: string; mimeType?: string }> {
-    const b = body as Record<string, unknown>;
-    const payload: Record<string, unknown> =
-      this.appId && b["app_tid"] === undefined ? { app_tid: this.appId, ...b } : b;
-    const res = await this.fetchImpl(this.url(path), {
-      method: "POST",
-      headers: this.headers({ "Content-Type": "application/json" }),
-      body: JSON.stringify(payload),
-      credentials: this.auth === "cookie" ? "include" : "same-origin",
-    });
-    this.captureCookies(res);
-
-    const type = res.headers.get("content-type") ?? "";
-    if (!res.ok || type.includes("application/json")) {
-      // Either a real error, or a handler that answered JSON because it
-      // refused. Let the normal envelope logic raise the typed error; if it
-      // somehow succeeds there were no bytes to return.
-      await this.unwrap<unknown>(res);
-      throw makeError(res.status, { msg: "expected binary body, got JSON" });
-    }
-
-    const disposition = res.headers.get("content-disposition") ?? "";
-    // filename*=UTF-8''... wins over the plain form when both are present.
-    const star = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
-    const plain = /filename="?([^";]+)"?/i.exec(disposition);
-    const filename = star ? decodeURIComponent(star[1]!) : plain?.[1];
-
-    return { bytes: await res.arrayBuffer(), filename, mimeType: type || undefined };
-  }
-
-  /**
-   * GET a path. Most of the API is POST-only, but a few genuinely public
-   * reads are GET — `/billing/catalog` is one, and it 405s on POST.
-   */
-  async get<T = unknown>(path: string, query: Record<string, string> = {}): Promise<T> {
-    const qs = new URLSearchParams(query).toString();
-    const res = await this.fetchImpl(this.url(path) + (qs ? `?${qs}` : ""), {
+  async get<T = unknown>(path: string, query: Record<string, string | number | undefined> = {}): Promise<T> {
+    const res = await this.fetchImpl(this.urlFor(path, query), {
       method: "GET",
       headers: this.headers(),
       credentials: this.auth === "cookie" ? "include" : "same-origin",
     });
     this.captureCookies(res);
     return this.unwrap<T>(res);
+  }
+
+  /**
+   * POST a JSON body to an endpoint that answers raw bytes on success
+   * (a PDF, a file download). Errors still arrive as the JSON envelope and
+   * are thrown as `Tfl5Error`.
+   */
+  async postBlob(path: string, body: object = {}): Promise<Blob> {
+    return (await this.postBlobNamed(path, body)).blob;
+  }
+
+  /**
+   * Like `postBlob`, plus the filename from `Content-Disposition` when the
+   * server sends one. (A browser can only read that header on the same
+   * origin as the API.)
+   */
+  async postBlobNamed(
+    path: string,
+    body: object = {},
+  ): Promise<{ blob: Blob; filename?: string; mimeType?: string }> {
+    const b = body as Record<string, unknown>;
+    const payload: Record<string, unknown> =
+      this.appId && b["app_tid"] === undefined ? { app_tid: this.appId, ...b } : b;
+    const res = await this.fetchImpl(this.url(path), {
+      method: "POST",
+      headers: this.headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload),
+      credentials: this.auth === "cookie" ? "include" : "same-origin",
+    });
+    this.captureCookies(res);
+    const type = res.headers.get("content-type") ?? "";
+    const disposition = res.headers.get("content-disposition");
+    // Success is marked by Content-Disposition (always set on a download), so
+    // a stored JSON file is not mistaken for an error envelope.
+    if (res.ok && (disposition !== null || !type.includes("application/json"))) {
+      return { blob: await res.blob(), filename: parseFilename(disposition), mimeType: type || undefined };
+    }
+    await this.unwrap<unknown>(res);
+    throw makeError(res.status, { code: "bad_request", msg: "expected a binary response" });
+  }
+
+  /**
+   * Absolute URL for `path` on this host, with query parameters. Use it for
+   * endpoints a browser loads directly (an `<iframe src>`, a download link).
+   */
+  urlFor(path: string, query: Record<string, string | number | undefined> = {}): string {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(query)) if (v !== undefined) qs.set(k, String(v));
+    const s = qs.toString();
+    return s ? `${this.url(path)}?${s}` : this.url(path);
   }
 
   private url(path: string): string {
@@ -239,7 +289,7 @@ export class HttpCore {
     }
   }
 
-  private async unwrap<T>(res: Response, opts: { envelope?: boolean } = {}): Promise<T> {
+  private async unwrap<T>(res: Response, whole = false): Promise<T> {
     const retryAfter = Number(res.headers.get("retry-after")) || undefined;
     let body: unknown;
     try {
@@ -257,28 +307,40 @@ export class HttpCore {
       isSignout?: boolean;
     };
 
-    // An expired session is reported by most `/user/*` handlers as HTTP 200
-    // `{isSignout:true, result:true}` — a SUCCESS envelope. This check has to
-    // come before the success branch below: with it after, the success branch
-    // returned first and the guard never ran, so a signed-out caller silently
-    // received an empty object instead of an error.
+    // A missing/expired session is sometimes answered HTTP 200
+    // `{isSignout:true, result:true}` — check it BEFORE the success branch,
+    // or a signed-out caller would receive the envelope as if it were data.
     if (env.isSignout === true) {
-      throw makeError(401, { ...env, code: env.code ?? "isSignout" }, retryAfter);
+      throw makeError(401, { ...env, code: env.code ?? "unauthorized" }, retryAfter);
     }
-    // Success: HTTP 2xx + `result:true`. Return the unwrapped payload — or the
-    // whole envelope when the caller asked for it (postFull).
+    // Success: HTTP 2xx + `result:true`. Return the unwrapped payload.
     if (res.ok && env.result === true) {
-      if (opts.envelope) return body as T;
+      if (whole) return body as T;
       return (env.data !== undefined ? env.data : (body as T)) as T;
     }
     // Some legacy error shapes ship HTTP 200 (not_found, access_denied)
     // with a `code` and no `result:true`. Treat any non-success envelope
     // as an error so callers never confuse rejection with data.
-    // (`isSignout` is handled above and is provably not `true` here.)
     if (!res.ok || env.code !== undefined || env.result === false) {
       throw makeError(res.status, env, retryAfter);
     }
     // 2xx without the standard envelope (e.g. raw object) — pass through.
     return body as T;
   }
+}
+
+/** Filename from a Content-Disposition header (`filename*=UTF-8''…` wins). */
+function parseFilename(header: string | null): string | undefined {
+  if (!header) return undefined;
+  const star = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/.exec(header);
+  if (star?.[1]) {
+    try {
+      return decodeURIComponent(star[1].trim());
+    } catch {
+      /* fall through to the plain form */
+    }
+  }
+  const plain = /filename\s*=\s*"([^"]*)"|filename\s*=\s*([^;]+)/.exec(header);
+  const v = plain?.[1] ?? plain?.[2];
+  return v ? v.trim() : undefined;
 }

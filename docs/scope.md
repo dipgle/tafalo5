@@ -14,6 +14,14 @@
 > ([acl-model.md §5](acl-model.md)), so if your requirement is "user A must not
 > *see* user B's rows", scope (or a resource-level ACL) is how you get it — not
 > `docs.readers`.
+>
+> Scope fences `/app/doc/*` and, through the `_files` entry (§6), `/app/file/*`.
+> It does **not** fence anonymous share links (`/app/share/*`), F3 attachments
+> (`/app/f3/*`), rollup aggregates, or signed-source writes (`/ingest`) — see the
+> table in [acl-model.md §1](acl-model.md#1-tldr). Scope applies to every caller
+> except `_cluster` — owner and Managers included — but it is not a boundary
+> against anyone at Designer level or above, because they can rewrite bindings,
+> their own included (§7).
 
 ---
 
@@ -52,7 +60,7 @@ Scope lives in the app's `acls` JSONB blob under `scope`, with two keys:
     }
   },
   "bindings": {
-    "<user_tid>": [             // what each user is allowed to see
+    "<user_tid>": [             // canonical `u-…` tid; what each user may see
       { "scope": "S", "params": { "S": "acme" },              "role_code": "cs"  },
       { "scope": "O", "params": { "owner_ids": ["u-bob"] },   "role_code": "rep" }
     ]
@@ -63,7 +71,7 @@ Scope lives in the app's `acls` JSONB blob under `scope`, with two keys:
 - **`field_map`** maps each **resource** to which **column** implements each scope
   tier. Set it, and that resource is opted into scope.
 - **`bindings`** maps each **user** to a list of grants. A grant names a **scope
-  code** + the **value(s)** the user is allowed. Multi-role users ("kiêm nhiệm")
+  code** + the **value(s)** the user is allowed. Users who hold several positions at once
   get all their bindings **OR-ed** (union).
 
 You read/write this via [`/app/scope/get`](api-reference.md) and
@@ -154,13 +162,18 @@ On every `/app/doc/*` call for a fenced resource:
 2. Each binding compiles to a predicate (`col = value`, or `col = ANY(list)`,
    or `Always`/`Never`). Bindings are **OR-ed** (a user with two bindings sees the
    union).
-3. On **reads** the predicate is `AND`-ed into the SQL `WHERE` — out-of-scope rows
-   simply don't come back (no existence leak).
+3. On **`list`** the predicate is `AND`-ed into the SQL `WHERE` — out-of-scope
+   rows simply don't come back (no existence leak). On **`get`** it is checked
+   in memory: an out-of-scope tid answers `access_denied` while a missing one
+   answers `not_found`, so `get` does reveal whether a tid exists.
 4. On **writes** it's checked in-memory against the row: create needs the new row
-   in-scope; update needs **both** the current row **and** the post-merge row
-   in-scope (so you can't scope-move a row out from under yourself). `upsert` and
-   `create-batch` apply the same double check; `del` and `acl-set` check the
-   current row only.
+   in-scope; update needs **both** the current row **and** the new `data` body
+   in-scope (so you can't scope-move a row out from under yourself). `update`
+   replaces the row's level-0 data wholesale — it does not merge — so **resend
+   the scope column(s) with every update that carries `data`**, or it is refused.
+   `upsert` applies the same double check on its update branch; `create-batch`
+   (like `create`) checks each new row; `del` and `acl-set` check the current row
+   only.
 
 The predicate is evaluated against the row's **level-0 (unencrypted) fields**.
 A scope column must therefore be declared `level: 0` — an encrypted field cannot
@@ -171,7 +184,7 @@ Edge cases (all fail-safe):
 - A binding maps to a column missing from `field_map` → that binding degrades to
   `Never` and a warning is logged (no crash, no accidental open).
 - A **`G`** binding matches every row (use sparingly — that's "see everything").
-- On update, the post-merge check only runs when the request actually carries a
+- On update, the second check only runs when the request actually carries a
   `data` body. An ACL-only update skips it — harmless, since nothing can move.
 
 ---
@@ -190,8 +203,16 @@ Three conditions, **all** required, before scope enforces anything:
 3. **Resource in `field_map`** — a resource with no entry is **default-deny** for a
    scoped app (rather than silently open): `scope_not_configured`, HTTP 400.
 
-There is a fourth bypass you can't trigger from a tenant app: the `_cluster`
-platform service principal skips scope entirely.
+**Opting in also fences files.** `/app/file/*` resolves the pseudo-resource
+`_files` (rows are matched on the file's `acls.scope_attrs`), so add a `_files`
+entry or the file endpoints (`list`, `get`, `upload`, `save`, `sign-url`,
+`del`, `rename`, `acl-set`) answer `scope_not_configured`.
+Public forms use a `_form` entry (matched on each form's `scope_attrs`) and chat
+uses a `_chat` entry (matched on each room config's `scope_attrs`); a missing
+entry answers `scope_not_configured` on that surface too.
+
+There is a fourth bypass: the `_cluster` platform service principal skips scope
+entirely.
 
 **Confirming it's live.** The `/app/doc/list` response carries
 `meta.scope_filter_applied`. Note the shape of that signal:
@@ -204,10 +225,9 @@ platform service principal skips scope entirely.
   `{"enforced": true, "reason": "no_bindings", "bindings_count": 0}` for a user
   with nothing bound.
 
-⚠ **Scope config changes are not cache-invalidated.** Unlike the ACL endpoints,
-`/app/scope/set` does not flush the app-config cache, so a change can take up to
-the cache TTL to take effect. Don't write a test that sets a binding and asserts
-the fence in the very next request.
+**Scope config changes apply on the next request.** The scope config is read
+from the database on every request rather than from a cache, so there is no TTL
+to wait out after `/app/scope/set`.
 
 ---
 
@@ -231,9 +251,10 @@ through this endpoint.
 order (`field_map`, then `bindings`, then `bindings_patch`):
 ```jsonc
 { "app_tid": "a_xxx",
-  "field_map": { ... },              // replace the whole field_map (omit = keep,
-                                     //   null = clear to {})
-  "bindings":  { ... },              // replace ALL bindings
+  "field_map": { ... },              // replace the whole field_map (omit or null
+                                     //   = keep; send {} to clear, which also
+                                     //   turns scope off for the app)
+  "bindings":  { ... },              // replace ALL bindings (null = keep, {} = clear)
   "bindings_patch": {                // OR: per-user patch (merge/clear one user)
      "u-alice": [ ... ],             //   set alice's bindings
      "u-bob":   null                 //   clear bob's bindings
@@ -242,6 +263,10 @@ order (`field_map`, then `bindings`, then `bindings_patch`):
     "data": { "app_tid", "bindings_count", "field_map_size" },
     "timestamp": ... }
 ```
+⚠ **Anyone at Designer level can rewrite any user's bindings — their own
+included** (for example, grant themselves `G`). Scope is a fence for Readers and
+Editors; it is not a boundary against Designers, Managers or the owner.
+
 Validation errors (all HTTP 400): `scope_field_map_invalid`,
 `scope_bindings_invalid`, `scope_bindings_patch_invalid`, and
 `scope_bindings_patch_invalid_value` when a patch entry is neither an array nor
@@ -283,16 +308,24 @@ See [security-model.md §5](security-model.md) for the masking rules and the
 ## 9. Gotchas
 
 1. **Scope is `AND`-ed with ACL, not instead of it.** A caller still needs
-   app-level Reader and the resource ACL (and, on writes, the per-row ACL).
-   Scope only *subtracts* rows.
+   app-level Reader and the resource ACL (and, on `update`/`del`/`acl-set`, the
+   per-row ACL — `upsert` skips it on its update branch). Scope only *subtracts*
+   rows.
 2. **`field_map` columns must be columns the row actually has**, and must be
-   **level 0** (unencrypted). A typo → that binding becomes `Never`.
+   **level 0** (unencrypted). A typo → that binding becomes `Never`. Two more
+   conditions. Scope values on the **row** must be JSON strings, or `list`
+   (SQL) and `get`/writes (in-memory) disagree — a numeric `42` shows in
+   `list` but is refused on `get`. Values in a **binding** must be strings
+   too: a non-string value turns that binding into `Never` on both paths (the
+   user sees nothing). Column names must match `[A-Za-z0-9_]+`: a bad name
+   hides every row from `list` while `get`/writes can still match.
 3. **No bindings = no rows.** Don't forget to bind a user, or they see nothing —
    and it will look like an empty dataset, not a permission error.
 4. **`G` is "see everything"** — reserve it for admin/service roles.
 5. **It's opt-in and env-gated** — check that `meta.scope_filter_applied` is
    *present* before trusting the fence in a security-sensitive flow. A missing
    `meta` key means scope did nothing.
-6. **Changes may lag the config cache** — `/app/scope/set` doesn't invalidate it.
+6. **Bindings are keyed by the canonical `u-…` tid.** A legacy `u_…` key never
+   matches, and that user sees zero rows.
 7. **A binding's `pii_level` can still expose Full data** via the
    `X-Audit-Reason` break-glass on `/app/doc/get` (§8). It is logged, not blocked.
