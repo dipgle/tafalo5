@@ -415,7 +415,7 @@ audit rows.
 host-scoped and Domain-scoped variants). Returns `{ "result": true }`.
 The cookie is not revoked on the server: a copy of its value keeps working
 until it expires (24 h from sign-in). To end every session of a user, change
-the password (`/user/change-password` bumps the session watermark).
+the password; `/user/change-password` bumps the session watermark.
 
 ### POST /auth/email-link
 
