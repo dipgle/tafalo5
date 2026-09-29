@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+No code change. Package metadata and README only:
+
+- `package.json` `repository`, `bugs` and `homepage` point at
+  `github.com/dipgle/tafalo5` (folder `sdk/`), where the package actually
+  lives; they pointed at a repository that does not hold it.
+- README: the Errors example did not compile under `strict` (undefined
+  `sleep`, `e.code` on an `unknown`); it now does, and the README names the
+  methods that resolve `result: false` instead of throwing. Role-token
+  brackets: which calls add them for you and which store arrays as sent.
+
 ## 0.2.0 — 2026-09-27
 
 Checked every method against the server it calls. Several methods never

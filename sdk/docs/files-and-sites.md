@@ -9,8 +9,9 @@ An app stores two kinds of files, with different life cycles:
 
 ## Publishing the front-end with the site engine
 
-The site engine keeps every published version. You edit a draft, publish it
-atomically, and can roll back to any earlier version:
+The site engine keeps recent published versions. You edit a draft, publish it
+atomically, and can roll back to a recent version (older snapshots are pruned —
+by default, those beyond the 20 most recent that are also older than 90 days):
 
 ```ts
 await tfl5.site.put({ path: "index.html", text: "<h1>Hello</h1>" });

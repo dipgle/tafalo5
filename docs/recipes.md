@@ -266,7 +266,10 @@ mutate the doc's own `readers` array. Revoke instantly via
 recipient never sees fields outside the list.
 
 **Gotchas:**
-- Resource must have `sharing: TRUE` (set via `/app/resource/update`).
+- Resource must have `sharing: TRUE` — the default on every resource.
+  Set `sharing: false` via `/app/resource/update` on resources that must
+  never be shared; the same flag also opens the anonymous
+  [`GET /public/…` read by code](api-reference.md#public-read-by-code).
 - `token` is returned **only** when `target == "anonymous"`. Targeted
   shares (user_tid or role token) don't get a link — the target
   reads via the normal `/app/doc/*` path.

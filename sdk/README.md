@@ -6,7 +6,8 @@ platform's REST and WebSocket API so you don't hand-roll `fetch` calls,
 response envelopes or error parsing.
 
 - Works in the browser and in Node 18+ (ESM, no runtime dependencies).
-- Fully typed; every method maps to one documented endpoint.
+- Fully typed; most methods map to one documented endpoint (a few, such as
+  `patch()`, combine calls).
 - Also served by every Tafalo server at `/sdk.js` and `/sdk.mjs`, so a page can
   use it with no build step.
 
@@ -37,8 +38,11 @@ Everything an app stores is built from five entities. The SDK mirrors them:
 
 Access is decided by ACL arrays on apps, resources, docs and files —
 `managers`, `designers`, `editors`, `readers`, `deletable`, `noaccess` —
-holding user ids (`u-…`), group ids (`g-…`) and role tokens (`[r-…]`; send a
-raw `r-…` and the server adds the brackets). Fields can be encrypted at rest
+holding user ids (`u-…`), group ids (`g-…`) and role tokens (`[r-…]`).
+`setAcl`, `apps.setAcl`, `files.aclSet`, `access.aclSet` and resource
+definitions (`setResourceAcl`, `putSchema`) accept a raw `r-…` and the server
+adds the brackets; ACL arrays passed to `createBatch` or `upsert` are stored as
+sent, so bracket role tokens yourself there. Fields can be encrypted at rest
 one by one (level 1 or 2); the SDK always reads and writes plain values.
 
 ## Install
@@ -86,21 +90,28 @@ are covered in [docs/authentication.md](docs/authentication.md).
 
 ## Errors
 
-Every failure is thrown as a `Tfl5Error` subclass. Branch on `err.code` (a
-stable machine code), never on the message text:
+Failures from the server are thrown as `Tfl5Error` subclasses. Branch on
+`err.code` (a stable machine code), never on the message text:
 
 ```ts
-import { NotFoundError, AccessDeniedError, RateLimitError } from "@tfl5/sdk";
+import { Tfl5Error, NotFoundError, RateLimitError } from "@tfl5/sdk";
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 try {
   await tfl5.resource("task").get("d-missing");
 } catch (e) {
   if (e instanceof NotFoundError) { /* … */ }
   else if (e instanceof RateLimitError) await sleep((e.retryAfter ?? 1) * 1000);
-  else if (e.code === "hook_validation_failed") { /* a hook refused the write */ }
+  else if (e instanceof Tfl5Error && e.code === "hook_validation_failed") { /* a hook refused the write */ }
   else throw e;
 }
 ```
+
+Two exceptions: methods documented to resolve `result: false` instead of
+throwing (`stages.promote`, `stages.releaseStatus`, `stages.rollbackRelease`,
+and the delivery outcomes of `durable.send`), and client-side mistakes such as
+an unknown resource alias, which throw a plain `Error`.
 
 See [docs/errors.md](docs/errors.md).
 
@@ -124,11 +135,17 @@ npm install
 npm run typecheck
 npm test                 # unit tests (no server needed)
 npm run docs:check       # docs/reference.md matches src/
-TFL5_SMOKE_HOST=http://localhost:8090 npm run smoke   # end-to-end, needs a server
+TFL5_SMOKE_HOST=http://localhost:8090 \
+TFL5_SMOKE_VERIFY_CMD='<command that marks user {user} email-verified>' \
+  npm run smoke                                        # end-to-end, needs a server
 ```
 
 The end-to-end smoke registers two users against a running server and drives
-every client through real requests (see the header of `smoke/smoke.mjs`).
+most clients through real requests (`groups`, `integrations`, `wasm` and
+`operator` are not exercised; see the header of `smoke/smoke.mjs`). New
+accounts must verify their email before they can create an app, so the smoke
+needs `TFL5_SMOKE_VERIFY_CMD` — or a development server started with
+`TFL5_AUTO_VERIFY_EMAIL=1`.
 
 ## License
 

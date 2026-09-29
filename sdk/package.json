@@ -47,12 +47,13 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tafalo/sdk.git"
+    "url": "git+https://github.com/dipgle/tafalo5.git",
+    "directory": "sdk"
   },
   "bugs": {
-    "url": "https://github.com/tafalo/sdk/issues"
+    "url": "https://github.com/dipgle/tafalo5/issues"
   },
-  "homepage": "https://github.com/tafalo/sdk#readme",
+  "homepage": "https://github.com/dipgle/tafalo5/tree/main/sdk#readme",
   "devDependencies": {
     "esbuild": "^0.28.1",
     "typescript": "^5.4.0"

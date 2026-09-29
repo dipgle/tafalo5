@@ -6,7 +6,7 @@ only the client-side surface — the backend is not part of it.
 
 You point the SDK at a running tafalo5 server (the hosted platform, or your
 own instance) and build apps against a fixed REST contract: `apps →
-(groups, roles, resources, docs)`, per-row ACL, field-level encryption,
+(roles, resources → docs)` plus platform-wide groups, per-row ACL, field-level encryption,
 declarative hooks, and sandboxed operators.
 
 ## Contents
@@ -50,14 +50,16 @@ browser with `TypeError: Illegal invocation`; if you see that, load a build of
 this SDK instead (see below).
 
 `@tfl5/sdk` isn't published to npm yet (see [sdk/README.md](sdk/README.md) for
-current status) — for a Node/CLI build pipeline, build it from source today:
+current status) — for a Node/CLI build pipeline, build it from source today,
+then add it to your project by path:
 
 ```bash
-cd sdk && npm install && npm run build
+cd sdk && npm install && npm run build   # in this repository → sdk/dist
+npm install /path/to/tafalo5/sdk         # in your project
 ```
 
 ```ts
-import { TFL5 } from "@tfl5/sdk"; // resolved to sdk/dist once built, or a local path
+import { TFL5 } from "@tfl5/sdk"; // resolves once installed by path as above
 
 const tfl5 = new TFL5({ host: "https://your-app.example.com" });
 await tfl5.auth.login("username", "password");
