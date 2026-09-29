@@ -125,7 +125,12 @@ export class AuthClient {
     return this.http.post("/reg", input);
   }
 
-  /** Invalidate the current session (clears cookie / server session). */
+  /**
+   * Sign this client out: the server clears the `_token` cookie and the SDK
+   * forgets its bearer token. The cookie value is not revoked server-side — a
+   * copy stays valid until it expires (24 h from sign-in); change the password
+   * to end every session.
+   */
   async logout(): Promise<void> {
     await this.http.post("/logout");
     this.http.setToken(undefined);

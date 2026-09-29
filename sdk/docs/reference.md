@@ -27,7 +27,7 @@ Guides: [getting started](getting-started.md) · [authentication](authentication
 |---|---|---|---|
 | 1 | `tfl5.auth.login(username: string, password: string): Promise<LoginResult>` | `/login` | Username/password login. Sets the session cookie (kept in the SDK's cookie jar outside a browser) and resolves `{ user: { tid, username } }`. |
 | 2 | `tfl5.auth.register(input: Record<string, unknown>): Promise<unknown>` | `/reg` | Register a new user. |
-| 3 | `tfl5.auth.logout(): Promise<void>` | `/logout` | Invalidate the current session (clears cookie / server session). |
+| 3 | `tfl5.auth.logout(): Promise<void>` | `/logout` | Sign this client out: the server clears the `_token` cookie and the SDK forgets its bearer token. The cookie value is not revoked server-side — a copy stays valid until it expires (24 h from sign-in); change the password to end every session. |
 | 4 | `tfl5.auth.me(): Promise<CurrentUser>` | `/user` | The signed-in user (`/user`). Throws `UnauthorizedError` when signed out. |
 | 5 | `tfl5.auth.setToken(token: string \| undefined): void` | — | Manually set a Bearer token (e.g. one minted out-of-band). |
 | 6 | `tfl5.auth.exportData(): Promise<DataExport>` | `/user/data/export` | Export the caller's own account: profile + email metadata + app memberships (right to access / data portability). Self-scoped — there is no admin-override form. Plaintext email addresses are fetched separately via `POST /user/email/list`; documents/files inside each app are exported through that app's own `/app/doc/*` and `/app/file/*` APIs. |
