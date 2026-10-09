@@ -2160,7 +2160,7 @@ Which to use:
 | You are… | Use |
 |---|---|
 | shipping a pre-built SPA / static site from CI | **Bundles** — one versioned zip, atomic activate, instant rollback |
-| authoring pages in-product (visual/no-code editor) | **Site engine** — draft → preview → publish, per-file history |
+| authoring pages in-product (Studio's code editor, JSON `page` documents) | **Site engine** — draft → preview → publish, per-file history |
 | managing individual assets with per-file ACL, signed URLs, trash | **Files** |
 
 Quota accounting and the trash belong to Files alone. **Per-file ACL is

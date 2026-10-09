@@ -683,8 +683,8 @@ timestamped backup.
 - Test subdomain works only when `TFL5_TEST_SUBDOMAIN_BASE` is
   configured at deploy time (`/platform/info` reports the base).
 - **This whole flow is shadowed if the app has a live site snapshot**
-  (i.e. it's ever been published through the no-code builder or code
-  editor). A pinned release only serves once there's no
+  (i.e. it's ever been published through the code editor or
+  `/app/site/publish`). A pinned release only serves once there's no
   `live_snapshot` above it — see recipe [#13](#13-why-isnt-my-uploaded-file-showing-up-serving-precedence)
   if your promoted release doesn't seem to take effect.
 
@@ -705,7 +705,7 @@ precedence chain, first match wins** — see
 for the full explanation. In order, highest wins:
 
 ```
-1. live snapshot   — /app/site/publish (no-code builder / code editor)
+1. live snapshot   — /app/site/publish (Studio's code editor, or your own call)
 2. active bundle   — /app/bundle/activate
 3. pinned release  — /app/release
 4. legacy public/  — /app/file/upload or /app/file/save
@@ -740,7 +740,7 @@ notice. The fix is to make your change in whichever tier is actually
 serving:
 
 - **Live snapshot is serving** → author through `/app/site/put` +
-  `/app/site/publish` (or the no-code builder / code editor UI), or
+  `/app/site/publish` (or Studio's code editor), or
   `/app/site/rollback` to re-point `apps.live_snapshot` at an older
   snapshot. There is **no way to fall back through to the tiers
   below**: no route ever NULLs `live_snapshot` — `rollback` only
@@ -770,8 +770,9 @@ serving:
   banner; use the diagnosis calls above.
 - A brand-new app with no site/bundle/release activity ever configured
   is always on tier 4 (legacy `public/`) — this recipe mostly matters
-  for apps that have used the visual builder, the code editor, or a
-  versioned deploy pipeline at some point in their history.
+  for apps that have used the code editor, the visual builder (removed
+  2026-08-19), or a versioned deploy pipeline at some point in their
+  history.
 - Rolling back a snapshot/bundle/release doesn't delete the lower
   tiers' files — it just changes which tier answers requests.
 

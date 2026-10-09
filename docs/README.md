@@ -50,11 +50,11 @@ building.
   deployment runbooks, testing strategy) are internal-team material
   and not in this folder. Ask the tfl5 platform team if a "why was
   it designed this way?" question blocks you.
-- **The in-UI editor and no-code builder themselves.** These now
-  exist (see "What the platform GIVES you" below) and ship as part of
-  the admin surface. This folder documents the **API contract** a
-  human or AI agent codes against; it is not a click-by-click manual
-  for those UIs.
+- **The in-UI editor itself.** Studio, the web IDE, exists (see "What
+  the platform GIVES you" below). This folder documents the **API
+  contract** a human or AI agent codes against; it is not a
+  click-by-click manual for Studio. There is no drag-and-drop page
+  builder any more — it was removed on 2026-08-19; pages are documents.
 - **AI-generate-a-frontend-from-a-prompt** — still a vision item, not
   built.
 
@@ -68,7 +68,7 @@ building.
 | Schema-defined data (resources + docs) with field-level encryption | `/app/resource/*`, `/app/doc/*` | api-reference §Resources + §Docs |
 | File upload (binary attachments) with per-file ACL + signed URLs | `/app/file/*` | api-reference §Files |
 | **Content-addressed site publishing** — blobs + immutable snapshots, publish = pointer flip, one-click rollback, per-file history | `/app/site/*` | §"Publishing a site" below |
-| **In-UI code editor + no-code page builder** shipped in the admin surface, both writing to the same `/app/site/*` engine. Builder pages are a JSON component tree rendered server-side; the injected runtime does read + write-back CRUD through the ordinary `/app/doc/{list,create,update,del}` endpoints, so **every ACL layer still applies** | `/app/site/*`, `/app/doc/*` | acl-model.md |
+| **In-UI code editor** (Studio's Explorer) writing to the `/app/site/*` engine. A `page` entry is a JSON component tree rendered server-side, written as a document — by hand or by an AI assistant; the drag-and-drop builder was removed on 2026-08-19; the injected runtime does read + write-back CRUD through the ordinary `/app/doc/{list,create,update,del}` endpoints, so **every ACL layer still applies** | `/app/site/*`, `/app/doc/*` | acl-model.md |
 | Roles + per-row ACL with role tokens | `/app/role/*` | acl-model + api-reference §Roles |
 | Resource-type ACL (gate a whole KIND of data) | `/app/resource/update` | acl-model §Resource-level ACL |
 | Row-level scope — users see only *their* rows by a data field (own/company/class), env-gated | `/app/scope/*`, `apps.acls.scope` | scope.md |

@@ -23,7 +23,7 @@ You build an app by:
 1. Registering a user account on tfl5 (one-time per dev).
 2. Creating an app row (`POST /app/update` without `tid`).
 3. Authoring your static FE (HTML/JS) — with the in-browser code
-   editor, the visual no-code page builder, or a direct file upload.
+   editor, or a direct file upload.
 4. Binding a public domain.
 5. Defining your data schema as *resources*.
 6. Letting your FE call tfl5 APIs from the browser — `fetch` with
@@ -33,9 +33,9 @@ You do **not** write Rust. You do **not** fork tfl5. You do **not**
 define custom routes. All tenant logic is either:
 
 - **Static FE code** (your HTML/JS, runs in the user's browser) —
-  written by hand and uploaded, dragged together in the visual
-  no-code builder, or edited in-browser with the code editor; all
-  three publish through the same versioned site engine (§4 step 3), or
+  written by hand or by an AI assistant and uploaded, or edited
+  in-browser with the code editor; both publish through the same
+  versioned site engine (§4 step 3), or
 - **Resource schema + declarative hooks** (validation + side-effects
   the platform executes for you), or
 - **Operators** (officially supported integrations like email, ZNS,
@@ -109,7 +109,7 @@ single most common "why isn't my change showing up" question. Concretely:
 - You `POST /app/file/upload` a new `index.html` straight into
   `public/` (tier 4), refresh your domain, and still see the old page.
   That's because the app was, at some point, published through the
-  no-code builder or the code editor (`/app/site/publish`, tier 1) —
+  code editor or `/app/site/publish` (tier 1) —
   the live snapshot answers every request until you either publish a
   new snapshot with your change or explicitly stop using the site
   engine for this app.
@@ -118,8 +118,8 @@ single most common "why isn't my change showing up" question. Concretely:
   though there's no site snapshot.
 
 **The fix is always the same:** figure out which tier is actually
-serving (ask "did this app ever go through the visual builder / code
-editor?", or check with whoever owns the deploy pipeline), and make
+serving (ask "did this app ever go through the code editor — or, before
+2026-08-19, the visual builder?", or check with whoever owns the deploy pipeline), and make
 your change in *that* tier — or explicitly roll it back
 (`/app/site/rollback`, `/app/bundle/rollback`, `/app/release/rollback`)
 to fall through to the tier you intended to edit. Uploading to a lower
@@ -151,7 +151,7 @@ Other primitives you'll meet less often:
 | **shares** | Time-limited read-only handles to a single doc | When a user needs to send a one-off link to someone without granting full access. |
 | **domains** | Custom hostnames bound to the app | Multiple domains per app supported; subdomain delegation built-in. |
 | **operators** | Configured integrations (one per `op_id` per app) | Connecting to external services like email send, Zalo, VNeID. |
-| **site** | Content-addressed draft + published-snapshot store for your app's site content (`/app/site/*`) | Publishing/updating your live site with full file history and one-click rollback — what the visual builder and the code editor both write through. |
+| **site** | Content-addressed draft + published-snapshot store for your app's site content (`/app/site/*`) | Publishing/updating your live site with full file history and one-click rollback — what the code editor writes through. |
 | **f3 attachments** | Encrypted files bound to one doc's ACL and encryption key (`/app/f3/*`) | A per-record attachment (e.g. a signed PDF on a `health_event` row) that should inherit that row's readers/editors — distinct from `files`, which is app-wide, not doc-scoped. |
 
 ---
@@ -203,14 +203,13 @@ Read [§2.1 Serving precedence](#21-serving-precedence--read-this-before-you-upl
 first — it explains why the path you pick here matters.
 
 **Recommended: the site engine (`/app/site/*`)** — a content-addressed
-draft-then-publish store. This is what the in-browser code editor and
-the visual no-code page builder both drive; you can use either UI, or
-call the endpoints yourself:
+draft-then-publish store. This is what the in-browser code editor
+drives; you can use it, or call the endpoints yourself:
 
 ```
 POST /app/site/put              (JSON) — write one draft entry
 { "app_tid": "a-example", "path": "/index.html",
-  "kind": "file",                       ← or "page" for a no-code component tree
+  "kind": "file",                       ← or "page" for a JSON component tree
   "content_text": "<html>...</html>" }  ← or content_base64 for binary
 
 POST /app/site/publish           ← snapshot the current draft, flip it live
@@ -227,7 +226,7 @@ POST /app/site/file-history      ← every past version of ONE file/path
 Publish is atomic (a new immutable snapshot + a pointer flip, never a
 partial write), and every file's history is addressable — a strictly
 stronger guarantee than the legacy path below. `kind: "page"` entries
-are JSON component trees rendered server-side by the no-code renderer
+are JSON component trees rendered server-side by the page renderer
 (headings, containers, text/image/button, and data-bound
 table/list/**chart** nodes wired to your resources); `kind: "file"`
 entries are served as-is (HTML you wrote yourself, CSS, JS, images).
