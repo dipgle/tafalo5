@@ -1,0 +1,109 @@
+# tafalo5 — SDK & developer docs
+
+> tafalo5 is a multi-tenant app platform. You build apps against a fixed REST contract — apps → (roles, resources → docs), plus platform-wide groups, per-row ACL, field-level encryption, declarative hooks and sandboxed operators — usually through the JavaScript/TypeScript client `@tfl5/sdk`. This file is a map: find your task below and read only the section it points to. The docs total about 580 KB; almost every entry below points at one section, not a whole file.
+
+How to use this map:
+- Links are relative to the repository root. `file.md#anchor` is a section: read from that heading to the next heading of the same level, not the whole file.
+- Sizes are given so you can budget. Never read `docs/api-reference.md` (~219 KB) or `sdk/docs/reference.md` (~68 KB) whole — jump to the section, or search for the endpoint or method name.
+- When two links are given, the first is the guide (why and how), the second is the contract (exact request, response, errors).
+
+## Rules that hold everywhere — get these wrong and the app is wrong
+
+- The client is never trusted; every permission is enforced by the server: [security-model §1](docs/security-model.md#1-the-trust-boundary--the-client-is-never-trusted)
+- ACL arrays are the most common source of mistakes. Read the TL;DR and the mistakes list before designing any data model: [acl-model §1](docs/acl-model.md#1-tldr), [acl-model §12](docs/acl-model.md#12-common-mistakes--read-before-designing)
+- Some SDK calls resolve with `result: false` instead of throwing — check the result, not only for exceptions: [sdk errors › Things that resolve instead of throwing](sdk/docs/errors.md#things-that-resolve-instead-of-throwing)
+- Encryption is custodial, not zero-knowledge. Do not promise users otherwise: [security-model §3](docs/security-model.md#3-custodial-not-zero-knowledge--say-this-to-your-customers)
+- Published site content is public by default: [security-model §8](docs/security-model.md#8-published-site-content--public-by-default-and-the-two-tiers-differ)
+- Several subsystems are off until the operator turns them on — check before you build on one: [security-model §10](docs/security-model.md#10-things-that-are-off-unless-the-operator-turns-them-on)
+- Row-level scope ships dark: configuring it is not enough, it must be activated: [scope §6](docs/scope.md#6-activation--scope-ships-dark-by-default)
+- Inside a WASM operator, an empty `host_query` result is also what an ACL denial looks like: [wasm-operator-abi §7](docs/wasm-operator-abi.md#7-host_query--read-and-the-three-gates)
+- A Google sign-in button on a host Google has not authorised renders fine and fails with 403 on click; use `google_allowed_origins` to hide it: [api-reference › GET /platform/info](docs/api-reference.md#get-platforminfo)
+
+## Map — I want to…
+
+- **Understand what the platform is** (read these three sections first)
+  - the model in one page: [app-builder-guide §2](docs/app-builder-guide.md#2-mental-model)
+  - which building block for which job: [app-builder-guide §3](docs/app-builder-guide.md#3-building-blocks--when-to-use-what)
+  - what it does NOT do for you: [app-builder-guide §7](docs/app-builder-guide.md#7-what-tfl5-does-not-give-you)
+- **Start coding**
+  - first app in six steps with the SDK: [sdk getting-started](sdk/docs/getting-started.md)
+  - browser (no build step) vs Node: [sdk §2](docs/sdk.md#2-browser-usage-no-build-step), [sdk §3](docs/sdk.md#3-node--server-side-usage)
+  - which SDK client covers which platform concept: [sdk §4](docs/sdk.md#4-architecture--sdk-map)
+  - the app lifecycle, end to end: [app-builder-guide §4](docs/app-builder-guide.md#4-app-lifecycle-the-6-steps)
+  - a worked example: [app-builder-guide §8](docs/app-builder-guide.md#8-end-to-end-walkthrough--student-record-flow)
+- **Sign users in**
+  - password, registration, email verification: [sdk authentication › Registration and email verification](sdk/docs/authentication.md#registration-and-email-verification)
+  - Google, Microsoft, email link, phone code, QR, Telegram, VNeID: [sdk authentication › Other sign-in methods](sdk/docs/authentication.md#other-sign-in-methods)
+  - cookie mode (browsers, scripts signing in as a user) vs bearer service token (server to server): [sdk authentication › Modes](sdk/docs/authentication.md#modes)
+  - two-factor: [sdk authentication › Two-factor authentication](sdk/docs/authentication.md#two-factor-authentication)
+  - every auth endpoint: [api-reference › Authentication](docs/api-reference.md#authentication)
+- **Model and store data**
+  - define a resource (schema shape): [app-builder-guide §5](docs/app-builder-guide.md#5-defining-resources--the-schema-shape), [api-reference › Resources (schema)](docs/api-reference.md#resources-schema)
+  - create, read, update, delete, list docs: [sdk data › Docs](sdk/docs/data.md#docs), [api-reference › Docs (data rows)](docs/api-reference.md#docs-data-rows)
+  - import a CSV or Excel file: [sdk data › Import from CSV or Excel](sdk/docs/data.md#import-from-csv-or-excel)
+  - let an external system push data in: [sdk data › Signed data sources](sdk/docs/data.md#signed-data-sources), [api-reference › Signed sources — external system → app, through the ACL gate](docs/api-reference.md#signed-sources--external-system--app-through-the-acl-gate)
+  - accept anonymous submissions (a public form): [api-reference › Public forms (anonymous submissions)](docs/api-reference.md#public-forms-anonymous-submissions)
+- **Control who sees what**
+  - the five permission levels: [acl-model §2](docs/acl-model.md#2-the-5-permission-levels)
+  - what goes into an ACL array: [acl-model §3](docs/acl-model.md#3-tokens--the-things-you-put-in-acl-arrays)
+  - roles and groups: [acl-model §8](docs/acl-model.md#8-roles--the-indirection-that-makes-scaling-work), [api-reference › Roles](docs/api-reference.md#roles)
+  - users see only their own rows (per class, per company): [scope](docs/scope.md)
+  - share one doc with one person: [recipes §11](docs/recipes.md#11-add-an-editor-to-a-single-doc-without-making-them-an-editor-of-the-whole-app), [api-reference › Sharing (per-doc grants)](docs/api-reference.md#sharing-per-doc-grants)
+  - a one-time share link: [recipes §5](docs/recipes.md#5-generate-a-one-time-shareable-link-to-a-single-doc)
+  - members and app ACL administration: [api-reference › Members & app ACL admin](docs/api-reference.md#members--app-acl-admin)
+- **Files and the front-end**
+  - publish the app's front-end: [sdk files-and-sites › Publishing the front-end with the site engine](sdk/docs/files-and-sites.md#publishing-the-front-end-with-the-site-engine), [api-reference › Publishing a frontend](docs/api-reference.md#publishing-a-frontend)
+  - test stage before release: [recipes §12](docs/recipes.md#12-test-changes-on-the-test-stage-before-promoting-to-release)
+  - an uploaded file is not showing up: [recipes §13](docs/recipes.md#13-why-isnt-my-uploaded-file-showing-up-serving-precedence)
+  - user uploads: [sdk files-and-sites › User files](sdk/docs/files-and-sites.md#user-files), [api-reference › Files (binary + static)](docs/api-reference.md#files-binary--static)
+  - encrypted attachments only named people can open (F3): [security-model §4](docs/security-model.md#4-f3-sealed-attachments--per-grantee-only-key-holders-open-it), [api-reference › F3 — secure attached files (per-doc)](docs/api-reference.md#f3--secure-attached-files-per-doc)
+  - a custom domain: [sdk files-and-sites › Custom domains](sdk/docs/files-and-sites.md#custom-domains), [api-reference › Domains](docs/api-reference.md#domains)
+- **Run logic on the server** (no backend of your own)
+  - validate input, react to writes (hooks): [sdk data › Hooks](sdk/docs/data.md#hooks), [recipes §7](docs/recipes.md#7-validate-input-server-side-without-writing-rust)
+  - notify when a record reaches a status: [recipes §8](docs/recipes.md#8-push-a-notification-when-a-record-is-created-with-a-specific-status)
+  - call a built-in integration (operators): [sdk §7](docs/sdk.md#7-operators--tfl5operatorid-tfl5integrations-tfl5wasm), [api-reference › Operators (integrations catalog + invocation)](docs/api-reference.md#operators-integrations-catalog--invocation)
+  - your own sandboxed code (WASM): [wasm-operator-abi §1](docs/wasm-operator-abi.md#1-the-two-ways-your-module-runs), then the rest of [wasm-operator-abi](docs/wasm-operator-abi.md) only while compiling a module
+  - send and receive email: [api-reference › Email (per-app inbox + send)](docs/api-reference.md#email-per-app-inbox--send)
+- **Realtime**
+  - chat, live projections, durable instances: [sdk realtime](sdk/docs/realtime.md), [api-reference › Realtime chat](docs/api-reference.md#realtime-chat)
+- **Charge money**
+  - catalog, checkout, credits, invoices, tiers: [sdk billing](sdk/docs/billing.md), [api-reference › Billing (provider-gated)](docs/api-reference.md#billing-provider-gated)
+- **Privacy, audit, compliance**
+  - before promising privacy: [security-model §11](docs/security-model.md#11-checklist--before-you-promise-privacy)
+  - encrypt one field at rest: [recipes §6](docs/recipes.md#6-encrypt-a-sensitive-field-at-rest-custodial)
+  - mask personal data on read: [security-model §5](docs/security-model.md#5-pii-masking-on-read-rides-on-scope), [scope §8](docs/scope.md#8-scope-carries-a-pii-level-too)
+  - who touched a doc and when: [recipes §2](docs/recipes.md#2-audit-who-touched-a-specific-doc-and-when), [acl-model §13](docs/acl-model.md#13-audit--traceability)
+  - data export and erasure requests: [sdk data › Audit log and data rights](sdk/docs/data.md#audit-log-and-data-rights)
+- **Debug a failure**
+  - what an error code means: [sdk errors › Codes you will meet](sdk/docs/errors.md#codes-you-will-meet), [api-reference › Error codes](docs/api-reference.md#error-codes)
+  - "it worked for me but not for them" (permissions): [acl-model §4](docs/acl-model.md#4-the-decision-algorithm-app-level)
+  - the exact signature of an SDK method: search [sdk reference](sdk/docs/reference.md) for the method name
+  - request and response conventions shared by every endpoint: [api-reference › Conventions](docs/api-reference.md#conventions)
+- **More task recipes**: the table of contents of [recipes](docs/recipes.md) lists them all.
+
+## Files
+
+- [README](README.md) · ~4 KB · what is in this repository
+- [docs index](docs/README.md) · ~12 KB · the human reading order, what the platform gives and does not give, quirks
+- [app-builder-guide](docs/app-builder-guide.md) · ~35 KB · concepts, building blocks, lifecycle, worked example
+- [acl-model](docs/acl-model.md) · ~75 KB · authorization: levels, tokens, decision algorithm, per-row ACL, roles, audit
+- [scope](docs/scope.md) · ~15 KB · row-level scope and PII levels
+- [security-model](docs/security-model.md) · ~28 KB · what is protected and what is left to your app
+- [recipes](docs/recipes.md) · ~30 KB · thirteen task-oriented how-tos
+- [sdk](docs/sdk.md) · ~25 KB · SDK architecture, every client module, config, versioning
+- [wasm-operator-abi](docs/wasm-operator-abi.md) · ~30 KB · contract for your own WASM operators
+- [api-reference](docs/api-reference.md) · ~219 KB · every REST endpoint, grouped by area; read by section only
+- [sdk README](sdk/README.md) · ~6 KB · install, sign in, errors, where the SDK docs are
+- [sdk getting-started](sdk/docs/getting-started.md) · ~4 KB · first app in six steps
+- [sdk authentication](sdk/docs/authentication.md) · ~5 KB · every sign-in method, 2FA, account management
+- [sdk data](sdk/docs/data.md) · ~8 KB · resources, docs, ACL, hooks, import, sharing, audit
+- [sdk files-and-sites](sdk/docs/files-and-sites.md) · ~5 KB · site publishing, user files, F3, domains
+- [sdk realtime](sdk/docs/realtime.md) · ~5 KB · durable instances, live projections, chat
+- [sdk billing](sdk/docs/billing.md) · ~3 KB · selling, credits, invoices, entitlements, tiers
+- [sdk errors](sdk/docs/errors.md) · ~4 KB · error shape, codes, calls that resolve instead of throwing
+- [sdk reference](sdk/docs/reference.md) · ~68 KB · generated from the SDK source: every method, its signature and endpoint; search, do not read whole
+
+## Not in this repository
+
+- The platform's server code, its internal architecture and its operations. These docs are the complete contract for building an app; nothing outside them is needed to start.
+- A click-by-click manual for the in-browser Studio editor.

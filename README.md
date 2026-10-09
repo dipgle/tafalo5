@@ -13,6 +13,7 @@ declarative hooks, and sandboxed operators.
 
 | Path | What |
 |---|---|
+| [`llms.txt`](llms.txt) | **For AI agents and LLMs** — a map from task to the one section that answers it, the rules that hold everywhere, and every file's size. Read this first instead of the whole docs. |
 | [`sdk/`](sdk/) | `@tfl5/sdk` — the typed client (`TFL5`, resources, auth, files, shares, operators). See [sdk/README.md](sdk/README.md). |
 | [`sdk/docs/`](sdk/docs/) | SDK guides (getting started, auth, data, files and sites, realtime, billing, errors) and the generated method reference. |
 | [`docs/README.md`](docs/README.md) | Documentation index — start here. |

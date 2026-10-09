@@ -37,9 +37,10 @@ tfl5 without modifying the Rust core.
    looks like.
 
 ### If you're an AI agent picking up this folder
-Read app-builder-guide.md → acl-model.md → scope.md → security-model.md →
-api-reference.md. Pull
-api-reference.md sections on demand by endpoint. These files are the
+Start at **[../llms.txt](../llms.txt)**, not here. It maps each task to the
+one section that answers it, lists the rules that hold everywhere, and gives
+every file's size. Reading the five guides above in order is about 370 KB;
+the map points each task at one or two sections of them. These files are the
 complete contract — nothing outside this folder is required to start
 building.
 
