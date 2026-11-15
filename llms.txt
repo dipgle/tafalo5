@@ -79,6 +79,9 @@ How to use this map:
   - "it worked for me but not for them" (permissions): [acl-model §4](docs/acl-model.md#4-the-decision-algorithm-app-level)
   - the exact signature of an SDK method: search [sdk reference](sdk/docs/reference.md) for the method name
   - request and response conventions shared by every endpoint: [api-reference › Conventions](docs/api-reference.md#conventions)
+- **Ship to phones** (design once — the Android and iOS shells draw the same pages as the web)
+  - the rule, and what needs an app-store release (almost nothing): [mobile §1](docs/mobile.md#1-the-rule), [mobile §2](docs/mobile.md#2-what-a-change-needs)
+  - what the shell does when it starts and when it opens an app: [mobile §3](docs/mobile.md#3-when-the-shell-starts), [mobile §4](docs/mobile.md#4-when-the-user-opens-an-app)
 - **More task recipes**: the table of contents of [recipes](docs/recipes.md) lists them all.
 
 ## Files
@@ -92,6 +95,7 @@ How to use this map:
 - [recipes](docs/recipes.md) · ~30 KB · thirteen task-oriented how-tos
 - [sdk](docs/sdk.md) · ~25 KB · SDK architecture, every client module, config, versioning
 - [wasm-operator-abi](docs/wasm-operator-abi.md) · ~30 KB · contract for your own WASM operators
+- [mobile](docs/mobile.md) · ~6 KB · design standard for phones: design once, the shell draws it everywhere
 - [api-reference](docs/api-reference.md) · ~219 KB · every REST endpoint, grouped by area; read by section only
 - [sdk README](sdk/README.md) · ~6 KB · install, sign in, errors, where the SDK docs are
 - [sdk getting-started](sdk/docs/getting-started.md) · ~4 KB · first app in six steps
